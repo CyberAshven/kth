@@ -123,6 +123,9 @@ void init_parser(llhttp_t& parser, llhttp_settings_t& settings, parse_ctx& ctx) 
     settings.on_body = on_body;
     settings.on_message_complete = on_message_complete;
     llhttp_init(&parser, HTTP_REQUEST, &settings);
+    // Mining pool software in the ckpool family ends its request lines with a
+    // bare LF instead of CRLF.
+    llhttp_set_lenient_optional_cr_before_lf(&parser, 1);
     parser.data = &ctx;
 }
 
