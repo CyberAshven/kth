@@ -147,6 +147,7 @@ TEST_CASE("rpc server accepts request lines that end in a bare LF", "[rpc server
     auto const answers = bodies(reply);
     REQUIRE(answers.size() == 1);
     CHECK(answers[0].find(R"("result":0)") != std::string::npos);
+}
 
 TEST_CASE("rpc server replies end their headers with Content-Length and their body with LF", "[rpc server]") {
     rpc_server_fixture fixture("rpc_server_reply_framing", 28433);
