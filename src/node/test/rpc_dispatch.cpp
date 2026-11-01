@@ -528,3 +528,82 @@ TEST_CASE("getnetworkhashps dispatch computes the rate over the connected chain"
     REQUIRE(request(R"(["x"])") == node::rpc::build_error("4", -32602,
         "getnetworkhashps takes [nblocks, height] as integers"));
 }
+
+TEST_CASE("submitblock dispatch rejects malformed parameters and block data", "[rpc dispatch]") {
+    test::chain_fixture fixture("rpc_submitblock_malformed");
+    REQUIRE(fixture.created());
+    REQUIRE(fixture.start());
+    node::mining::job_store jobs(1, 60);
+    node::rpc::method_context context{fixture.chain(), jobs};
+    node::rpc::dispatcher dispatcher;
+    node::rpc::register_builtin_methods(dispatcher);
+
+    auto request = [&](std::string const& method, std::string const& params) {
+        auto body = std::string(R"({"method":")") + method + R"(","id":8)";
+        if ( ! params.empty()) {
+            body += R"(,"params":)" + params;
+        }
+        body += '}';
+        ::asio::io_context io;
+        auto result = ::asio::co_spawn(io, dispatcher.handle(context, body), ::asio::use_future);
+        io.run();
+        return result.get();
+    };
+
+    auto const hex = encode_base16(to_data_chunk(domain::chain::block::genesis_regtest()));
+    for (auto const& params : std::vector<std::string>{
+             "", "[]", "{}", "[0]", "[null]", R"([""])", R"(["zz"])", R"(["0"])", R"(["00"])",
+             R"([")" + hex.substr(0, hex.size() - 2) + R"("])",
+             R"([")" + hex + R"(00"])",
+             R"([")" + hex + R"(",null,null])"}) {
+        CAPTURE(params);
+        auto const response = request("submitblock", params);
+        REQUIRE(response.find(R"("result":null)") != std::string::npos);
+        REQUIRE(response.find(R"("code":-32602)") != std::string::npos);
+    }
+}
+
+TEST_CASE("submitblock dispatch returns chain rejection reasons and ignores the dummy parameter", "[rpc dispatch]") {
+    test::chain_fixture fixture("rpc_submitblock_rejected");
+    REQUIRE(fixture.created());
+    REQUIRE(fixture.start());
+
+    auto const genesis = domain::chain::block::genesis_regtest();
+    auto const timestamp = uint32_t(zulu_time()) - test::block_spacing;
+    std::vector<domain::chain::block> const blocks{
+        test::mine_block(genesis.hash(), 1, timestamp, 0, {}, 0)};
+    REQUIRE(fixture.organizer().add_headers(test::headers_of(blocks)).headers_added == 1u);
+    test::persist_headers(fixture, blocks, 1);
+    test::connect_bodies(fixture, blocks, 1);
+    auto const view = fixture.chain().chain_view();
+    REQUIRE(view);
+    REQUIRE(view->connected_tip_height == 1u);
+    REQUIRE(view->tip_hash == blocks.front().hash());
+
+    node::mining::job_store jobs(1, 60);
+    node::rpc::method_context context{fixture.chain(), jobs};
+    node::rpc::dispatcher dispatcher;
+    node::rpc::register_builtin_methods(dispatcher);
+    auto request = [&](domain::chain::block const& block, std::string const& suffix) {
+        auto const body = std::string(R"({"method":"submitblock","params":[")")
+            + encode_base16(to_data_chunk(block)) + '"' + suffix + R"(],"id":9})";
+        ::asio::io_context io;
+        auto result = ::asio::co_spawn(io, dispatcher.handle(context, body), ::asio::use_future);
+        io.run();
+        return result.get();
+    };
+
+    for (auto const* suffix : {"", ",\"dummy\"", ",null", ",{}"}) {
+        CAPTURE(suffix);
+        REQUIRE(request(blocks.front(), suffix) == node::rpc::build_success("9", R"("duplicate block")"));
+    }
+
+    // The block passes validation, but this fixture has no pipeline accepting submissions.
+    auto const next = test::mine_block(blocks.front().hash(), 2,
+        timestamp + test::block_spacing, 0, {}, 0);
+    REQUIRE(request(next, "") == node::rpc::build_success("9", R"("service stopped")"));
+    auto const after = fixture.chain().chain_view();
+    REQUIRE(after);
+    REQUIRE(after->connected_tip_height == 1u);
+    REQUIRE(after->tip_hash == blocks.front().hash());
+}
