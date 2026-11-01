@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <sstream>
+#include <algorithm>
 #include <string>
 
 #include <asio/co_spawn.hpp>
@@ -67,6 +68,8 @@ TEST_CASE("getblockheader dispatch honors verbose and rejects invalid types", "[
 
 TEST_CASE("validateaddress dispatch checks addresses against the node's network", "[rpc dispatch]") {
     test::chain_fixture fixture("rpc_validate_address");
+TEST_CASE("help dispatch lists the registered methods", "[rpc dispatch]") {
+    test::chain_fixture fixture("rpc_help");
     REQUIRE(fixture.created());
     REQUIRE(fixture.start());
     node::mining::job_store jobs(1, 60);
@@ -76,6 +79,7 @@ TEST_CASE("validateaddress dispatch checks addresses against the node's network"
 
     auto request = [&](std::string const& params) {
         auto const body = R"({"method":"validateaddress","params":)" + params + R"(,"id":3})";
+        auto const body = R"({"method":"help","params":)" + params + R"(,"id":5})";
         ::asio::io_context io;
         auto result = ::asio::co_spawn(io, dispatcher.handle(context, body), ::asio::use_future);
         io.run();
@@ -162,4 +166,23 @@ TEST_CASE("getblockchaininfo dispatch leaves initial download once synchronized"
 
     auto const raw = blockchain_info(fixture.chain());
     REQUIRE(raw.find(R"("initialblockdownload":false)") != std::string::npos);
+    // help itself is registered last and is in its own list.
+    auto const methods = dispatcher.methods();
+    REQUIRE(std::ranges::is_sorted(methods));
+    REQUIRE(std::ranges::binary_search(methods, std::string("help")));
+    REQUIRE(std::ranges::binary_search(methods, std::string("getblockcount")));
+
+    // One method per line, newlines escaped as the JSON string carries them.
+    std::string listing;
+    for (auto const& method : methods) {
+        listing += (listing.empty() ? "" : "\\n") + method;
+    }
+    REQUIRE(request("[]") == node::rpc::build_success("5", '"' + listing + '"'));
+    REQUIRE(request(R"([""])") == request("[]"));
+
+    // Fulcrum sends this on every connection and needs a successful reply.
+    REQUIRE(request(R"(["help"])") == node::rpc::build_success("5", R"("help")"));
+    REQUIRE(request(R"(["getblockhash"])") == node::rpc::build_success("5", R"("getblockhash")"));
+    REQUIRE(request(R"(["nosuchmethod"])") ==
+        node::rpc::build_success("5", R"("help: unknown command: nosuchmethod")"));
 }
