@@ -220,3 +220,30 @@ TEST_CASE("rpc server checks a CR that ends one read against the byte after it",
     // The byte after it is LF: the head is complete and the request is answered.
     CHECK(fixture.exchange_in_parts({head, "\n"}).starts_with("HTTP/1.1 200 OK\r\n"));
 }
+
+TEST_CASE("rpc server replies end their headers with Content-Length and their body with LF", "[rpc server]") {
+    rpc_server_fixture fixture("rpc_server_reply_framing");
+    REQUIRE(fixture.start());
+
+    // The header line right before the blank line, as a line reader sees it.
+    auto last_header = [](std::string_view reply) {
+        auto const end = reply.find("\r\n\r\n");
+        auto const head = reply.substr(0, end);
+        return std::string(head.substr(head.rfind("\r\n") + 2));
+    };
+
+    auto const ok = fixture.exchange(request(1, "close"));
+    auto const answers = bodies(ok);
+    REQUIRE(answers.size() == 1);
+    CHECK(last_header(ok).starts_with("Content-Length: "));
+    CHECK(answers[0].ends_with("}\n"));
+
+    // An error reply with an extra header is framed the same way.
+    auto unauthorized = request(2, "close");
+    unauthorized.erase(unauthorized.find("Authorization:"), std::string("Authorization: Basic dGVzdDp0ZXN0\r\n").size());
+    auto const denied = fixture.exchange(unauthorized);
+    REQUIRE(denied.starts_with("HTTP/1.1 401 "));
+    CHECK(last_header(denied).starts_with("Content-Length: "));
+    REQUIRE(bodies(denied).size() == 1);
+    CHECK(bodies(denied)[0].ends_with("}\n"));
+}
