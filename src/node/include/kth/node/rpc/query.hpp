@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <kth/domain/chain/block.hpp>
 #include <kth/domain/chain/header.hpp>
@@ -111,6 +112,16 @@ struct network_info {
 // major * 1000000 + minor * 10000 + patch * 100, the services as 16 hex digits
 // with their names, and `relayfee` in BCH per kB.
 std::string render_network_info(network_info const& info);
+// One getchaintips entry.
+struct chain_tip {
+    std::size_t height;
+    hash_digest hash;
+    std::size_t branch_length;   // blocks from the connected chain to this tip
+    std::string_view status;     // "active", "valid-headers" or "headers-only"
+};
+
+// Serialize the getchaintips result array, in the order given.
+std::string render_chain_tips(std::vector<chain_tip> const& tips);
 
 // getblockheader (verbose) result object.
 std::string render_block_header(domain::chain::header const& header,

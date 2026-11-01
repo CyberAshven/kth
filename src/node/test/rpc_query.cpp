@@ -346,4 +346,9 @@ TEST_CASE("render_network_info reads the version number part by part", "[rpc que
     REQUIRE(version("2.1") == R"({"version":2010000)");
     REQUIRE(version("1.5.2-rc1") == R"({"version":1050200)");
     REQUIRE(version("unknown") == R"({"version":0)");
+TEST_CASE("render_chain_tips serializes the getchaintips entries", "[rpc query]") {
+    REQUIRE(render_chain_tips({}) == "[]");
+    REQUIRE(render_chain_tips({{7u, null_hash, 2u, "headers-only"}, {5u, null_hash, 0u, "active"}}) ==
+        std::string(R"([{"height":7,"hash":")") + zeros + R"(","branchlen":2,"status":"headers-only"},)" +
+        R"({"height":5,"hash":")" + zeros + R"(","branchlen":0,"status":"active"}])");
 }

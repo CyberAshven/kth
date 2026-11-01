@@ -74,6 +74,7 @@ counterpart.
 | `getblockchaininfo` | `kth_chain_sync_mining_info` + `kth_chain_sync_block_hash` | `fetch_mining_info()` + `get_last_heights()` |
 | `getnetworkhashps` | `kth_chain_sync_block_header_by_height` | `chain_view()` + `headers()` (chain work, timestamps) |
 | `getnetworkinfo` | `kth_network_settings` + `kth_blockchain_settings.byte_fee_satoshis` | `p2p_node::network_settings()` + `connection_count()` |
+| `getchaintips` | — (the C-API does not expose the header index) | `chain_view()` + `headers()` |
 | `getrawtransaction` | `kth_chain_sync_transaction` | `fetch_transaction(hash)` |
 | `getblock` | `kth_chain_sync_block_by_hash` | `fetch_block(hash)` |
 | `getblockheader` (`verbose=false`: raw 80-byte header hex; verbose: `confirmations`, -1 off the connected chain) | `kth_chain_sync_block_header_by_hash` | `fetch_block_header(hash)` + `chain_view()` |
@@ -170,6 +171,14 @@ peers), `protocolversion`, `localservices` (16 hex digits) with
 and `warnings`. `relayfee` is the size part of the node's transaction price,
 `node.byte_fee_satoshis` per byte, in BCH per kB; the price also charges
 `node.sigop_fee_satoshis` per signature operation.
+## getchaintips
+
+`getchaintips` returns every chain tip the header index knows, highest first,
+each with `height`, `hash`, `branchlen` (blocks from the connected chain to the
+tip) and `status`: `active` for the connected tip, `valid-headers` for a branch
+whose blocks the node all holds, and `headers-only` for one it does not. The
+header index does not record whether a block failed validation, so `invalid`
+and `valid-fork` are not reported.
 
 ## Mining: getblocktemplatelight
 

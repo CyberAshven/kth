@@ -411,6 +411,18 @@ std::string render_network_info(network_info const& info) {
     w.field("relayfee", static_cast<double>(std::max(relay_fee_per_kb, 0LL)) / satoshis_per_bch);
     w.field("warnings", "");
     w.end_object();
+std::string render_chain_tips(std::vector<chain_tip> const& tips) {
+    writer w;
+    w.begin_array();
+    for (auto const& tip : tips) {
+        w.begin_object();
+        w.field("height", static_cast<std::uint64_t>(tip.height));
+        w.field("hash", encode_hash(tip.hash));
+        w.field("branchlen", static_cast<std::uint64_t>(tip.branch_length));
+        w.field("status", tip.status);
+        w.end_object();
+    }
+    w.end_array();
     return w.str();
 }
 
