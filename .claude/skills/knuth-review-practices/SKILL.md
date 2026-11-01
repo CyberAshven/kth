@@ -34,6 +34,10 @@ These rules come from maintainer review on k-nuth/kth. A request made on one PR 
    - `git fetch` runs before every push, and a push is made only when the branch has not moved. A moved branch is built on or answered with a reply, never pushed over.
    - Replies name only commits that are on the branch.
 
+7. **CI on an external PR waits for maintainer approval** (#800, 2026-11-01).
+   - Every push to an open PR costs the maintainer an approval before its CI runs.
+   - Fixes are proven in `kth-rows.yml` first and batched into one push per PR. New PRs are opened a few at a time, not all at once.
+
 ## How changes are made
 
 - **Shape.** One issue per PR, with fix and tests together, in kth's style: Catch2 cases next to the existing tests, and comments that explain why. CI is not changed inside a feature PR.
