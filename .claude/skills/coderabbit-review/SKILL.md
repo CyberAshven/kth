@@ -26,7 +26,8 @@ The kth maintainer's rule: "Please resolve the CodeRabbit review comments before
 1. **Verify.** Is it real in the code as it stands now?
    - Its suggested fix can be wrong. On #770 it suggested removing `lenient_optional_lf_after_cr`, but the bare-LF request line the PR exists for needs that flag. The right fix kept the flag and held back a CR that ends a read until the next byte arrived.
 2. **Fix** valid findings with a test, following `knuth-review-practices`: OS-assigned test ports, tests that fail instead of hanging, negative tests, coverage.
-3. **Prove** the fix on a `test/...` branch in CI (`kth-rows.yml` on the package repo's `knuth-rpc-e2e` branch) before touching the PR. Then fast-forward the PR branch; no force-push.
+3. **Check the branch did not move** (`git fetch`). The maintainer reworks PR branches himself. If it moved, the finding may already be handled in his version: read it before doing anything, and reply about his commit, not about yours.
+   **Prove** the fix on a `test/...` branch in CI (`kth-rows.yml` on the package repo's `knuth-rpc-e2e` branch) before touching the PR. Then fast-forward the PR branch; no force-push.
 4. **Reply** in that comment's thread with only what changed and the evidence. For example: "Fixed in 1f35fff1: the client shuts down its send side after writing, so a lost pipelined request fails the response count instead of leaving the read waiting."
    - When a suggestion is wrong, say why in one or two sentences and what was done instead.
    - CodeRabbit answers a reply and resolves its own thread when the fix is right (it did so on #769).

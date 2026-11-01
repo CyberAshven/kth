@@ -32,6 +32,12 @@ These come from the maintainer's (Fernando Pelliccioni's) own review comments. T
 5. **Coverage gate.**
    kth's `codecov/patch` check fails below the project target (82.69% on 2026-11-01). Cover new error branches with tests before pushing. For example, use a stored block file damaged on purpose to reach "cannot read" and "cannot parse".
 
+6. **He edits PR branches himself.**
+   On 2026-11-01 he force-pushed his own reworks of #769 and #770 within an hour of our pushes.
+   - Before every push, `git fetch` and check the PR branch has not moved since we last saw it.
+   - Never push over his commits. If the branch moved, build on his version or reply instead.
+   - Only name commits in a reply that are actually on the branch.
+
 ## How changes are made
 
 - **Shape.** One issue per PR, with fix and tests together, in kth's own style: Catch2 test cases next to the code's existing tests, and comments that explain why. No CI changes inside a feature PR.
