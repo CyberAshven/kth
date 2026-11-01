@@ -66,10 +66,22 @@ struct rpc_server_fixture {
 
     // Send the bytes as given and read until the server closes the connection.
     [[nodiscard]] std::string exchange(std::string const& request) const {
+        return exchange_in_parts({request});
+    }
+
+    // The same, written in parts with a pause after each, so the server reads
+    // each part on its own.
+    [[nodiscard]] std::string exchange_in_parts(std::vector<std::string> const& parts) const {
         ::asio::io_context client;
         ::asio::ip::tcp::socket socket(client);
         socket.connect({::asio::ip::make_address("127.0.0.1"), port});
-        ::asio::write(socket, ::asio::buffer(request));
+        socket.set_option(::asio::ip::tcp::no_delay(true));
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            if (i > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+            ::asio::write(socket, ::asio::buffer(parts[i]));
+        }
         // Nothing more is sent. A server that lost a request then sees EOF and
         // closes, so a missing response fails the count below instead of
         // leaving this read waiting.
@@ -187,4 +199,24 @@ TEST_CASE("rpc server refuses a CR that does not end its line", "[rpc server]") 
         "Authorization: Basic dGVzdDp0ZXN0\r\n"
         "Connection: close\r\n" + head_end);
     CHECK(crlf.starts_with("HTTP/1.1 200 OK\r\n"));
+}
+
+TEST_CASE("rpc server checks a CR that ends one read against the byte after it", "[rpc server]") {
+    rpc_server_fixture fixture("rpc_server_split_cr");
+    REQUIRE(fixture.start());
+
+    // A head whose last byte is a CR, sent on its own. Whether that CR ends its
+    // line depends on the next byte, and with no body to wait for the request
+    // must not be answered on the CR alone.
+    std::string const head =
+        "POST / HTTP/1.1\r\n"
+        "Authorization: Basic dGVzdDp0ZXN0\r\n"
+        "Connection: close\r\n"
+        "Content-Length: 0\r\n"
+        "\r";
+
+    // The byte after it is not LF: the CR ends no line.
+    CHECK(fixture.exchange_in_parts({head, "X"}).starts_with("HTTP/1.1 400 Bad Request\r\n"));
+    // The byte after it is LF: the head is complete and the request is answered.
+    CHECK(fixture.exchange_in_parts({head, "\n"}).starts_with("HTTP/1.1 200 OK\r\n"));
 }

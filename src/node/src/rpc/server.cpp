@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <fstream>
 #include <random>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -127,16 +128,20 @@ struct head_line_check {
     bool after_cr = false;
     bool at_line_start = false;
 
-    // False when the bytes hold a CR that does not end its line.
-    [[nodiscard]] bool accept(std::string_view bytes) {
+    // How many of the bytes the parser may take now, or nothing when they hold
+    // a CR that does not end its line. A CR that is the last byte here, still
+    // inside the head, is held back: whether it ends a line depends on the byte
+    // after it, and the parser, lenient about the LF after a CR, could finish
+    // the request on that CR alone. It is looked at again when more arrives.
+    [[nodiscard]] std::optional<std::size_t> accept(std::string_view bytes) {
         for (auto const b : bytes) {
             if (done) {
-                return true;
+                return bytes.size();
             }
             if (after_cr) {
                 after_cr = false;
                 if (b != '\n') {
-                    return false;
+                    return std::nullopt;
                 }
             }
             if (b == '\r') {
@@ -148,7 +153,11 @@ struct head_line_check {
                 at_line_start = false;
             }
         }
-        return true;
+        if (after_cr && ! done) {
+            after_cr = false;
+            return bytes.size() - 1;
+        }
+        return bytes.size();
     }
 };
 
@@ -259,24 +268,28 @@ bool server::authorized(std::string_view authorization_header) const {
         init_parser(parser, settings, ctx);
         head_line_check head;
 
+        bool need_more = pending.empty();
         while ( ! ctx.complete) {
-            std::string_view input = pending;
-            if (input.empty()) {
+            if (need_more) {
                 auto [ec, n] = co_await socket.async_read_some(
                     ::asio::buffer(buffer), ::asio::as_tuple(::asio::use_awaitable));
                 if (ec || n == 0) {
                     co_return; // client closed or read error
                 }
-                input = std::string_view(buffer.data(), n);
+                pending.append(buffer.data(), n);
             }
-            auto const status = head.accept(input)
-                ? llhttp_execute(&parser, input.data(), input.size())
+            std::string_view const input = pending;
+            auto const ready = head.accept(input);
+            auto const status = ready
+                ? llhttp_execute(&parser, input.data(), *ready)
                 : HPE_LF_EXPECTED;
             if (status == HPE_PAUSED) {
                 // on_message_complete paused right after this request.
                 pending = std::string(llhttp_get_error_pos(&parser), input.data() + input.size());
             } else if (status == HPE_OK) {
-                pending.clear();
+                // All parsed but a CR held back for the byte after it.
+                pending.erase(0, *ready);
+                need_more = true;
             } else {
                 co_await write_response(socket, 400, "Bad Request",
                     R"({"result":null,"error":{"code":-32700,"message":"Parse error"},"id":null})",
