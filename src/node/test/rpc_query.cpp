@@ -201,4 +201,9 @@ TEST_CASE("render_estimate_fee converts the per-byte fee to BCH per kB", "[rpc q
     REQUIRE(std::stod(render_estimate_fee(1.0f)) == 0.00001);
     REQUIRE(std::stod(render_estimate_fee(2.5f)) == 0.000025);
     REQUIRE(std::stod(render_estimate_fee(0.0f)) == 0.0);
+TEST_CASE("render_network_hash_ps divides the work by the time spanned", "[rpc query]") {
+    REQUIRE(std::stod(render_network_hash_ps(uint256_t{100}, uint256_t{1300}, 1000u, 1600u)) == 2.0);
+    // No time spanned, or a window given backwards: 0.
+    REQUIRE(std::stod(render_network_hash_ps(uint256_t{100}, uint256_t{1300}, 1000u, 1000u)) == 0.0);
+    REQUIRE(std::stod(render_network_hash_ps(uint256_t{1300}, uint256_t{100}, 1000u, 1600u)) == 0.0);
 }

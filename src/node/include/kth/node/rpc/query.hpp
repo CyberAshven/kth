@@ -74,6 +74,11 @@ std::string render_mempool_entry(blockchain::mempool_entry_info const& entry,
 // The estimatefee result: `byte_fee_satoshis` per byte as BCH per kB, rounded
 // to whole satoshis per kB.
 std::string render_estimate_fee(float byte_fee_satoshis);
+// The getnetworkhashps result: the work the blocks of a window add, from the
+// chain work before them to the chain work at its last block, over the time
+// the window's timestamps span. 0 when they span no time.
+std::string render_network_hash_ps(uint256_t const& work_before, uint256_t const& work_at_end,
+                                   std::uint32_t min_time, std::uint32_t max_time);
 
 // getblockheader (verbose) result object.
 std::string render_block_header(domain::chain::header const& header,

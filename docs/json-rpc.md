@@ -71,6 +71,8 @@ counterpart.
 | `getblockhash` | `kth_chain_sync_block_hash` | `get_block_hash(height)` |
 | `getdifficulty` | `kth_chain_sync_mining_info` | `fetch_mining_info().difficulty` |
 | `getblockchaininfo` | `kth_chain_sync_mining_info` + `kth_chain_sync_block_hash` | `chain_view()` + `get_last_heights()` + `synchronization()` + `headers()` |
+| `getblockchaininfo` | `kth_chain_sync_mining_info` + `kth_chain_sync_block_hash` | `fetch_mining_info()` + `get_last_heights()` |
+| `getnetworkhashps` | `kth_chain_sync_block_header_by_height` | `chain_view()` + `headers()` (chain work, timestamps) |
 | `getrawtransaction` | `kth_chain_sync_transaction` | `fetch_transaction(hash)` |
 | `getblock` | `kth_chain_sync_block_by_hash` | `fetch_block(hash)` |
 | `getblockheader` (`verbose=false`: raw 80-byte header hex; verbose: `confirmations`, -1 off the connected chain) | `kth_chain_sync_block_header_by_hash` | `fetch_block_header(hash)` + `chain_view()` |
@@ -127,6 +129,15 @@ satoshis per kB (`0.000001` with the default `0.1`). The price also charges
 carry, so a transaction pays that on top. The node has no fee estimator: the
 target-blocks argument older clients send is accepted and does not change the
 answer.
+## getnetworkhashps
+
+`getnetworkhashps [nblocks=120] [height=-1]` returns the hashes per second the
+network did over the `nblocks` blocks ending at `height` on the connected chain:
+the chain work those blocks add, divided by the time between the earliest and
+the latest timestamp among them and the block before them. A non-positive
+`nblocks` counts the default 120 and the window stops at the genesis block; a
+`height` of -1, or past the connected tip, means the connected tip. It is `0`
+when those timestamps span no time.
 
 ## Mining: getblocktemplatelight
 
