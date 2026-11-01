@@ -16,6 +16,7 @@
 
 #include <kth/node/mining/job_store.hpp>
 #include <kth/node/rpc/dispatch.hpp>
+#include <kth/node/rpc/query.hpp>
 #include "../../blockchain/test/reorg_chain_fixture.hpp"
 #include "sync_harness.hpp"
 
@@ -92,6 +93,10 @@ TEST_CASE("getblockheader dispatch counts confirmations from the connected tip",
     test::connect_bodies(fixture, {trunk.begin(), trunk.begin() + 3}, 1);
     REQUIRE(fixture.chain().chain_view()->connected_tip_height == 3u);
 
+TEST_CASE("estimatefee dispatch answers with or without a target", "[rpc dispatch]") {
+    test::chain_fixture fixture("rpc_estimate_fee");
+    REQUIRE(fixture.created());
+    REQUIRE(fixture.start());
     node::mining::job_store jobs(1, 60);
     node::rpc::method_context context{fixture.chain(), jobs};
     node::rpc::dispatcher dispatcher;
@@ -100,6 +105,7 @@ TEST_CASE("getblockheader dispatch counts confirmations from the connected tip",
     auto request = [&](std::string const& params) {
         auto const body = R"({"method":"validateaddress","params":)" + params + R"(,"id":3})";
         auto const body = R"({"method":"help","params":)" + params + R"(,"id":5})";
+        auto const body = R"({"method":"estimatefee","params":)" + params + R"(,"id":2})";
         ::asio::io_context io;
         auto result = ::asio::co_spawn(io, dispatcher.handle(context, body), ::asio::use_future);
         io.run();
@@ -226,4 +232,9 @@ TEST_CASE("getblockchaininfo dispatch leaves initial download once synchronized"
     REQUIRE(confirmations(trunk[2].hash()) == 1);
     // Stored, but its block is not connected yet.
     REQUIRE(confirmations(trunk[4].hash()) == -1);
+    auto const expected = node::rpc::build_success("2",
+        node::rpc::render_estimate_fee(fixture.chain().chain_settings().byte_fee_satoshis));
+    // Fulcrum sends one argument to nodes it does not know to take none.
+    REQUIRE(request("[6]") == expected);
+    REQUIRE(request("[]") == expected);
 }

@@ -71,6 +71,11 @@ std::string render_mempool_entry(blockchain::mempool_entry_info const& entry,
 
 // getblockheader (verbose) result object. `confirmations` is -1 for a block
 // that is not on the connected chain.
+// The estimatefee result: `byte_fee_satoshis` per byte as BCH per kB, rounded
+// to whole satoshis per kB.
+std::string render_estimate_fee(float byte_fee_satoshis);
+
+// getblockheader (verbose) result object.
 std::string render_block_header(domain::chain::header const& header,
                                 std::size_t height, hash_digest const& hash,
                                 std::int64_t confirmations);
