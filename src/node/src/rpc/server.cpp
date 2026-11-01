@@ -110,7 +110,9 @@ int on_message_complete(llhttp_t* p) {
     c->complete = true;
     c->method = llhttp_get_method(p);
     c->keep_alive = llhttp_should_keep_alive(p) != 0;
-    return 0;
+    // Stop at the end of this request: bytes after it belong to the next
+    // request a client pipelined on the same connection.
+    return HPE_PAUSED;
 }
 
 void init_parser(llhttp_t& parser, llhttp_settings_t& settings, parse_ctx& ctx) {
@@ -121,6 +123,12 @@ void init_parser(llhttp_t& parser, llhttp_settings_t& settings, parse_ctx& ctx) 
     settings.on_body = on_body;
     settings.on_message_complete = on_message_complete;
     llhttp_init(&parser, HTTP_REQUEST, &settings);
+    // Mining pool software in the ckpool family ends its request lines with a
+    // bare LF instead of CRLF. llhttp takes the LF after the HTTP version for
+    // the CR and then needs the LF to be optional, so the request line needs
+    // both flags; header lines need only the first.
+    llhttp_set_lenient_optional_cr_before_lf(&parser, 1);
+    llhttp_set_lenient_optional_lf_after_cr(&parser, 1);
     parser.data = &ctx;
 }
 
@@ -134,20 +142,24 @@ void init_parser(llhttp_t& parser, llhttp_settings_t& settings, parse_ctx& ctx) 
     bool keep_alive,
     std::string_view extra_headers = {}) {
 
+    // Pool software in the ckpool family reads a reply line by line: it takes
+    // the line after Content-Length as the end of the headers, and the body as
+    // one JSON line. So Content-Length comes last and the body ends in LF.
     std::string out;
     out.reserve(body.size() + 160);
     out += "HTTP/1.1 ";
     out += std::to_string(status);
     out += ' ';
     out += reason;
-    out += "\r\nContent-Type: application/json\r\nContent-Length: ";
-    out += std::to_string(body.size());
-    out += "\r\nConnection: ";
+    out += "\r\nContent-Type: application/json\r\nConnection: ";
     out += keep_alive ? "keep-alive" : "close";
     out += "\r\n";
     out += extra_headers;
-    out += "\r\n";
+    out += "Content-Length: ";
+    out += std::to_string(body.size() + 1);
+    out += "\r\n\r\n";
     out += body;
+    out += '\n';
 
     co_await ::asio::async_write(socket, ::asio::buffer(out),
         ::asio::as_tuple(::asio::use_awaitable));
@@ -204,6 +216,9 @@ bool server::authorized(std::string_view authorization_header) const {
 
 ::asio::awaitable<void> server::serve_connection(::asio::ip::tcp::socket& socket) {
     std::array<char, 8192> buffer;
+    // Bytes read past the end of the previous request: the start of the next
+    // one when a client pipelines requests on a keep-alive connection.
+    std::string pending;
     for (;;) {
         parse_ctx ctx;
         llhttp_t parser;
@@ -211,12 +226,22 @@ bool server::authorized(std::string_view authorization_header) const {
         init_parser(parser, settings, ctx);
 
         while ( ! ctx.complete) {
-            auto [ec, n] = co_await socket.async_read_some(
-                ::asio::buffer(buffer), ::asio::as_tuple(::asio::use_awaitable));
-            if (ec || n == 0) {
-                co_return; // client closed or read error
+            std::string_view input = pending;
+            if (input.empty()) {
+                auto [ec, n] = co_await socket.async_read_some(
+                    ::asio::buffer(buffer), ::asio::as_tuple(::asio::use_awaitable));
+                if (ec || n == 0) {
+                    co_return; // client closed or read error
+                }
+                input = std::string_view(buffer.data(), n);
             }
-            if (llhttp_execute(&parser, buffer.data(), n) != HPE_OK) {
+            auto const status = llhttp_execute(&parser, input.data(), input.size());
+            if (status == HPE_PAUSED) {
+                // on_message_complete paused right after this request.
+                pending = std::string(llhttp_get_error_pos(&parser), input.data() + input.size());
+            } else if (status == HPE_OK) {
+                pending.clear();
+            } else {
                 co_await write_response(socket, 400, "Bad Request",
                     R"({"result":null,"error":{"code":-32700,"message":"Parse error"},"id":null})",
                     false);
