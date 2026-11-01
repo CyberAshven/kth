@@ -78,6 +78,9 @@ counterpart.
 | `getrawtransaction` | `kth_chain_sync_transaction` | `fetch_transaction(hash)` |
 | `getblock` | `kth_chain_sync_block_by_hash` | `fetch_block(hash)` |
 | `getblockheader` (`verbose=false`: raw 80-byte header hex; verbose: `confirmations`, -1 off the connected chain) | `kth_chain_sync_block_header_by_hash` | `fetch_block_header(hash)` + `chain_view()` |
+| `getrawtransaction` | `kth_chain_sync_transaction` (+ `kth_chain_sync_block_by_hash`) | `fetch_transaction(hash)` (mempool), or `fetch_block(blockhash)` |
+| `getblock` | `kth_chain_sync_block_by_hash` | `fetch_block(hash)` (flat-file block store) |
+| `getblockheader` (`verbose=false`: raw 80-byte header hex) | `kth_chain_sync_block_header_by_hash` | `fetch_block_header(hash)` |
 | `sendrawtransaction` | `kth_chain_sync_organize_transaction` | `organize(tx)` |
 | `validateaddress` | `kth_wallet_payment_address_parse_from` | `wallet::payment_address::parse_from(address, network)` |
 | `decoderawtransaction` | `kth_chain_transaction_construct_from_data` | `transaction::from_data()` |
@@ -193,6 +196,14 @@ block's sigchecks limit), `sizelimit`, `curtime`, `bits` and `height`. It is the
 same template `getblocktemplatelight` serves, so the two agree on the selection.
 Only `template` mode is supported; long polling is not, and `longpollid` only
 changes with the tip or the mempool.
+## Blocks and transactions
+
+`getblock "<hash>"` reads the block from the flat-file block store, through the
+header index, and returns it as hex; a side-branch block the node holds is
+returned too. `getrawtransaction "<txid>"` answers for a mempool transaction.
+Confirmed transactions are not indexed by txid (#491), so for one of those pass
+the block hash as the third parameter: `getrawtransaction "<txid>" false
+"<blockhash>"`. A block or transaction the node does not have is error `-5`.
 
 ## Mining: getblocktemplatelight
 

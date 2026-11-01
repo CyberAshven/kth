@@ -79,6 +79,8 @@ TEST_CASE("getblockheader dispatch counts confirmations from the connected tip",
     test::chain_fixture fixture("rpc_header_confirmations");
 TEST_CASE("getchaintips dispatch reports the connected tip and the branches beyond it", "[rpc dispatch]") {
     test::chain_fixture fixture("rpc_chain_tips");
+TEST_CASE("getblock and getrawtransaction dispatch read the block files and the mempool", "[rpc dispatch]") {
+    test::chain_fixture fixture("rpc_block_file_reads");
     REQUIRE(fixture.created());
     REQUIRE(fixture.start());
 
@@ -167,6 +169,9 @@ TEST_CASE("estimatefee dispatch answers with or without a target", "[rpc dispatc
         prev = side.back().hash();
     }
     REQUIRE(fixture.organizer().add_headers(test::headers_of(side)).headers_added == side.size());
+    REQUIRE(fixture.organizer().add_headers(test::headers_of(trunk)).headers_added == trunk.size());
+    test::persist_headers(fixture, trunk, 1);
+    test::connect_bodies(fixture, {trunk.begin(), trunk.begin() + 3}, 1);
 
     node::mining::job_store jobs(1, 60);
     node::rpc::method_context context{fixture.chain(), jobs};
@@ -181,6 +186,8 @@ TEST_CASE("estimatefee dispatch answers with or without a target", "[rpc dispatc
         auto const body = R"({"method":"getnetworkhashps","params":)" + params + R"(,"id":4})";
     auto request = [&](std::string const& params) {
         auto const body = R"({"method":"gettxout","params":)" + params + R"(,"id":7})";
+    auto request = [&](std::string const& method, std::string const& params) {
+        auto const body = R"({"method":")" + method + R"(","params":)" + params + R"(,"id":12})";
         ::asio::io_context io;
         auto result = ::asio::co_spawn(io, dispatcher.handle(context, body), ::asio::use_future);
         io.run();
@@ -436,4 +443,33 @@ TEST_CASE("getblocktemplate dispatch serves the template with its transactions",
     REQUIRE(request("[]").find(R"("error":null)") != std::string::npos);
     REQUIRE(request(R"([{"mode":"proposal","data":"00"}])") ==
         node::rpc::build_error("11", -32602, "only template mode is supported"));
+    auto const quoted = [](hash_digest const& hash) { return '"' + encode_hash(hash) + '"'; };
+    auto const hex = [](std::string const& text) { return '"' + text + '"'; };
+
+    // Block 3, as stored, by hash.
+    REQUIRE(request("getblock", "[" + quoted(trunk[2].hash()) + ",false]") ==
+        node::rpc::build_success("12", hex(node::rpc::block_to_hex(trunk[2]))));
+    REQUIRE(request("getblock", "[" + quoted(null_hash) + "]") ==
+        node::rpc::build_error("12", -5, "Block not found"));
+
+    // A confirmed transaction: with its block hash, and not without one.
+    auto const& coinbase = trunk[2].transactions().front();
+    REQUIRE(request("getrawtransaction", "[" + quoted(coinbase.hash()) + ",false," + quoted(trunk[2].hash()) + "]") ==
+        node::rpc::build_success("12", hex(node::rpc::transaction_to_hex(coinbase))));
+    REQUIRE(request("getrawtransaction", "[" + quoted(coinbase.hash()) + ",false," + quoted(trunk[1].hash()) + "]") ==
+        node::rpc::build_error("12", -5, "No such transaction found in the provided block"));
+    REQUIRE(request("getrawtransaction", "[" + quoted(coinbase.hash()) + "]") ==
+        node::rpc::build_error("12", -5, "No such mempool transaction; pass the block hash for a confirmed one"));
+
+    // A mempool transaction, by txid alone.
+    domain::chain::input::list ins;
+    ins.emplace_back(domain::chain::output_point{coinbase.hash(), 0}, domain::chain::script{}, 0xffffffffu);
+    domain::chain::output::list outs;
+    outs.emplace_back(1000u, test::miner_script(), domain::chain::token_data_opt{});
+    auto const pooled = std::make_shared<domain::message::transaction>(
+        domain::chain::transaction{2u, 0u, std::move(ins), std::move(outs)});
+    REQUIRE(fixture.chain().mempool_ref().add(blockchain::mempool_entry{
+        pooled, 1000u, uint32_t(pooled->serialized_size(true)), 1u, 0u}));
+    REQUIRE(request("getrawtransaction", "[" + quoted(pooled->hash()) + "]") ==
+        node::rpc::build_success("12", hex(node::rpc::transaction_to_hex(*pooled))));
 }
