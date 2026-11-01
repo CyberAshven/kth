@@ -1,6 +1,6 @@
 ---
 name: "coderabbit-review"
-description: "The CodeRabbit review loop for k-nuth/kth PRs: trigger `@coderabbitai review` one PR at a time, check each finding, fix and prove, reply, get every thread resolved, and only then request approval. Use before requesting approval on any kth PR, or when CodeRabbit comments on one."
+description: "Handling CodeRabbit reviews on k-nuth/kth PRs: reviews are triggered by the maintainer only; check each finding, fix and prove, reply, and get every thread resolved before approval is requested. Use when CodeRabbit comments on a kth PR, or before requesting approval on one."
 ---
 
 # CodeRabbit review for kth PRs
@@ -9,10 +9,8 @@ On k-nuth/kth, CodeRabbit comments are resolved before approval is requested. Au
 
 ## Triggering
 
-- The comment is exactly `@coderabbitai review`. Reviews are incremental: only commits not yet reviewed are read. `@coderabbitai full review` reviews the whole PR again.
-- **One PR at a time.** The free plan is rate-limited. On 2026-11-01, five triggers posted within a minute got one "Review triggered" and four "Review rate limited" answers, with no wait time given.
-  - The next PR is triggered only after the previous review has been posted.
-  - After "Review rate limited", about 20 minutes pass before that PR is triggered again. Repeated triggers are not posted in a row, since each one is a comment on the maintainer's repository.
+- **Reviews are not triggered from our side.** The owner decided this on 2026-11-01. The free plan is rate-limited: five triggers within a minute got one review and four "Review rate limited" answers, and a later paced trigger was limited too. Every trigger is also a comment on the maintainer's repository.
+- Reviews run when the maintainer triggers them (`@coderabbitai review`). Their findings are handled as below.
 - A trigger on a PR whose commits were all reviewed already ends with "Review finished" and no new comments. That is not a failure.
 
 ## Reading the review
@@ -31,7 +29,6 @@ On k-nuth/kth, CodeRabbit comments are resolved before approval is requested. Au
 4. **Reply.** The reply in the comment's thread holds only what changed and the evidence. Example: "Fixed in 1f35fff1: the client shuts down its send side after writing, so a lost pipelined request fails the response count instead of leaving the read waiting."
    - A wrong suggestion is answered in one or two sentences saying why, and what was done instead.
    - CodeRabbit answers the reply and resolves its own thread when the fix is right, as it did on #769.
-5. **Trigger again.** `@coderabbitai review` is posted so the fix commits are reviewed.
 
 ## Before approval is requested
 

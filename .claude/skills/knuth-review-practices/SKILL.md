@@ -10,7 +10,7 @@ These rules come from maintainer review on k-nuth/kth. A request made on one PR 
 ## Review rules
 
 1. **CodeRabbit comments are resolved before approval is requested.**
-   - A review is triggered with `@coderabbitai review`; see the `coderabbit-review` skill.
+   - Reviews are triggered by the maintainer, never from our side (rate limits; owner's decision, 2026-11-01). See the `coderabbit-review` skill.
    - Each finding is checked against the current code. Suggested fixes can be wrong: on #770 the removal of a parser flag was suggested, but the feature depends on that flag, so the gap was closed another way.
    - Valid findings are fixed and invalid ones are answered with evidence. Every thread ends resolved.
 
