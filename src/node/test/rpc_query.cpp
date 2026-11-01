@@ -108,8 +108,8 @@ TEST_CASE("header_to_hex serializes the 80-byte wire header", "[rpc query]") {
 TEST_CASE("render_block_header serializes the verbose header fields", "[rpc query]") {
     domain::chain::header h{/*version*/ 2u, null_hash, null_hash,
                            /*timestamp*/ 1000u, /*bits*/ 0x1d00ffffu, /*nonce*/ 42u};
-    REQUIRE(render_block_header(h, /*height*/ 5u, null_hash) ==
-        std::string(R"({"hash":")") + zeros + R"(","height":5,"version":2,)" +
+    REQUIRE(render_block_header(h, /*height*/ 5u, null_hash, /*confirmations*/ 3) ==
+        std::string(R"({"hash":")") + zeros + R"(","confirmations":3,"height":5,"version":2,)" +
         R"("previousblockhash":")" + zeros + R"(","merkleroot":")" + zeros + R"(",)" +
         R"("time":1000,"bits":"1d00ffff","nonce":42})");
 }
@@ -189,4 +189,9 @@ TEST_CASE("chain_name gives each network's short chain name", "[rpc query]") {
     REQUIRE(chain_name(network::scalenet) == "scale");
     REQUIRE(chain_name(network::chipnet) == "chip");
     REQUIRE(chain_name(network::regtest) == "regtest");
+TEST_CASE("render_block_header reports a block off the connected chain", "[rpc query]") {
+    domain::chain::header h{/*version*/ 2u, null_hash, null_hash,
+                           /*timestamp*/ 1000u, /*bits*/ 0x1d00ffffu, /*nonce*/ 42u};
+    REQUIRE(render_block_header(h, /*height*/ 5u, null_hash, /*confirmations*/ -1).find(
+        R"("confirmations":-1,"height":5,)") != std::string::npos);
 }
