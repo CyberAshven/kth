@@ -13,8 +13,10 @@
 
 #include <kth/domain/chain/block.hpp>
 #include <kth/domain/chain/header.hpp>
+#include <kth/domain/chain/output.hpp>
 #include <kth/domain/chain/transaction.hpp>
 #include <kth/domain/config/network.hpp>
+#include <kth/domain/machine/script_flags.hpp>
 #include <kth/infrastructure/hash_define.hpp>
 #include <kth/infrastructure/math/hash.hpp>
 
@@ -79,6 +81,21 @@ std::string render_estimate_fee(float byte_fee_satoshis);
 // the window's timestamps span. 0 when they span no time.
 std::string render_network_hash_ps(uint256_t const& work_before, uint256_t const& work_at_end,
                                    std::uint32_t min_time, std::uint32_t max_time);
+// A transaction as the decoderawtransaction result object: txid, hash,
+// version, size, locktime, vin and vout, with each output's value in BCH, its
+// script, its kind and addresses, and its token data. Addresses are cashaddr
+// under `net`'s prefix. Script text is kth's own notation (script::to_string
+// under `flags`); the hex is there for anything that reads the bytes.
+std::string render_transaction(domain::chain::transaction const& tx,
+                               domain::config::network net, domain::script_flags_t flags);
+
+// The gettxout result object for an unspent output: the tip it was read
+// against, its confirmations (0 for an output of a mempool transaction), its
+// value in BCH, its scriptPubKey and token data as decoderawtransaction shows
+// them, and whether a coinbase created it.
+std::string render_tx_out(hash_digest const& best_block, std::int64_t confirmations,
+                          domain::chain::output const& output, bool coinbase,
+                          domain::config::network net, domain::script_flags_t flags);
 
 // getblockheader (verbose) result object.
 std::string render_block_header(domain::chain::header const& header,
