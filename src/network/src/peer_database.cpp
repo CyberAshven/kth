@@ -186,7 +186,8 @@ std::pair<size_t, size_t> peer_database::count_by_status() const {
 bool peer_database::store_address(domain::message::network_address const& addr) {
     auto const authority = infrastructure::config::authority(addr);
 
-    if (authority.port() == 0 && ! authority.is_i2p()) {
+    // An onion service is dialled by port. IP records keep their old handling.
+    if (authority.is_tor_v3() && authority.port() == 0) {
         return false;
     }
 

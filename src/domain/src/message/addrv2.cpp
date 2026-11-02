@@ -92,7 +92,8 @@ std::optional<infrastructure::message::network_address> addrv2_entry::to_network
         std::copy(addr_.begin(), addr_.end(), ip.begin() + 12);
     } else if (network_ == bip155_network::ipv6 && addr_.size() == ADDR_IPV6_SIZE) {
         std::copy(addr_.begin(), addr_.end(), ip.begin());
-    } else if (network_ == bip155_network::torv3 || network_ == bip155_network::i2p) {
+    } else if ((network_ == bip155_network::torv3 && addr_.size() == ADDR_TORV3_SIZE)
+        || (network_ == bip155_network::i2p && addr_.size() == ADDR_I2P_SIZE)) {
         infrastructure::message::overlay_address address{};
         std::copy(addr_.begin(), addr_.end(), address.begin());
         auto const network = network_ == bip155_network::i2p

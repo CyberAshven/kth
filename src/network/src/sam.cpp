@@ -7,9 +7,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <string_view>
 #include <system_error>
 #include <unordered_map>
@@ -381,18 +383,24 @@ std::optional<authority> sam_session::local_address() const {
     return impl_->address;
 }
 
+// co_spawn needs a default-constructible result and a socket is not one, so
+// the result crosses the strand inside an optional.
 awaitable_expected<socket_type> sam_session::connect(std::string hostname) {
     auto self = impl_;
-    co_return co_await ::asio::co_spawn(self->strand, [self, hostname]() -> awaitable_expected<socket_type> {
-        co_return co_await with_deadline(self->connect(hostname), self->timeout);
-    }, ::asio::use_awaitable);
+    auto result = co_await ::asio::co_spawn(self->strand,
+        [self, hostname]() -> ::asio::awaitable<std::optional<std::expected<socket_type, code>>> {
+            co_return co_await with_deadline(self->connect(hostname), self->timeout);
+        }, ::asio::use_awaitable);
+    co_return std::move(*result);
 }
 
 awaitable_expected<sam_inbound> sam_session::accept() {
     auto self = impl_;
-    co_return co_await ::asio::co_spawn(self->strand, [self]() -> awaitable_expected<sam_inbound> {
-        co_return co_await with_deadline(self->accept(), self->timeout);
-    }, ::asio::use_awaitable);
+    auto result = co_await ::asio::co_spawn(self->strand,
+        [self]() -> ::asio::awaitable<std::optional<std::expected<sam_inbound, code>>> {
+            co_return co_await with_deadline(self->accept(), self->timeout);
+        }, ::asio::use_awaitable);
+    co_return std::move(*result);
 }
 
 } // namespace kth::network
