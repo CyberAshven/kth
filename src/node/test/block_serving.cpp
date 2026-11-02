@@ -38,12 +38,13 @@ struct served_chain {
         test::persist_headers(fixture, trunk, 1);
         test::connect_bodies(fixture, {trunk.begin(), trunk.begin() + 3}, 1);
 
+        // Into the index directly: only its place off the active chain matters here.
         prev = trunk[0].hash();
         for (uint32_t h = 2; h <= 3; ++h) {
             side.push_back(test::mine_block(prev, h, base_time + h * test::block_spacing + 1, 1, {}, 0));
             prev = side.back().hash();
+            REQUIRE(chain().headers().add(side.back().hash(), side.back().header()).inserted);
         }
-        REQUIRE(fixture.organizer().add_headers(test::headers_of(side)).headers_added == side.size());
 
         auto const heights = chain().get_last_heights();
         REQUIRE(heights);
