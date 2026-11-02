@@ -823,11 +823,9 @@ TEST_CASE("peer_database filters unreachable overlays before selecting peers", "
     CHECK(db.fetch_address(selected, none) == error::not_found);
     CHECK(db.size() == 2);
 
-    // As before, an IP address without a port is kept but never selected.
     auto bad_ip = auth("8.8.8.8:0").to_network_address();
     bad_ip.set_services(1);
-    CHECK(db.store_address(bad_ip));
-    CHECK(db.get_connectable(100).size() == 2);
+    CHECK( ! db.store_address(bad_ip));
     auto bad_onion = onion_address;
     bad_onion.set_port(0);
     CHECK( ! db.store_address(bad_onion));

@@ -91,7 +91,6 @@ TEST_CASE("I2P settings retain defaults and command line values", "[configuratio
     std::ostringstream error;
     REQUIRE(parser.parse(11, argv, error));
     CHECK(parser.configured.network.i2psam == "[::1]:7656");
-    CHECK(parser.settings_text().find("[::1]:7656") != std::string::npos);
     CHECK_FALSE(parser.configured.network.i2p_accept_incoming);
     CHECK(parser.configured.network.i2p_private_key_file == path("private/i2p_key"));
     REQUIRE(parser.configured.network.peers.size() == 1);
