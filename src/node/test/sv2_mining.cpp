@@ -741,10 +741,13 @@ TEST_CASE("sv2 mining network shares connect blocks and advance every channel", 
     }
     std::shared_ptr<operation> blocked;
     size_t sent = 0;
+    // A write counts as stalled only after half a second without progress: a
+    // loaded machine can take longer than that to drain a write that is not
+    // stalled at all.
     while (sent + flood.size() <= 8 * 1024 * 1024) {
         blocked = fixture.begin_write(*slow, flood);
         sent += flood.size();
-        if ( ! fixture.wait_until([&] { return blocked->done; }, 50ms)) break;
+        if ( ! fixture.wait_until([&] { return blocked->done; }, 500ms)) break;
         REQUIRE_FALSE(blocked->error);
     }
     REQUIRE(blocked);
