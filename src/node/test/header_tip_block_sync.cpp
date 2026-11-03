@@ -2018,12 +2018,12 @@ struct compact_network_run {
 
 void require_compact_fallback(p2p_node& network, peer_ptr const& peer, hash_digest const& hash,
     std::chrono::milliseconds limit = quick) {
-    std::optional<detail::ingest_submit> submitted;
+    std::optional<kth::node::detail::ingest_submit> submitted;
     REQUIRE(wait_until([&] {
         return network.header_ingest().commands.try_receive(
-            [&](std::error_code ec, detail::ingest_command command) {
+            [&](std::error_code ec, kth::node::detail::ingest_command command) {
                 REQUIRE_FALSE(ec);
-                auto const* batch = std::get_if<detail::ingest_submit>(&command);
+                auto const* batch = std::get_if<kth::node::detail::ingest_submit>(&command);
                 REQUIRE(batch != nullptr);
                 submitted = *batch;
             });
@@ -2165,7 +2165,7 @@ TEST_CASE("compact relay bounds pending reconstruction across peers and per peer
         (void)offer(*peer, uint32_t(p.session->nonce()));
         CHECK_FALSE(next_compact_request(*peer, domain::message::get_block_transactions::command,
             nullptr, std::chrono::milliseconds(100)));
-        CHECK_FALSE(run.network.header_ingest().commands.try_receive([](std::error_code, detail::ingest_command) {}));
+        CHECK_FALSE(run.network.header_ingest().commands.try_receive([](std::error_code, kth::node::detail::ingest_command) {}));
     }
     auto const second_hash = offer(p, 5);
     require_compact_fallback(run.network, p.session, second_hash);
