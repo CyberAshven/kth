@@ -85,11 +85,27 @@ Message response(data_chunk const& bytes) {
     return *message;
 }
 
+// A P2PKH cashaddr on the given network: version byte 0 and a 20-byte hash,
+// packed into 5-bit groups. (The cashaddr spec's checksum vector has no
+// version byte, so it is not an address.)
 std::string payout_address(std::string_view prefix = "bchreg") {
-    auto const decoded = domain::wallet::cashaddr::decode(
-        "bitcoincash:qpzry9x8gf2tvdw0s3jn54khce6mua7lcw20ayyn", "");
-    REQUIRE_FALSE(decoded.first.empty());
-    return domain::wallet::cashaddr::encode(prefix, decoded.second);
+    data_chunk bytes(1 + 20, 0x11);
+    bytes[0] = 0x00;
+    data_chunk groups;
+    uint32_t accumulator = 0;
+    unsigned bits = 0;
+    for (auto const byte : bytes) {
+        accumulator = (accumulator << 8) | byte;
+        bits += 8;
+        while (bits >= 5) {
+            bits -= 5;
+            groups.push_back(uint8_t((accumulator >> bits) & 31));
+        }
+    }
+    if (bits > 0) {
+        groups.push_back(uint8_t((accumulator << (5 - bits)) & 31));
+    }
+    return domain::wallet::cashaddr::encode(std::string{prefix}, groups);
 }
 
 struct operation {
