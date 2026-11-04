@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -26,6 +27,7 @@
 #include <kth/node/settings.hpp>
 #include <kth/node/sv2/jd_connection.hpp>
 #include <kth/node/sv2/jd_declaration.hpp>
+#include <kth/node/sv2/jd_failover.hpp>
 #include <kth/node/sv2/jd_session.hpp>
 #include <kth/node/sv2/jd_settings.hpp>
 
@@ -44,8 +46,8 @@ struct jd_notice {
     blockchain::mining_template solo{};
 };
 
-// Own both upstreams together. A refusal or disconnect closes the other one;
-// the listener and its solo mining sessions have independent lifetimes.
+// Own each Mining/JDS pair together. Only the active pair publishes payouts;
+// one higher-priority pair may recover without disturbing downstream work.
 struct jd_client {
     // settings have passed validate_jd_settings and solo payout validation.
     jd_client(sv2_settings const& settings, ::asio::any_io_executor executor,
@@ -61,6 +63,7 @@ struct jd_client {
     // Empty until an allocation has been published, or until fallback republishes
     // the same template for the solo payout. Safe to call off this client's strand.
     [[nodiscard]] boost::shared_ptr<jd_notice const> notice() const;
+    [[nodiscard]] boost::shared_ptr<jd_status const> status() const;
 
     using publication_channel = broadcaster<int>::channel_type;
 
@@ -75,34 +78,40 @@ struct jd_client {
     void observe_share(mining::pool_proof proof);
 
 private:
+    struct attempt;
     ::asio::awaitable<void> run_owned();
-    ::asio::awaitable<void> serve(jd_connection& connection, jd_session& session,
-        char const* name);
-    ::asio::awaitable<void> declare_templates();
-    bool dispatch(jd_declaration::result result);
-    void publish_pool();
-    void publish_solo();
-    void note_share(mining::pool_proof const& proof);
-    void forward_share(mining::pool_proof const& proof);
-    void flush_cached();
+    ::asio::awaitable<void> run_attempt(std::shared_ptr<attempt> value);
+    ::asio::awaitable<void> serve(attempt& value, jd_connection& connection,
+        jd_session& session, jd_peer peer);
+    ::asio::awaitable<void> declare_templates(attempt& value);
+    void start_attempt(size_t index, bool probe);
+    void fail(attempt& value, jd_failure kind, std::string reason);
+    void update_status();
+    void mark_ready(attempt& value);
+    bool recover_at_boundary();
+    bool dispatch(attempt& value, jd_declaration::result result);
+    bool share_response(attempt& value, message_header const& header, byte_span payload);
+    void publish_pool(attempt& value);
+    void publish_solo(attempt const& value);
+    void note_share(attempt& value, mining::pool_proof const& proof);
+    void forward_share(attempt& value, mining::pool_proof const& proof);
+    void flush_cached(attempt& value);
 
     ::asio::strand<::asio::any_io_executor> owner_;
-    jd_connection mining_;
-    jd_connection declaration_;
-    jd_session mining_session_;
-    jd_session declaration_session_;
-    jd_declaration jobs_;
+    sv2_settings const settings_;
+    std::vector<sv2_settings::jd_upstream> const upstreams_;
+    jd_failover policy_;
+    std::shared_ptr<attempt> active_;
+    std::shared_ptr<attempt> probe_;
     blockchain::block_chain* const chain_;
     std::chrono::seconds const response_timeout_;
-    std::optional<std::chrono::steady_clock::time_point> job_deadline_;
     ::asio::experimental::concurrent_channel<void(std::error_code, int)> ready_;
+    ::asio::experimental::concurrent_channel<void(std::error_code, int)> stopping_;
     boost::atomic_shared_ptr<jd_notice> notice_;
+    boost::atomic_shared_ptr<jd_status> status_;
     broadcaster<int> publications_;
-    std::vector<mining::pool_proof> cached_;
-    uint32_t share_sequence_ = 0;
     std::atomic_bool stopped_{false};
     bool published_ = false;
-    bool pool_live_ = false;
 };
 
 } // namespace kth::node::sv2
