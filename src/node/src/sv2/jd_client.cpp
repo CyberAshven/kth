@@ -81,6 +81,7 @@ jd_client::jd_client(sv2_settings const& settings, ::asio::any_io_executor execu
     , chain_(chain)
     , response_timeout_(settings.jd.response_timeout_seconds)
     , ready_(owner_, 1)
+    , publications_(owner_, 1)
 {}
 
 ::asio::awaitable<void> jd_client::serve(jd_connection& connection,
@@ -312,6 +313,17 @@ boost::shared_ptr<jd_notice const> jd_client::notice() const {
     return notice_.load();
 }
 
+std::shared_ptr<jd_client::publication_channel> jd_client::subscribe_publications() {
+    auto channel = publications_.subscribe();
+    // Registration and this wake-up cover a publication before the first wait.
+    (void)channel->try_send(std::error_code{}, 1);
+    return channel;
+}
+
+void jd_client::unsubscribe_publications(std::shared_ptr<publication_channel> const& channel) {
+    publications_.unsubscribe(channel);
+}
+
 void jd_client::observe_share(mining::pool_proof proof) {
     ::asio::post(owner_, [this, proof = std::move(proof)] {
         if (stopped_) return;
@@ -339,6 +351,8 @@ void jd_client::publish_pool() {
     next->generation = (current ? current->generation : 0) + 1;
     notice_.store(next);
     pool_live_ = true;
+    // A full slot already asks the consumer to load the latest notice.
+    publications_.publish(1);
 }
 
 void jd_client::publish_solo() {
@@ -352,6 +366,7 @@ void jd_client::publish_solo() {
     next->previous = next->solo.previous_block_hash;
     next->generation = (current ? current->generation : 0) + 1;
     notice_.store(next);
+    publications_.publish(1);
     spdlog::info("[sv2 jd] Downstream work pays the solo address again");
 }
 

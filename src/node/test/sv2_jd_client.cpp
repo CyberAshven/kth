@@ -26,6 +26,7 @@
 #include <asio/io_context.hpp>
 #include <asio/ip/address_v4.hpp>
 #include <asio/read.hpp>
+#include <asio/use_awaitable.hpp>
 #include <asio/use_future.hpp>
 #include <asio/write.hpp>
 
@@ -292,6 +293,10 @@ node::sv2_settings settings(fake_upstream const& pool, fake_upstream const& jds)
 
 ::asio::awaitable<void> await_client_ready(std::shared_ptr<jd_client> client) {
     co_await client->wait_until_ready();
+}
+
+::asio::awaitable<int> receive_publication(std::shared_ptr<jd_client::publication_channel> channel) {
+    co_return co_await channel->async_receive(::asio::use_awaitable);
 }
 
 struct client_fixture : io_driver {
@@ -1114,6 +1119,113 @@ TEST_CASE("sv2 JD invalid listener configuration reports failure before acceptin
     REQUIRE_NOTHROW(result.get());
     CHECK_FALSE(fixture.pool.accepted->done);
     CHECK_FALSE(fixture.jds.accepted->done);
+}
+
+TEST_CASE("sv2 JD provider stop joins publication waiters and both upstreams", "[sv2 jd]") {
+    bool disconnected = false;
+    SECTION("allocation is unanswered") {}
+    SECTION("upstreams have already ended") { disconnected = true; }
+    auto chain = started_chain("sv2_jd_stop");
+    client_fixture fixture;
+    auto const configuration = settings(fixture.pool, fixture.jds);
+    provider_run provider(fixture, configuration, chain);
+    handshake_upstreams(fixture, true);
+    miner_link miner(fixture, provider.port);
+    auto const allocation = fixture.jds.receive<allocate_mining_job_token>();
+    REQUIRE(allocation.request_id != 0);
+    if (disconnected) {
+        fixture.pool.finish_writing();
+        fixture.eof(fixture.pool.socket);
+        fixture.eof(fixture.jds.socket);
+    }
+
+    // Keep the downstream open: stop must end the publication wait itself.
+    provider.provider->stop();
+    fixture.await(provider.result);
+    REQUIRE_NOTHROW(provider.result.get());
+    fixture.eof(miner.socket);
+    if ( ! disconnected) {
+        fixture.eof(fixture.pool.socket);
+        fixture.eof(fixture.jds.socket);
+    }
+}
+
+TEST_CASE("sv2 JD publications wake every subscriber and coalesce to the latest payout", "[sv2 jd]") {
+    auto chain = started_chain("sv2_jd_publications");
+    client_fixture fixture;
+    fixture.start(settings(fixture.pool, fixture.jds), &chain->chain());
+    auto first = fixture.client->subscribe_publications();
+    auto slow = fixture.client->subscribe_publications();
+    auto removed = fixture.client->subscribe_publications();
+    for (auto const& channel : {first, slow, removed}) {
+        auto initial = ::asio::co_spawn(fixture.io, receive_publication(channel), ::asio::use_future);
+        fixture.await(initial);
+        REQUIRE_NOTHROW(initial.get());
+    }
+    REQUIRE_FALSE(fixture.client->notice());
+    fixture.client->unsubscribe_publications(removed);
+    auto removed_wait = ::asio::co_spawn(fixture.io, receive_publication(removed), ::asio::use_future);
+    fixture.await(removed_wait);
+    REQUIRE_THROWS_AS(removed_wait.get(), std::system_error);
+    auto pool_wait = ::asio::co_spawn(fixture.io, receive_publication(first), ::asio::use_future);
+
+    fixture.setup();
+    (void)fixture.jds.receive<setup_connection>();
+    fixture.jds.send(setup_connection_success{2, 0});
+    auto const request = fixture.open();
+    fixture.accept(request);
+    fixture.await(fixture.ready);
+    REQUIRE_NOTHROW(fixture.ready.get());
+    auto const allocation = fixture.jds.receive<allocate_mining_job_token>();
+    fixture.jds.send(allocate_mining_job_token_success{allocation.request_id,
+        {1, 2, 3}, output_bytes(pool_output_list())});
+    (void)fixture.jds.receive<declare_mining_job>();
+    fixture.await(pool_wait);
+    REQUIRE_NOTHROW(pool_wait.get());
+    auto const pooled = fixture.client->notice();
+    REQUIRE(pooled);
+    REQUIRE(pooled->pool);
+
+    // A subscription made after publication has a buffered wake as well.
+    auto late = fixture.client->subscribe_publications();
+    auto late_initial = ::asio::co_spawn(fixture.io, receive_publication(late), ::asio::use_future);
+    fixture.await(late_initial);
+    REQUIRE_NOTHROW(late_initial.get());
+    REQUIRE(fixture.client->notice()->generation == pooled->generation);
+    auto first_fallback = ::asio::co_spawn(fixture.io, receive_publication(first), ::asio::use_future);
+    auto late_fallback = ::asio::co_spawn(fixture.io, receive_publication(late), ::asio::use_future);
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
+    for (auto* result : {&first_fallback, &late_fallback}) {
+        fixture.await(*result);
+        REQUIRE_NOTHROW(result->get());
+    }
+    auto const solo = fixture.client->notice();
+    REQUIRE(solo);
+    REQUIRE_FALSE(solo->pool);
+    REQUIRE(solo->generation > pooled->generation);
+
+    // This reader did not drain the pool wake. One buffered wake still leads
+    // to the newer solo publication, without retaining a queue of old work.
+    auto latest = ::asio::co_spawn(fixture.io, receive_publication(slow), ::asio::use_future);
+    fixture.await(latest);
+    REQUIRE_NOTHROW(latest.get());
+    REQUIRE(fixture.client->notice()->generation == solo->generation);
+    auto quiet = ::asio::co_spawn(fixture.io, receive_publication(slow), ::asio::use_future);
+    CHECK_FALSE(fixture.wait_until([&] {
+        return quiet.wait_for(0s) == std::future_status::ready;
+    }, 50ms));
+    auto remained_closed = ::asio::co_spawn(fixture.io, receive_publication(removed), ::asio::use_future);
+    fixture.await(remained_closed);
+    REQUIRE_THROWS_AS(remained_closed.get(), std::system_error);
+    slow->cancel();
+    slow->close();
+    fixture.client->unsubscribe_publications(first);
+    fixture.client->unsubscribe_publications(slow);
+    fixture.client->unsubscribe_publications(late);
+    fixture.await(quiet);
+    REQUIRE_THROWS_AS(quiet.get(), std::system_error);
 }
 
 TEST_CASE("sv2 JD invalid configuration refuses full node startup before opening the chain", "[sv2 jd]") {
