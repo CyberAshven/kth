@@ -2,14 +2,22 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include <asio/awaitable.hpp>
+#include <simdjson.h>
 
 #include <kth/blockchain/interface/block_chain.hpp>
 #if defined(KTH_CURRENCY_BCH)
@@ -17,6 +25,7 @@
 #endif
 #include <kth/domain/config/network.hpp>
 #include <kth/domain/message/transaction.hpp>
+#include <kth/infrastructure/expect.hpp>
 #include <kth/infrastructure/formats/base_16.hpp>
 #include <kth/infrastructure/utility/byte_reader.hpp>
 #include <kth/infrastructure/utility/data.hpp>
@@ -55,6 +64,32 @@ std::expected<chain_progress, rpc_error> progress_for(
         schedule->block_interval(height), schedule->next_block_interval(height)};
 }
 #endif
+
+// How many blocks the connected chain has from the block at `height` with
+// `hash` up to its tip, that block included; -1 when that block is not on the
+// connected chain, including a header stored ahead of it.
+std::int64_t confirmations(blockchain::block_chain const& chain,
+                           std::size_t height, hash_digest const& hash) {
+    auto const view = chain.chain_view();
+    if ( ! view || height > view->connected_tip_height) {
+        return -1;
+    }
+    // The durable height table may already name a replacement branch while
+    // this publication still names the old connected tip. Walk that tip's
+    // immutable ancestry instead of mixing it with a newer height mapping.
+    auto const& index = chain.headers();
+    auto const tip = index.find(view->tip_hash);
+    if (tip == blockchain::header_index::null_index ||
+        index.get_height(tip) < 0 ||
+        static_cast<size_t>(index.get_height(tip)) != view->connected_tip_height) {
+        return -1;
+    }
+    auto const ancestor = index.get_ancestor(tip, static_cast<int32_t>(height));
+    if (ancestor == blockchain::header_index::null_index || index.get_hash(ancestor) != hash) {
+        return -1;
+    }
+    return static_cast<std::int64_t>(view->connected_tip_height - height + 1);
+}
 
 // getblockcount -> the height of the most-work fully-validated block.
 // C-API counterpart: kth_chain_sync_last_height (see docs/json-rpc.md).
@@ -311,8 +346,9 @@ get_block(method_context& ctx, request const& req) {
     co_return w.str();
 }
 
-// getblockheader <blockhash> [verbose=true] -> the header fields, or with
-// verbose=false the 80-byte serialized header as hex.
+// getblockheader <blockhash> [verbose=true] -> the header fields with its
+// height and confirmations, or with verbose=false the 80-byte serialized
+// header as hex.
 // C-API counterpart: kth_chain_sync_block_header_by_hash.
 ::asio::awaitable<std::expected<std::string, rpc_error>>
 get_block_header(method_context& ctx, request const& req) {
@@ -346,9 +382,11 @@ get_block_header(method_context& ctx, request const& req) {
     if (!progress) {
         co_return std::unexpected(progress.error());
     }
-    co_return render_block_header(*header, height, *hash, *progress);
+    co_return render_block_header(*header, height, *hash,
+        confirmations(ctx.chain, height, *hash), *progress);
 #else
-    co_return render_block_header(*header, height, *hash);
+    co_return render_block_header(*header, height, *hash,
+        confirmations(ctx.chain, height, *hash));
 #endif
 }
 
@@ -383,6 +421,87 @@ send_raw_transaction(method_context& ctx, request const& req) {
     writer w;
     w.value(txid);
     co_return w.str();
+}
+
+// validateaddress <address> -> whether it is a P2PKH or P2SH address of this
+// node's network and, if it is, its cashaddr form and the scriptPubKey it pays.
+// C-API counterpart: kth_wallet_payment_address_parse_from.
+::asio::awaitable<std::expected<std::string, rpc_error>>
+validate_address(method_context& ctx, request const& req) {
+    auto const invalid_params = [] {
+        return std::unexpected(make_error(error_code::invalid_params,
+            "validateaddress requires [address]"));
+    };
+    // An empty string is an invalid address, not a missing argument. Parse
+    // the type explicitly because params_strings maps non-strings to empty.
+    simdjson::ondemand::parser parser;
+    simdjson::padded_string padded(req.params);
+    simdjson::ondemand::document doc;
+    simdjson::ondemand::array args;
+    if (parser.iterate(padded).get(doc) != simdjson::SUCCESS ||
+        doc.get_array().get(args) != simdjson::SUCCESS) {
+        co_return invalid_params();
+    }
+    std::string address;
+    std::size_t count = 0;
+    for (auto element : args) {
+        if (count++ != 0) {
+            co_return invalid_params();
+        }
+        simdjson::ondemand::value value;
+        std::string_view text;
+        if (element.get(value) != simdjson::SUCCESS ||
+            value.get_string().get(text) != simdjson::SUCCESS) {
+            co_return invalid_params();
+        }
+        address.assign(text);
+    }
+    if (count != 1) {
+        co_return invalid_params();
+    }
+    auto const view = ctx.chain.chain_view();
+    if ( ! view || ! view->state) {
+        co_return std::unexpected(make_error(error_code::internal_error,
+            "chain state unavailable"));
+    }
+    co_return render_validate_address(address, view->state->network());
+}
+
+// estimatefee [nblocks] -> the fee per kB, in BCH, that the size part of this
+// node's transaction price asks for (chain.byte_fee_satoshis). The price also
+// charges per signature operation (chain.sigop_fee_satoshis), which a per-kB
+// rate cannot carry. kth has no fee estimator, so nblocks, which older clients
+// send, does not change the answer. Anything other than no argument or one
+// non-negative integer is refused rather than answered.
+// C-API counterpart: kth_blockchain_settings.byte_fee_satoshis.
+::asio::awaitable<std::expected<std::string, rpc_error>>
+estimate_fee(method_context& ctx, request const& req) {
+    auto const invalid_params = [] {
+        return kth::fail(make_error(error_code::invalid_params,
+            "estimatefee takes no argument or [nblocks] (a non-negative integer)"));
+    };
+    if ( ! req.params.empty()) {
+        simdjson::ondemand::parser parser;
+        simdjson::padded_string padded(req.params);
+        simdjson::ondemand::document document;
+        simdjson::ondemand::array args;
+        if (parser.iterate(padded).get(document) != simdjson::SUCCESS ||
+            document.get_array().get(args) != simdjson::SUCCESS) {
+            co_return invalid_params();
+        }
+        size_t count = 0;
+        for (auto element : args) {
+            if (element.error() != simdjson::SUCCESS || ++count > 1) {
+                co_return invalid_params();
+            }
+        }
+        // Preserve the existing target conversion, but only after validating
+        // its container and arity; a non-array must never mean "no target".
+        if (count == 1 && ! params_uint(req.params, 0)) {
+            co_return invalid_params();
+        }
+    }
+    co_return render_estimate_fee(ctx.chain.chain_settings().byte_fee_satoshis);
 }
 
 // ---- mempool query methods -----------------------------------------------
@@ -455,6 +574,53 @@ get_mempool_descendants(method_context& ctx, request const& req) {
     co_return render_hash_list(ctx.chain.get_mempool_descendants(*hash));
 }
 
+// Prepared method name / JSON result pairs, sorted by name.
+using help_response = std::pair<std::string, std::string>;
+
+// help [command] selects an immutable prepared result. The owning handler
+// and request outlive this coroutine; no dispatcher or mutable table is read.
+// C-API counterpart: none; it describes this server.
+::asio::awaitable<std::expected<std::string, rpc_error>>
+help(std::string const& listing_json, std::vector<help_response> const& responses,
+     request const& req) {
+    auto const invalid_params = [] {
+        return kth::fail(make_error(error_code::invalid_params,
+            "help requires [] or [command]"));
+    };
+    simdjson::ondemand::parser parser;
+    auto const params = req.params.empty() ? std::string_view{"[]"} : std::string_view{req.params};
+    simdjson::padded_string padded(params);
+    simdjson::ondemand::document doc;
+    simdjson::ondemand::array args;
+    if (parser.iterate(padded).get(doc) != simdjson::SUCCESS ||
+        doc.get_array().get(args) != simdjson::SUCCESS) {
+        co_return invalid_params();
+    }
+    std::string_view command;
+    size_t count = 0;
+    for (auto element : args) {
+        if (count++ != 0) {
+            co_return invalid_params();
+        }
+        simdjson::ondemand::value value;
+        if (element.get(value) != simdjson::SUCCESS ||
+            value.get_string().get(command) != simdjson::SUCCESS) {
+            co_return invalid_params();
+        }
+    }
+
+    if (command.empty()) {
+        co_return listing_json;
+    }
+    auto const found = std::ranges::lower_bound(responses, command, {}, &help_response::first);
+    if (found != responses.end() && found->first == command) {
+        co_return found->second;
+    }
+    writer w;
+    w.value(fmt::format("help: unknown command: {}", command));
+    co_return w.str();
+}
+
 } // namespace
 
 void register_builtin_methods(dispatcher& d) {
@@ -467,14 +633,37 @@ void register_builtin_methods(dispatcher& d) {
     d.add("getrawtransaction", get_raw_transaction);
     d.add("getblock", get_block);
     d.add("sendrawtransaction", send_raw_transaction);
+    d.add("validateaddress", validate_address);
     d.add("getrawmempool", get_raw_mempool);
     d.add("getmempoolinfo", get_mempool_info);
+    d.add("estimatefee", estimate_fee);
     d.add("getmempoolentry", get_mempool_entry);
     d.add("getmempoolancestors", get_mempool_ancestors);
     d.add("getmempooldescendants", get_mempool_descendants);
     d.add("getblocktemplatelight", get_block_template_light);
     d.add("getmininginfo", get_mining_info);
     d.add("submitblocklight", submit_block_light);
+
+    // Help MUST be the last method registered: capture the completed catalog,
+    // including its own name, before any request can be served.
+    auto names = d.methods();
+    auto const position = std::ranges::lower_bound(names, std::string_view{"help"});
+    if (position == names.end() || *position != "help") {
+        names.insert(position, "help");
+    }
+    writer listing;
+    listing.value(fmt::format("{}", fmt::join(names, "\n")));
+    std::vector<help_response> responses;
+    responses.reserve(names.size());
+    for (auto const& name : names) {
+        writer individual;
+        individual.value(name);
+        responses.emplace_back(name, individual.str());
+    }
+    d.add("help", [listing_json = listing.str(), responses = std::move(responses)]
+        (method_context&, request const& req) {
+        return help(listing_json, responses, req);
+    });
 }
 
 } // namespace kth::node::rpc

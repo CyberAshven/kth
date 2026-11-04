@@ -6,15 +6,17 @@
 #define KTH_NODE_RPC_QUERY_HPP
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
-#include <kth/node/rpc/chain_progress.hpp>
 #include <string>
 #include <string_view>
 
 #include <kth/domain/chain/block.hpp>
 #include <kth/domain/chain/header.hpp>
 #include <kth/domain/chain/transaction.hpp>
+#include <kth/domain/config/network.hpp>
 #include <kth/infrastructure/hash_define.hpp>
+#include <kth/node/rpc/chain_progress.hpp>
 
 // The pure (chain-free) serialization behind the blockchain query RPCs, split
 // out so it can be unit-tested without a live block_chain.
@@ -50,10 +52,23 @@ std::string render_mempool_info(blockchain::mempool_totals const& totals);
 std::string render_mempool_entry(blockchain::mempool_entry_info const& entry,
                                  hash_list const& depends, hash_list const& spentby);
 
-// getblockheader (verbose) result object.
+// The estimatefee result: `byte_fee_satoshis` per byte as BCH per kB, rounded
+// to whole satoshis per kB.
+std::string render_estimate_fee(float byte_fee_satoshis);
+
+// getblockheader (verbose) result object. `confirmations` is -1 for a block
+// that is not on the connected chain.
 std::string render_block_header(domain::chain::header const& header,
                                 std::size_t height, hash_digest const& hash,
+                                std::int64_t confirmations,
                                 std::optional<chain_progress> progress = std::nullopt);
+
+// validateaddress result object for `address` on network `net`: only
+// {"isvalid":false} unless it is a P2PKH or P2SH address of that network,
+// otherwise also the address as cashaddr under the network's prefix, the
+// scriptPubKey it pays to, whether that is a script hash, and whether the
+// address signals CashTokens support.
+std::string render_validate_address(std::string_view address, domain::config::network net);
 
 } // namespace kth::node::rpc
 

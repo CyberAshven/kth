@@ -1691,13 +1691,13 @@ std::atomic<uint32_t> g_active_download_peers{0};
     block_storage_input_channel& input,
     chunk_validated_channel& output,
     uint32_t start_height,
-    blockchain::header_organizer& organizer,
+    blockchain::header_organizer&,
     std::atomic<uint32_t>* contiguous_out
 ) {
     spdlog::info("[block_storage] Task started at height {}", start_height);
 
-    // This task marks blocks have_data and advances the validated height, both of
-    // which a chain switch rewrites, so it participates in the reorg barrier.
+    // A chain switch rewrites the have_data flags this task publishes, so
+    // storage participates in the reorg barrier. Stored does not mean validated.
     reorg_participation const storage_participation(chain);
 
     uint64_t chunks_stored = 0;
@@ -1723,27 +1723,38 @@ std::atomic<uint32_t> g_active_download_peers{0};
 
     auto initial_rss = get_rss_mb();
 
-    while (true) {
-        // Park BEFORE waiting for input. A paused pipeline delivers no chunk, so a
-        // check placed after the receive is never reached and the barrier would
-        // wait on a task that is itself waiting.
-        if (chain.reorg_pause_requested()) {
-            chain.enter_reorg_barrier();
-            while (chain.reorg_pause_requested() && ! chain.stopped()) {
-                ::asio::steady_timer pause_timer(co_await ::asio::this_coro::executor);
-                pause_timer.expires_after(std::chrono::milliseconds(50));
-                co_await pause_timer.async_wait(::asio::as_tuple(::asio::use_awaitable));
-            }
-            chain.leave_reorg_barrier();
+    // Compatibility boundary: retain the existing chain barrier and its pause
+    // protocol; the typed input wake supplies the missing owner notification.
+    // No receive is cancelled, so a received chunk remains owned across a pause.
+    auto park_for_reorg = [&]() -> ::asio::awaitable<void> {
+        // This scope also releases the parked count on cancellation or an
+        // exception, before the task's participation guard retires it.
+        struct parked_scope {
+            blockchain::block_chain& chain;
+            explicit parked_scope(blockchain::block_chain& c) : chain(c) { chain.enter_reorg_barrier(); }
+            ~parked_scope() { chain.leave_reorg_barrier(); }
+        } const parked(chain);
+        while (chain.reorg_pause_requested() && ! chain.stopped()) {
+            ::asio::steady_timer pause_timer(co_await ::asio::this_coro::executor);
+            pause_timer.expires_after(std::chrono::milliseconds(50));
+            auto const [ec] = co_await pause_timer.async_wait(::asio::as_tuple(::asio::use_awaitable));
+            if (ec) throw std::system_error(ec);
+        }
 
-            // The switch rewound the chain and reset the shared counter: re-derive
-            // the local cursors instead of carrying pre-switch values.
-            if (contiguous_out) {
-                contiguous_height = contiguous_out->load(std::memory_order_acquire);
-                max_stored_height = contiguous_height > 0 ? contiguous_height - 1 : 0;
-                spdlog::info("[block_storage] Resuming after reorg at contiguous height {}",
-                    contiguous_height);
-            }
+        // The switch rewound the chain and reset the shared counter: re-derive
+        // the local cursors instead of carrying pre-switch values.
+        if (contiguous_out) {
+            contiguous_height = contiguous_out->load(std::memory_order_acquire);
+            max_stored_height = contiguous_height > 0 ? contiguous_height - 1 : 0;
+            spdlog::info("[block_storage] Resuming after reorg at contiguous height {}",
+                contiguous_height);
+        }
+    };
+
+    while (true) {
+        if (chain.reorg_pause_requested()) {
+            co_await park_for_reorg();
+            if (chain.stopped()) break;
             continue;
         }
 
@@ -1761,6 +1772,18 @@ std::atomic<uint32_t> g_active_download_peers{0};
         if (std::holds_alternative<stop_request>(msg)) {
             spdlog::debug("[block_storage] Stop signal received");
             break;
+        }
+
+        if (std::holds_alternative<storage_reorg_wake>(msg)) {
+            continue;
+        }
+
+        // Pause may have been raised after the pre-receive check, including
+        // after a data completion was already queued. Keep that chunk in this
+        // frame until resume; the generation check below then drops old work.
+        if (chain.reorg_pause_requested()) {
+            co_await park_for_reorg();
+            if (chain.stopped()) break;
         }
 
         auto& chunk = std::get<downloaded_chunk>(msg);
@@ -1816,7 +1839,6 @@ std::atomic<uint32_t> g_active_download_peers{0};
             // no longer its height. Walking the index directly would count the
             // abandoned branch's blocks as contiguous and push the validated tip
             // past where the chain actually reaches.
-            auto const prev_contiguous = contiguous_height;
             auto const& hdr = chain.headers();
             while (true) {
                 auto const idx = hdr.active_at(static_cast<int32_t>(contiguous_height));
@@ -1830,11 +1852,6 @@ std::atomic<uint32_t> g_active_download_peers{0};
                 contiguous_out->store(contiguous_height, std::memory_order_release);
             }
 
-            // Advance the finalized block as newly stored (batch-validated)
-            // blocks extend the contiguous validated range.
-            if (contiguous_height > prev_contiguous) {
-                organizer.note_block_validated(static_cast<int32_t>(contiguous_height - 1));
-            }
         } else {
             // Store failed — release memory
             chunk.blocks.clear();
@@ -2040,6 +2057,19 @@ uint32_t utxo_batch_len(uint32_t available, uint32_t batch_size, bool stale) {
     domain::config::network network,
     std::function<bool()> should_stop,
     std::function<void(std::string const&)> on_fatal
+) {
+    co_await utxo_build_task(chain, contiguous_height, start_height, network,
+        std::move(should_stop), std::move(on_fatal), nullptr);
+}
+
+::asio::awaitable<void> utxo_build_task(
+    blockchain::block_chain& chain,
+    std::atomic<uint32_t> const& contiguous_height,
+    uint32_t start_height,
+    domain::config::network network,
+    std::function<bool()> should_stop,
+    std::function<void(std::string const&)> on_fatal,
+    utxo_build_progress_channel* progress
 ) {
     spdlog::info("[utxo_build] Task started at height {}", start_height);
 
@@ -2884,6 +2914,18 @@ uint32_t utxo_batch_len(uint32_t available, uint32_t batch_size, bool stale) {
 
         // Earned, not unwound.
         chain.end_transition();
+
+        // A progress-only channel retains one wake-up, not work per block. If
+        // full, its queued wake already asks the coordinator to read the latest
+        // published view, so this notification is coalesced without losing debt.
+        // Never suspend this reorg participant behind the coordinator: it may
+        // be waiting for this task to reach the next reorg barrier.
+        if (progress) {
+            if ( ! progress->try_send(std::error_code{}, utxo_build_advanced{utxo_built_height}) &&
+                ! progress->is_open()) {
+                co_return;
+            }
+        }
 
         spdlog::info("[utxo_build] UTXO built to height {}/{}", utxo_built_height, current_contiguous - 1);
     }

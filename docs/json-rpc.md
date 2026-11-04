@@ -73,16 +73,19 @@ counterpart.
 | `getblockchaininfo` | `kth_chain_sync_mining_info` + `kth_chain_sync_block_hash` | `fetch_mining_info()` + `get_last_heights()` |
 | `getrawtransaction` | `kth_chain_sync_transaction` | `fetch_transaction(hash)` |
 | `getblock` | `kth_chain_sync_block_by_hash` | `fetch_block(hash)` |
-| `getblockheader` (`verbose=false`: raw 80-byte header hex) | `kth_chain_sync_block_header_by_hash` | `fetch_block_header(hash)` |
+| `getblockheader` (`verbose=false`: raw 80-byte header hex; verbose: `confirmations`, -1 off the connected chain) | `kth_chain_sync_block_header_by_hash` | `fetch_block_header(hash)` + `chain_view()` |
 | `sendrawtransaction` | `kth_chain_sync_organize_transaction` | `organize(tx)` |
+| `validateaddress` | `kth_wallet_payment_address_parse_from` | `wallet::payment_address::parse_from(address, network)` |
 | `getrawmempool` | `kth_chain_get_mempool_txids` | `get_mempool_txids()` |
 | `getmempoolinfo` | `kth_chain_get_mempool_info` | `get_mempool_info()` |
+| `estimatefee` | `kth_blockchain_settings.byte_fee_satoshis` | `chain_settings().byte_fee_satoshis` |
 | `getmempoolentry` | `kth_chain_get_mempool_entry` | `get_mempool_entry()` (+ depends/spentby) |
 | `getmempoolancestors` | `kth_chain_get_mempool_ancestors` | `get_mempool_ancestors()` |
 | `getmempooldescendants` | `kth_chain_get_mempool_descendants` | `get_mempool_descendants()` |
 | `getblocktemplatelight` | `kth_chain_sync_mining_template` / `kth_chain_async_mining_template` | `fetch_mining_template()` |
 | `getmininginfo` | `kth_chain_sync_mining_info` / `kth_chain_async_mining_info` | `fetch_mining_info()` |
 | `submitblocklight` | `kth_chain_sync_organize_block` / `kth_chain_async_organize_block` | `organize(block)` |
+| `help` | — (describes this server) | `dispatcher::methods()` |
 
 Each async chain reader is exposed in both a blocking (`kth_chain_sync_*`) and a
 callback (`kth_chain_async_*`) flavor.
@@ -90,6 +93,35 @@ callback (`kth_chain_async_*`) flavor.
 _More methods land per phase: mining (`submitblock`, `getmininginfo`), mempool
 (`getrawmempool`, `getmempoolentry`, ...), and blockchain/raw-tx (`getblock`,
 `getrawtransaction`, `sendrawtransaction`, ...)._
+
+## getblockheader
+
+The verbose result includes `confirmations` (`-1` off the connected chain).
+On BCH builds it also includes the requested block's cumulative `ticks`, its
+target interval in seconds as `target_time`, and its successor's interval as
+`next_target_time`, all under that block's own branch. At a Faster Blocks
+activation boundary, the block retains the old interval while its child uses
+the new one. With `verbose=false`, the result is the raw 80-byte header as hex.
+
+## help
+
+`help` returns the methods this server answers, one per line. `help "<method>"`
+returns the method's name, or `help: unknown command: <method>` for a name it
+does not answer; there is no per-method help text yet. Method names and JSON
+help results are prepared during registration. Custom methods must be
+registered before the built-ins, which install `help` last. An omitted parameter
+or an empty string lists all methods. Parameters must be an array containing
+at most one string; other types or extra arguments return invalid params.
+
+## estimatefee
+
+`estimatefee` returns the fee per kB, in BCH, that the size part of the node's
+transaction price asks for: `node.byte_fee_satoshis` per byte, rounded to whole
+satoshis per kB (`0.000001` with the default `0.1`). The price also charges
+`node.sigop_fee_satoshis` per signature operation, which a per-kB rate cannot
+carry, so a transaction pays that on top. The node has no fee estimator: the
+target-blocks argument older clients send is accepted and does not change the
+answer.
 
 ## Mining: getblocktemplatelight
 
@@ -100,7 +132,12 @@ alone, so transactions never travel over the wire.
 
 Response fields: `version`, `previousblockhash`, `height`, `coinbasevalue`
 (subsidy + selected fees), `target`, `bits`, `mintime` (MTP + 1), `curtime`,
-`sizelimit`, `sigchecklimit`, `noncerange`, `mutable`, and `job_id`.
+`sizelimit`, `sigchecklimit`, `noncerange`, `mutable`, `job_id`, and `merkle`.
+
+`merkle` is the coinbase's merkle branch: the hashes, in display order like
+`previousblockhash`, that the miner folds its coinbase txid with, one after the
+other (`root = sha256d(root || hash)`, each hash in internal byte order), to get
+the block's merkle root. It is empty when the template has no transactions.
 
 Job cache config (mirrors bitcoind `-gbtcachesize` / `-gbtstoretime`):
 

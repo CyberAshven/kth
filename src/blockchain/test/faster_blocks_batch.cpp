@@ -5,6 +5,7 @@
 #if defined(KTH_CURRENCY_BCH)
 #include <test_helpers.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -61,6 +62,7 @@ struct spec {
     uint32_t coinbase_version = 1;
     uint32_t coinbase_locktime = 0;
     uint32_t coinbase_sequence = 0xffffffff;
+    bool wrong_coinbase_height = false;
     domain::config::network consensus_network = domain::config::network::regtest;
     uint32_t spend_coinbase_of = 0;               // height whose coinbase is spent; 0 = none
     uint32_t spend_at = 0;
@@ -148,7 +150,8 @@ std::vector<domain::message::block::const_ptr> build_chain(spec const& sp, uint3
             ? sp.coinbase_value_override
             : block::subsidy(ticks, h, /*retarget*/ false) + fees;
         bool const shaped = (sp.coinbase_value_override_at == h);
-        auto cb = coinbase(h, value, shaped ? sp.coinbase_version : 1u, shaped ? sp.coinbase_locktime : 0u,
+        auto const coinbase_height = sp.wrong_coinbase_height && h == h_a + 1 ? h + 1 : h;
+        auto cb = coinbase(coinbase_height, value, shaped ? sp.coinbase_version : 1u, shaped ? sp.coinbase_locktime : 0u,
             shaped ? sp.coinbase_sequence : 0xffffffffu);
         if ((sp.unlocked_spend && h == sp.spend_coinbase_of) || h <= sp.padding_transactions) {
             domain::machine::operation::list ops;
@@ -172,6 +175,13 @@ std::vector<domain::message::block::const_ptr> build_chain(spec const& sp, uint3
             txs.back() = transaction(padded.version(), padded.locktime(), input::list(padded.inputs()), std::move(outputs));
             REQUIRE(block(domain::chain::header{}, transaction::list(txs)).serialized_size() == sp.padded_block_size);
         }
+
+        // Padding must still satisfy CTOR so these cases reach the size limit.
+        std::sort(txs.begin() + 1, txs.end(), [](auto const& a, auto const& b) {
+            auto const a_hash = a.hash();
+            auto const b_hash = b.hash();
+            return std::lexicographical_compare(a_hash.rbegin(), a_hash.rend(), b_hash.rbegin(), b_hash.rend());
+        });
 
         auto mined = mine(prev, base + h * 600, std::move(txs));
         prev = mined.hash();
@@ -258,6 +268,17 @@ TEST_CASE("short blocks retain height-based BIP66 and BIP65 header version gates
         }
         previous = accepted.hash();
     }
+}
+
+TEST_CASE("short blocks still require the raw BIP34 coinbase height", "[batch][faster_blocks][bip34_height]") {
+    spec sp;
+    sp.len = h_a + 1;
+    REQUIRE(run("fb_bip34_valid", sp) == error::success);
+    sp.wrong_coinbase_height = true;
+    auto const blocks = build_chain(sp, base_time(sp.len), settings(sp.consensus_network).enabled_flags());
+    REQUIRE(blocks.back()->is_valid_coinbase_script(h_a + 2));
+    REQUIRE_FALSE(blocks.back()->is_valid_coinbase_script(h_a + 1));
+    CHECK(run("fb_bip34_wrong", sp) == error::coinbase_height_mismatch);
 }
 
 // -----------------------------------------------------------------------------
