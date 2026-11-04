@@ -787,9 +787,9 @@ TEST_CASE("sv2 JD rejects a payout success that is not the reserved revenue", "[
     require_failure(height, unfit);
     REQUIRE(unfit.error.find("height") != std::string::npos);
 
-    refuse_incomplete(payout_success(1, paid_outputs(), true), jd_peer::declaration, requesting);
-    refuse_incomplete(request_payout_outputs_error{1, "invalid-request"}, jd_peer::declaration, requesting);
-    refuse_incomplete(payout_outputs_stale{}, jd_peer::declaration, requesting);
+    refuse_incomplete(payout_success(1, paid_outputs(), true), jd_peer::declaration, [] { return requesting(); });
+    refuse_incomplete(request_payout_outputs_error{1, "invalid-request"}, jd_peer::declaration, [] { return requesting(); });
+    refuse_incomplete(payout_outputs_stale{}, jd_peer::declaration, [] { return requesting(); });
 }
 
 TEST_CASE("sv2 JD stale payout outputs allocate again until the race repeats", "[sv2 jd]") {
