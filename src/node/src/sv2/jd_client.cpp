@@ -1,0 +1,406 @@
+// Copyright (c) 2016-present Knuth Project developers.
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#include <kth/node/sv2/jd_client.hpp>
+
+#include <chrono>
+#include <cstdint>
+#include <exception>
+#include <stdexcept>
+#include <utility>
+
+#include <asio/as_tuple.hpp>
+#include <asio/co_spawn.hpp>
+#include <asio/experimental/awaitable_operators.hpp>
+#include <asio/post.hpp>
+#include <asio/steady_timer.hpp>
+#include <asio/use_awaitable.hpp>
+
+#include <boost/smart_ptr/make_shared.hpp>
+
+#include <spdlog/spdlog.h>
+
+#include <kth/blockchain/interface/block_chain.hpp>
+#include <kth/infrastructure/math/hash.hpp>
+#include <kth/node/detail/scope_action.hpp>
+#include <kth/node/sv2/framing.hpp>
+#include <kth/node/sv2/jd_messages.hpp>
+#include <kth/node/sv2/mining_messages.hpp>
+#include <kth/node/sv2/noise.hpp>
+
+namespace kth::node::sv2 {
+
+namespace {
+
+jd_endpoint endpoint(std::string const& address) {
+    auto value = parse_jd_endpoint(address);
+    if ( ! value) throw std::invalid_argument("Invalid Job Declaration endpoint");
+    return *value;
+}
+
+hash_digest authority(std::string const& text) {
+    auto value = noise_parse_authority_key(text);
+    if ( ! value) throw std::invalid_argument("Invalid Job Declaration authority key");
+    return *value;
+}
+
+template <typename Message>
+data_chunk frame(Message const& message) {
+    auto const payload = to_data_chunk(message);
+    auto bytes = to_data_chunk(message_header{Message::channel_message
+        ? message_header::channel_msg_flag : uint16_t{0}, Message::message_type,
+        static_cast<uint32_t>(payload.size())});
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+// Shares found before the pool names the custom job. Past this, drop rather
+// than let a slow Success pin every downstream proof.
+constexpr size_t max_cached_shares = 32;
+
+} // namespace
+
+jd_client::jd_client(sv2_settings const& settings, ::asio::any_io_executor executor,
+    blockchain::block_chain* chain)
+    : owner_(::asio::make_strand(executor))
+    , mining_(owner_, endpoint(settings.jd.mining_address).host,
+        endpoint(settings.jd.mining_address).port,
+        authority(settings.jd.mining_authority_public_key),
+        std::chrono::seconds(settings.handshake_timeout_seconds))
+    , declaration_(owner_, endpoint(settings.jd.jds_address).host,
+        endpoint(settings.jd.jds_address).port,
+        authority(settings.jd.jds_authority_public_key),
+        std::chrono::seconds(settings.handshake_timeout_seconds))
+    , mining_session_(jd_peer::mining, endpoint(settings.jd.mining_address).host,
+        endpoint(settings.jd.mining_address).port, settings.jd.user_identity,
+        settings.jd.mode == "full-template")
+    , declaration_session_(jd_peer::declaration, endpoint(settings.jd.jds_address).host,
+        endpoint(settings.jd.jds_address).port, settings.jd.user_identity,
+        settings.jd.mode == "full-template")
+    , jobs_(settings.jd.user_identity, settings.jd.mode == "full-template")
+    , chain_(chain)
+    , response_timeout_(settings.jd.response_timeout_seconds)
+    , ready_(owner_, 1)
+{}
+
+::asio::awaitable<void> jd_client::serve(jd_connection& connection,
+    jd_session& session, char const* name) {
+    using namespace ::asio::experimental::awaitable_operators;
+
+    ::asio::steady_timer deadline(owner_);
+    deadline.expires_at(std::chrono::steady_clock::time_point::max());
+    bool done = false;
+    bool timed_out = false;
+    std::string failure;
+    auto connected = [&] {
+        if (stopped_) return false;
+        deadline.expires_after(response_timeout_);
+        return connection.send(session.start());
+    };
+    auto received = [&](data_chunk bytes) {
+        if (stopped_) return false;
+        byte_reader source(bytes);
+        auto const header = message_header::from_data(source);
+        if ( ! header) return false;
+        auto const payload = source.read_bytes(source.remaining_size());
+        if ( ! payload) return false;
+        auto const peer = &session == &mining_session_ ? jd_peer::mining : jd_peer::declaration;
+        // Share replies are not channel state. Success leaves the job in place.
+        // Error is a refusal of work the pool already accepted (sv2-spec 6.2).
+        if (session.ready() && peer == jd_peer::mining && header->channel_msg()
+            && header->extension() == 0) {
+            if (header->msg_type == submit_shares_success::message_type) return true;
+            if (header->msg_type == submit_shares_error::message_type) {
+                failure = "pool refused a valid share on an accepted job";
+                return false;
+            }
+        }
+        if (session.ready() && header->extension() == 0
+            && (peer == jd_peer::declaration
+                || header->msg_type == set_custom_mining_job_success::message_type
+                || header->msg_type == set_custom_mining_job_error::message_type)) {
+            return dispatch(jobs_.process(peer, *header, *payload));
+        }
+        auto const previous_prefix = mining_session_.channel()
+            ? mining_session_.channel()->extranonce_prefix : data_chunk{};
+        auto result = session.process(*header, *payload);
+        if (result.close) {
+            failure = result.error;
+            return false;
+        }
+        if (session.ready() && peer == jd_peer::mining && (jobs_.pending() || jobs_.work())
+            && previous_prefix != mining_session_.channel()->extranonce_prefix) {
+            failure = "pool changed the extranonce prefix of declared work";
+            return false;
+        }
+        if (session.ready() && peer == jd_peer::mining) jobs_.note_target(mining_session_.channel()->target);
+        if ( ! result.response.empty()) {
+            // The next request gets a fresh deadline. Extensions and partial
+            // input cannot extend the wait for the response already owed.
+            deadline.expires_after(response_timeout_);
+            if ( ! connection.send(std::move(result.response))) return false;
+        }
+        if (session.ready()) {
+            deadline.cancel();
+            if ( ! published_ && mining_session_.ready() && declaration_session_.ready()) {
+                published_ = true;
+                (void)ready_.try_send(std::error_code{}, 1);
+                spdlog::info("[sv2 jd] Both upstreams ready; starting local declarations");
+            }
+        }
+        return true;
+    };
+    auto exchange = [&]() -> ::asio::awaitable<void> {
+        detail::scope_action finish([&] {
+            done = true;
+            deadline.cancel();
+        }, true);
+        try {
+            auto reason = co_await connection.run(connected, received);
+            if (failure.empty()) failure = std::move(reason);
+        } catch (std::exception const& e) {
+            failure = e.what();
+        }
+        // Stopping either side consumes this attempt. There is no retry or
+        // alternate pool in this PR, and no upstream can stall solo work.
+        stop();
+    };
+    auto response_deadline = [&]() -> ::asio::awaitable<void> {
+        while ( ! done && ! session.ready()) {
+            auto [error] = co_await deadline.async_wait(::asio::as_tuple(::asio::use_awaitable));
+            if (done || session.ready()) co_return;
+            if (error == ::asio::error::operation_aborted) continue;
+            timed_out = true;
+            connection.stop();
+            co_return;
+        }
+    };
+    co_await (exchange() && response_deadline());
+    if ( ! published_) {
+        published_ = true;
+        (void)ready_.try_send(std::make_error_code(std::errc::connection_aborted), 0);
+    }
+    spdlog::warn("[sv2 jd] {}: {}; continuing solo mining", name,
+        timed_out ? "setup response deadline expired" : failure);
+}
+
+::asio::awaitable<void> jd_client::run_owned() {
+    using namespace ::asio::experimental::awaitable_operators;
+    co_await (serve(mining_, mining_session_, "pool")
+        && serve(declaration_, declaration_session_, "JDS") && declare_templates());
+}
+
+bool jd_client::dispatch(jd_declaration::result result) {
+    if ( ! result.error.empty()) {
+        spdlog::warn("[sv2 jd] {}; continuing solo mining", result.error);
+        stop();
+        return false;
+    }
+    if (result.progress) {
+        if (jobs_.pending()) job_deadline_ = std::chrono::steady_clock::now() + response_timeout_;
+        else job_deadline_.reset();
+    }
+    if (( ! result.declaration.empty() && ! declaration_.send(std::move(result.declaration)))
+        || ( ! result.mining.empty() && ! mining_.send(std::move(result.mining)))) {
+        spdlog::warn("[sv2 jd] Upstream output queue refused declaration; continuing solo mining");
+        stop();
+        return false;
+    }
+    // Publish after the frame is queued. A full queue must not show downstream
+    // miners a coinbase the pool never received.
+    if (jobs_.work()) publish_pool();
+    if (result.accepted) {
+        spdlog::info("[sv2 jd] Pool accepted local template as job {}",
+            jobs_.work()->upstream_job_id);
+        flush_cached();
+    }
+    return true;
+}
+
+::asio::awaitable<void> jd_client::declare_templates() {
+    // This loop has no downstream await and only one outstanding declaration.
+    // A slow JDS cannot pin a queue of old templates or delay solo jobs. After
+    // the response, fetch only the latest connected tip's own selection.
+    ::asio::steady_timer tick(owner_);
+    std::optional<hash_digest> previous;
+    while ( ! stopped_) {
+        if (job_deadline_ && std::chrono::steady_clock::now() >= *job_deadline_) {
+            spdlog::warn("[sv2 jd] Declaration response deadline expired; continuing solo mining");
+            stop();
+            co_return;
+        }
+        if (chain_ && mining_session_.ready() && declaration_session_.ready() && jobs_.pending()) {
+            auto const view = chain_->chain_view();
+            if (view && jobs_.has_template()
+                && view->tip_hash != jobs_.template_value().previous_block_hash) {
+                jobs_.supersede();
+                job_deadline_.reset();
+            }
+        }
+        if (chain_ && mining_session_.ready() && declaration_session_.ready() && ! jobs_.pending()) {
+            auto const view = chain_->chain_view();
+            if (view && previous != view->tip_hash && mining_session_.channel()) {
+                // Allocation outputs fit B0_64K. Reserve their maximum size
+                // before selecting transactions; the builder checks the exact
+                // completed coinbase against the returned block limit.
+                auto value = co_await chain_->fetch_mining_template(248 + uint64_t{0xffff}, 0);
+                if (stopped_) co_return;
+                auto const latest = chain_->chain_view();
+                // The tip can move while the template is built. Do not declare
+                // a parent the chain has already left, and do not start a
+                // second declaration over one that completed during the fetch.
+                if (value && latest && latest->tip_hash == value->previous_block_hash
+                    && ! jobs_.pending() && mining_session_.channel()) {
+                    previous = value->previous_block_hash;
+                    if ( ! dispatch(jobs_.start(std::move(*value), *mining_session_.channel()))) co_return;
+                }
+            }
+        }
+        tick.expires_after(std::chrono::milliseconds(50));
+        auto [error] = co_await tick.async_wait(::asio::as_tuple(::asio::use_awaitable));
+        if (error) co_return;
+    }
+}
+
+::asio::awaitable<void> jd_client::run() {
+    detail::scope_action finish([this] {
+        ready_.cancel();
+        ready_.close();
+    }, true);
+    co_await ::asio::co_spawn(owner_, run_owned(), ::asio::use_awaitable);
+}
+
+void jd_client::stop() {
+    bool const first = ! stopped_.exchange(true);
+    if (first) {
+        // Declaration state is only touched on this strand. A stop from the
+        // listener posts the payout switch; one from this strand does it now,
+        // before run() can return and destroy the client.
+        if (owner_.running_in_this_thread()) {
+            if (pool_live_) publish_solo();
+        } else {
+            ::asio::post(owner_, [this] {
+                if (pool_live_) publish_solo();
+            });
+        }
+    }
+    mining_.stop();
+    declaration_.stop();
+    (void)ready_.try_send(std::make_error_code(std::errc::operation_canceled), 0);
+    ready_.cancel();
+    ready_.close();
+}
+
+boost::shared_ptr<jd_notice const> jd_client::notice() const {
+    return notice_.load();
+}
+
+void jd_client::observe_share(mining::pool_proof proof) {
+    ::asio::post(owner_, [this, proof = std::move(proof)] {
+        if (stopped_) return;
+        note_share(proof);
+    });
+}
+
+void jd_client::publish_pool() {
+    if (stopped_) return;
+    auto const& work = jobs_.work();
+    if ( ! work) return;
+    auto const current = notice_.load();
+    if (current && current->pool && current->pooled.generation == work->generation
+        && current->pooled.coinbase_tx_prefix == work->coinbase_tx_prefix
+        && current->pooled.coinbase_tx_suffix == work->coinbase_tx_suffix
+        && current->pooled.tmpl.previous_block_hash == work->tmpl.previous_block_hash
+        && current->pooled.upstream_extranonce_prefix == work->upstream_extranonce_prefix
+        && current->pooled.upstream_extranonce_size == work->upstream_extranonce_size) {
+        return;
+    }
+    auto next = boost::make_shared<jd_notice>();
+    next->pool = true;
+    next->previous = work->tmpl.previous_block_hash;
+    next->pooled = *work;
+    next->generation = (current ? current->generation : 0) + 1;
+    notice_.store(next);
+    pool_live_ = true;
+}
+
+void jd_client::publish_solo() {
+    if ( ! pool_live_) return;
+    pool_live_ = false;
+    if ( ! jobs_.has_template()) return;
+    auto const current = notice_.load();
+    auto next = boost::make_shared<jd_notice>();
+    next->pool = false;
+    next->solo = jobs_.template_value();
+    next->previous = next->solo.previous_block_hash;
+    next->generation = (current ? current->generation : 0) + 1;
+    notice_.store(next);
+    spdlog::info("[sv2 jd] Downstream work pays the solo address again");
+}
+
+void jd_client::note_share(mining::pool_proof const& proof) {
+    // Spec 6.4.9: PushSolution is only defined after DeclareMiningJob.Success,
+    // which is full-template. Coinbase-only still connects the block locally.
+    // The full extranonce is the pool prefix plus the nested miner bytes.
+    // BCH has no witness bytes to append.
+    if (jobs_.can_push_solution() && proof.block && proof.full_extranonce.size() <= 32) {
+        push_solution message;
+        message.extranonce = proof.full_extranonce;
+        message.prev_hash = proof.prev_hash;
+        message.nonce = proof.nonce;
+        message.ntime = proof.ntime;
+        message.nbits = proof.bits;
+        message.version = proof.version;
+        if ( ! declaration_.send(frame(message))) {
+            spdlog::warn("[sv2 jd] JDS output queue refused PushSolution; continuing solo mining");
+            stop();
+            return;
+        }
+    }
+    auto const& work = jobs_.work();
+    if ( ! work || to_uint256(proof.header_hash) > to_uint256(work->upstream_target)) return;
+    if (work->upstream_job_id == 0) {
+        if (cached_.size() < max_cached_shares) cached_.push_back(proof);
+        return;
+    }
+    forward_share(proof);
+}
+
+void jd_client::forward_share(mining::pool_proof const& proof) {
+    auto const& work = jobs_.work();
+    if ( ! work || work->upstream_job_id == 0
+        || proof.upstream_extranonce.size() != work->upstream_extranonce_size) {
+        return;
+    }
+    submit_shares_extended message;
+    message.channel_id = work->upstream_channel_id;
+    message.sequence_number = share_sequence_++;
+    message.job_id = work->upstream_job_id;
+    message.nonce = proof.nonce;
+    message.ntime = proof.ntime;
+    message.version = proof.version;
+    message.extranonce = proof.upstream_extranonce;
+    if ( ! mining_.send(frame(message))) {
+        spdlog::warn("[sv2 jd] Pool output queue refused a share; continuing solo mining");
+        stop();
+    }
+}
+
+void jd_client::flush_cached() {
+    auto const& work = jobs_.work();
+    if ( ! work || work->upstream_job_id == 0) return;
+    std::vector<mining::pool_proof> pending;
+    pending.swap(cached_);
+    for (auto const& proof : pending) {
+        if (to_uint256(proof.header_hash) <= to_uint256(work->upstream_target)) {
+            forward_share(proof);
+        }
+    }
+}
+
+::asio::awaitable<void> jd_client::wait_until_ready() {
+    (void)co_await ready_.async_receive(::asio::use_awaitable);
+}
+
+} // namespace kth::node::sv2

@@ -1,0 +1,98 @@
+// Copyright (c) 2016-present Knuth Project developers.
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#ifndef KTH_NODE_SV2_JD_CLIENT_HPP
+#define KTH_NODE_SV2_JD_CLIENT_HPP
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <string>
+#include <system_error>
+#include <vector>
+
+#include <asio/any_io_executor.hpp>
+#include <asio/awaitable.hpp>
+#include <asio/experimental/concurrent_channel.hpp>
+#include <asio/strand.hpp>
+
+#include <boost/smart_ptr/atomic_shared_ptr.hpp>
+#include <boost/smart_ptr/shared_ptr.hpp>
+
+#include <kth/node/settings.hpp>
+#include <kth/node/sv2/jd_connection.hpp>
+#include <kth/node/sv2/jd_declaration.hpp>
+#include <kth/node/sv2/jd_session.hpp>
+#include <kth/node/sv2/jd_settings.hpp>
+
+namespace kth::blockchain { struct block_chain; }
+
+namespace kth::node::sv2 {
+
+// One published template for downstream miners. `generation` advances only
+// when the coinbase they should mine changes. Readers load the pointer and
+// never wait on an upstream socket.
+struct jd_notice {
+    uint64_t generation = 0;
+    bool pool = false;
+    hash_digest previous{};
+    mining::declared_work pooled{};
+    blockchain::mining_template solo{};
+};
+
+// Own both upstreams together. A refusal or disconnect closes the other one;
+// the listener and its solo mining sessions have independent lifetimes.
+struct jd_client {
+    // settings have passed validate_jd_settings and solo payout validation.
+    jd_client(sv2_settings const& settings, ::asio::any_io_executor executor,
+        blockchain::block_chain* chain = nullptr);
+
+    ::asio::awaitable<void> run();
+    void stop();
+
+    // Both protocol setups and the extended channel, or a terminal error.
+    // Local listener readiness never waits for this result.
+    [[nodiscard]] ::asio::awaitable<void> wait_until_ready();
+
+    // Empty until an allocation has been published, or until fallback republishes
+    // the same template for the solo payout. Safe to call off this client's strand.
+    [[nodiscard]] boost::shared_ptr<jd_notice const> notice() const;
+
+    // Queue a share for the pool and, in full-template mode, for the JDS.
+    // Returns without waiting for either socket. The block is organized by the caller.
+    void observe_share(mining::pool_proof proof);
+
+private:
+    ::asio::awaitable<void> run_owned();
+    ::asio::awaitable<void> serve(jd_connection& connection, jd_session& session,
+        char const* name);
+    ::asio::awaitable<void> declare_templates();
+    bool dispatch(jd_declaration::result result);
+    void publish_pool();
+    void publish_solo();
+    void note_share(mining::pool_proof const& proof);
+    void forward_share(mining::pool_proof const& proof);
+    void flush_cached();
+
+    ::asio::strand<::asio::any_io_executor> owner_;
+    jd_connection mining_;
+    jd_connection declaration_;
+    jd_session mining_session_;
+    jd_session declaration_session_;
+    jd_declaration jobs_;
+    blockchain::block_chain* const chain_;
+    std::chrono::seconds const response_timeout_;
+    std::optional<std::chrono::steady_clock::time_point> job_deadline_;
+    ::asio::experimental::concurrent_channel<void(std::error_code, int)> ready_;
+    boost::atomic_shared_ptr<jd_notice> notice_;
+    std::vector<mining::pool_proof> cached_;
+    uint32_t share_sequence_ = 0;
+    std::atomic_bool stopped_{false};
+    bool published_ = false;
+    bool pool_live_ = false;
+};
+
+} // namespace kth::node::sv2
+
+#endif // KTH_NODE_SV2_JD_CLIENT_HPP

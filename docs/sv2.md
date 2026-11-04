@@ -203,5 +203,106 @@ specific codes):
 | | `share-limit` | The bounded share history is full; fresh work replaces this job. |
 
 Malformed frames, invalid hash rates (NaN, infinity, negative values or negative
-zero), and server-only messages close the connection. Job Declaration, custom
-jobs, pool failover and Stratum V1 are separate features.
+zero), and server-only messages close the connection. Custom jobs, pool
+failover and Stratum V1 are separate features.
+
+## Job Declaration
+
+Job Declaration is off by default (`sv2.jd.enabled=false`). Enabling it requires
+the listener, Mining Protocol and its valid solo payout address, both upstream
+addresses and pinned Noise authority keys, a user identity and an explicit
+mode. Invalid enabled settings stop startup before the chain or listener starts.
+Dormant JD settings are ignored when JD is disabled. The solo fallback pays
+`sv2.mining.address`.
+
+For example, to negotiate full-template mode with a pool and its JDS:
+
+```ini
+sv2.enabled                        = true
+sv2.mining.enabled                 = true
+sv2.mining.address                 = <your-network-cashaddr>
+sv2.jd.enabled                     = true
+sv2.jd.mining_address              = pool.example:3333
+sv2.jd.mining_authority_public_key = <pool-noise-authority-key>
+sv2.jd.jds_address                 = jds.example:3334
+sv2.jd.jds_authority_public_key     = <jds-noise-authority-key>
+sv2.jd.user_identity               = account.worker
+sv2.jd.mode                        = full-template
+sv2.jd.response_timeout_seconds    = 10
+```
+
+Addresses are `host:port` or `[IPv6]:port`, with an explicit port from 1 to
+65535. DNS labels are at most 63 bytes and the whole hostname at most 253;
+URLs, paths, credentials and whitespace are refused. Identities are 1 to 255
+UTF-8 bytes. Authority keys use the same Base58Check encoding described above.
+Each upstream always uses Noise, including when the local listener explicitly
+uses plaintext. A different signing authority, a certificate outside its
+validity window or an unauthenticated frame ends that attempt.
+
+The Mining connection requests work selection and version rolling, then opens
+one extended channel with the configured identity. The channel must leave at
+least 24 extranonce bytes for local channel allocation and miners, and its
+prefix plus extranonce must fit 32 bytes. A fixed-version upstream is refused.
+The node retains its own transaction selection; jobs supplied by the pool do
+not replace local work.
+
+`full-template` sets `DECLARE_TX_DATA` (specification section 6.2) on the JD
+connection. `coinbase-only` leaves that flag clear. For each new template the
+node asks the JDS for `AllocateMiningJobToken` and builds the coinbase from
+the allocation's `coinbase_tx_outputs`. Those outputs arrive with zero value;
+the whole coinbase revenue is then placed in the first output, which is the
+pool payout. `full-template` sends `DeclareMiningJob` with the coinbase prefix
+and suffix and the transaction list, answers `ProvideMissingTransactions` with
+the raw transactions, and uses the new token from `DeclareMiningJob.Success`.
+`coinbase-only` does not send `DeclareMiningJob` and uses the allocated token.
+Either mode then sends `SetCustomMiningJob` on the mining connection.
+
+Bitcoin Cash differs from the parts of the specification written for Bitcoin.
+There is no segregated witness, so the declared "wtxid" list carries ordinary
+transaction ids in the template's CTOR order. The coinbase has no witness and
+no witness commitment. BIP34 stays in the coinbase script. `excess_data` is
+empty because there is no witness reserved value to carry.
+
+Downstream miners keep mining that same template through the Mining Protocol
+server. Until a pool coinbase is ready, and again after fallback, they are
+paid `sv2.mining.address`. When the pool coinbase is installed, a channel whose
+rollable extranonce still leaves at least four bytes inside the upstream
+extranonce nests its channel id there and receives `SetExtranoncePrefix` before
+the next job. A channel that cannot nest keeps the solo payout so one miner
+cannot drop the others. The scriptSig generation and the extranonce prefix
+return to the solo channel's own values on fallback; the template's
+transactions do not change.
+
+A share that meets the upstream channel's target is forwarded as
+`SubmitSharesExtended` with the custom job id and the extranonce bytes after
+the pool's prefix. A share that does not meet that target is not forwarded.
+The target is the one the custom job was sent with; a later `SetTarget` does
+not retarget it. A share that meets the network target is submitted locally
+through the same block-connection path as solo mining. In `full-template`,
+after `DeclareMiningJob.Success`, that solution is also `PushSolution` to the
+JDS (specification section 6.4.9). `coinbase-only` has no declared job for
+`PushSolution` to name, so the block is connected locally and not pushed.
+
+Fallback follows specification section 6.2. The node returns downstream work
+to the solo payout, and logs why, when the JDS does not answer
+`AllocateMiningJobToken` within `sv2.jd.response_timeout_seconds`, the JDS
+sends `DeclareMiningJob.Error`, the pool refuses `SetCustomMiningJob`, the
+pool refuses a share on an accepted job, or either connection drops. The next
+job after the pool coinbase was in use pays `sv2.mining.address`. This PR does
+not reconnect and does not try another pool.
+
+Both connections run independently of the listener, the template build and
+downstream miners. A slow or silent upstream cannot hold those up: solo jobs
+are served while a token or declaration is outstanding, and a network-target
+share is connected without waiting for the pool or the JDS to accept it.
+Resolution, connection, handshake, partial-frame assembly and writes have
+deadlines using `sv2.handshake_timeout_seconds`; setup, the extended channel
+and each declaration step use `sv2.jd.response_timeout_seconds`. With JD
+enabled, both settings must be from 1 to 600 seconds. A healthy idle
+connection has no outstanding response deadline. OS DNS resolution
+cancellation still needs validation on Linux; numeric IP addresses avoid the
+resolver's OS lookup. Each direction accepts payloads of at most 1 MiB and the
+output queue holds at most eight frames. Shares that arrive before the custom
+job id is known are retained up to 32 and then dropped. An output queue that
+refuses a declaration or a share ends the attempt and continues solo. No
+reconnect or alternate pool is tried.

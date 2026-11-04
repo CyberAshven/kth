@@ -95,6 +95,8 @@ private:
     uint64_t stale_through_ = 0;
 };
 
+struct jd_client;
+
 // Accepts Template Distribution and Mining Protocol clients on sv2.bind:sv2.port.
 // Like the JSON-RPC server it runs on the node's executor, with one coroutine
 // per connection, and every socket is owned by one strand.
@@ -118,7 +120,8 @@ struct template_provider {
 
 private:
     ::asio::awaitable<void> run_owned();
-    ::asio::awaitable<void> serve_connection(::asio::ip::tcp::socket& socket);
+    ::asio::awaitable<void> serve_connection(::asio::ip::tcp::socket& socket,
+        jd_client* upstream);
 
     sv2_settings const settings_;
     domain::config::network const network_;
