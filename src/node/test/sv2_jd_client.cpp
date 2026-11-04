@@ -1179,6 +1179,7 @@ TEST_CASE("sv2 JD publications wake every subscriber and coalesce to the latest 
     fixture.setup();
     (void)fixture.jds.receive<setup_connection>();
     fixture.jds.send(setup_connection_success{2, 0});
+    answer_extensions(fixture, false);
     auto const request = fixture.open();
     fixture.accept(request);
     fixture.await(fixture.ready);
