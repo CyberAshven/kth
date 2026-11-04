@@ -273,6 +273,10 @@ cannot drop the others. The scriptSig generation and the extranonce prefix
 return to the solo channel's own values on fallback; the template's
 transactions do not change.
 
+Pool and solo payout changes wake connected miners when they are published.
+The listener does not poll for those changes, and stopping it joins every
+connection even while the upstreams are quiet or Job Declaration is disabled.
+
 A share that meets the upstream channel's target is forwarded as
 `SubmitSharesExtended` with the custom job id and the extranonce bytes after
 the pool's prefix. A share that does not meet that target is not forwarded.

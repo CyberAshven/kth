@@ -5,9 +5,11 @@
 #ifndef KTH_NODE_SV2_JD_CLIENT_HPP
 #define KTH_NODE_SV2_JD_CLIENT_HPP
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -20,6 +22,7 @@
 #include <boost/smart_ptr/atomic_shared_ptr.hpp>
 #include <boost/smart_ptr/shared_ptr.hpp>
 
+#include <kth/infrastructure/utility/broadcaster.hpp>
 #include <kth/node/settings.hpp>
 #include <kth/node/sv2/jd_connection.hpp>
 #include <kth/node/sv2/jd_declaration.hpp>
@@ -59,6 +62,14 @@ struct jd_client {
     // the same template for the solo payout. Safe to call off this client's strand.
     [[nodiscard]] boost::shared_ptr<jd_notice const> notice() const;
 
+    using publication_channel = broadcaster<int>::channel_type;
+
+    // One buffered wake-up per subscriber, including the current publication.
+    // Read notice() for the latest work; a slow miner never holds up the JDS.
+    [[nodiscard]] std::shared_ptr<publication_channel> subscribe_publications();
+    // Cancel a pending receive before unsubscribing, just as for chain events.
+    void unsubscribe_publications(std::shared_ptr<publication_channel> const& channel);
+
     // Queue a share for the pool and, in full-template mode, for the JDS.
     // Returns without waiting for either socket. The block is organized by the caller.
     void observe_share(mining::pool_proof proof);
@@ -86,6 +97,7 @@ private:
     std::optional<std::chrono::steady_clock::time_point> job_deadline_;
     ::asio::experimental::concurrent_channel<void(std::error_code, int)> ready_;
     boost::atomic_shared_ptr<jd_notice> notice_;
+    broadcaster<int> publications_;
     std::vector<mining::pool_proof> cached_;
     uint32_t share_sequence_ = 0;
     std::atomic_bool stopped_{false};

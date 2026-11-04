@@ -370,6 +370,7 @@ template_provider::template_provider(sv2_settings const& settings,
     // queue complete frames and tip wake-ups, so a tip cannot cancel a partial
     // read or interleave its messages with a transaction-data response.
     ::asio::experimental::channel<void(std::error_code, event)> inbox(owner_, 8);
+    auto publications = upstream ? upstream->subscribe_publications() : nullptr;
     // Closing a channel does not wake an operation already waiting on it in
     // the pinned Asio; cancelling first does.
     auto const end_inputs = [&] {
@@ -377,11 +378,16 @@ template_provider::template_provider(sv2_settings const& settings,
         socket.close(ignored);
         inbox.cancel();
         inbox.close();
+        if (publications) {
+            publications->cancel();
+            publications->close();
+        }
         tips->cancel();
         tips->close();
     };
     detail::scope_action cleanup([&] {
         end_inputs();
+        if (upstream) upstream->unsubscribe_publications(publications);
         chain_.unsubscribe_blockchain(tips);
     }, true);
 
@@ -586,20 +592,19 @@ template_provider::template_provider(sv2_settings const& settings,
             if (result.close) co_return;
         }
     };
-    // Poll the published coinbase. The JD client never waits for this connection,
-    // and this connection never reads the upstream socket.
-    auto watch_publication = [&]() -> ::asio::awaitable<void> {
-        ::asio::steady_timer timer(owner_);
-        if ( ! upstream) {
-            timer.expires_at(std::chrono::steady_clock::time_point::max());
-            auto [error] = co_await timer.async_wait(::asio::as_tuple(::asio::use_awaitable));
-            co_return;
-        }
-        uint64_t seen = 0;
+    // Publications wake only this connection. Its channel is ended with the
+    // other inputs, so the group also joins a quiet or stopped JD client.
+    // Setup reads the current notice; subscribe before remembering it so only
+    // later changes need to ask dispatch for another job.
+    uint64_t seen = 0;
+    if (upstream) {
         if (auto const notice = upstream->notice()) seen = notice->generation;
+    }
+    auto watch_publication = [&]() -> ::asio::awaitable<void> {
+        if ( ! publications) co_return;
         for (;;) {
-            timer.expires_after(std::chrono::milliseconds(50));
-            auto [error] = co_await timer.async_wait(::asio::as_tuple(::asio::use_awaitable));
+            auto [error, wake] = co_await publications->async_receive(
+                ::asio::as_tuple(::asio::use_awaitable));
             if (error) co_return;
             auto const notice = upstream->notice();
             auto const generation = notice ? notice->generation : 0;
