@@ -81,6 +81,7 @@ jd_client::jd_client(sv2_settings const& settings, ::asio::any_io_executor execu
     , jobs_(settings.jd.user_identity, settings.jd.mode == "full-template")
     , chain_(chain)
     , response_timeout_(settings.jd.response_timeout_seconds)
+    , declaration_wake_(owner_)
     , ready_(owner_, 1)
     , publications_(owner_, 1)
 {}
@@ -148,6 +149,7 @@ jd_client::jd_client(sv2_settings const& settings, ::asio::any_io_executor execu
                 published_ = true;
                 (void)ready_.try_send(std::error_code{}, 1);
                 spdlog::info("[sv2 jd] Both upstreams ready; starting local declarations");
+                wake_declarations();
             }
         }
         return true;
@@ -188,8 +190,49 @@ jd_client::jd_client(sv2_settings const& settings, ::asio::any_io_executor execu
 
 ::asio::awaitable<void> jd_client::run_owned() {
     using namespace ::asio::experimental::awaitable_operators;
+
+    // Subscribe before the first snapshot so a completed transition cannot
+    // leave the declaration loop asleep on an older tip.
+    auto tips = chain_ ? chain_->subscribe_blockchain() : nullptr;
+    auto const end_tips = [&] {
+        if (tips) {
+            tips->cancel();
+            tips->close();
+        }
+    };
+    detail::scope_action cleanup([&] {
+        end_tips();
+        if (chain_) chain_->unsubscribe_blockchain(tips);
+    }, true);
+    if (chain_ && ! tips) {
+        stop();
+        co_return;
+    }
+    auto receive_tips = [&]() -> ::asio::awaitable<void> {
+        if ( ! tips) co_return;
+        for (;;) {
+            auto [error, height, incoming, outgoing] = co_await tips->async_receive(
+                ::asio::as_tuple(::asio::use_awaitable));
+            if (error) {
+                stop();
+                co_return;
+            }
+            wake_declarations();
+        }
+    };
+    auto declarations = [&]() -> ::asio::awaitable<void> {
+        // Cancel the pending tip receive before closing and joining it.
+        detail::scope_action finish(end_tips, true);
+        co_await declare_templates();
+    };
     co_await (serve(mining_, mining_session_, "pool")
-        && serve(declaration_, declaration_session_, "JDS") && declare_templates());
+        && serve(declaration_, declaration_session_, "JDS")
+        && declarations() && receive_tips());
+}
+
+void jd_client::wake_declarations() {
+    declaration_changed_ = true;
+    declaration_wake_.cancel();
 }
 
 bool jd_client::dispatch(jd_declaration::result result) {
@@ -201,6 +244,7 @@ bool jd_client::dispatch(jd_declaration::result result) {
     if (result.progress) {
         if (jobs_.pending()) job_deadline_ = std::chrono::steady_clock::now() + response_timeout_;
         else job_deadline_.reset();
+        wake_declarations();
     }
     if (( ! result.declaration.empty() && ! declaration_.send(std::move(result.declaration)))
         || ( ! result.mining.empty() && ! mining_.send(std::move(result.mining)))) {
@@ -223,9 +267,9 @@ bool jd_client::dispatch(jd_declaration::result result) {
     // This loop has no downstream await and only one outstanding declaration.
     // A slow JDS cannot pin a queue of old templates or delay solo jobs. After
     // the response, fetch only the latest connected tip's own selection.
-    ::asio::steady_timer tick(owner_);
     std::optional<hash_digest> previous;
     while ( ! stopped_) {
+        declaration_changed_ = false;
         if (job_deadline_ && std::chrono::steady_clock::now() >= *job_deadline_) {
             spdlog::warn("[sv2 jd] Declaration response deadline expired; continuing solo mining");
             stop();
@@ -258,9 +302,12 @@ bool jd_client::dispatch(jd_declaration::result result) {
                 }
             }
         }
-        tick.expires_after(std::chrono::milliseconds(50));
-        auto [error] = co_await tick.async_wait(::asio::as_tuple(::asio::use_awaitable));
-        if (error) co_return;
+        // A tip or reply can arrive while the template fetch is suspended.
+        // Remember that wake even when there was no timer wait to cancel.
+        if (declaration_changed_) continue;
+        declaration_wake_.expires_at(job_deadline_.value_or(
+            std::chrono::steady_clock::time_point::max()));
+        (void)co_await declaration_wake_.async_wait(::asio::as_tuple(::asio::use_awaitable));
     }
 }
 
@@ -279,9 +326,11 @@ void jd_client::stop() {
         // listener posts the payout switch; one from this strand does it now,
         // before run() can return and destroy the client.
         if (owner_.running_in_this_thread()) {
+            wake_declarations();
             if (pool_live_) publish_solo();
         } else {
             ::asio::post(owner_, [this] {
+                wake_declarations();
                 if (pool_live_) publish_solo();
             });
         }

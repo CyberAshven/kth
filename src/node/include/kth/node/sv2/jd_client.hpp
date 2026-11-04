@@ -17,6 +17,7 @@
 #include <asio/any_io_executor.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/experimental/concurrent_channel.hpp>
+#include <asio/steady_timer.hpp>
 #include <asio/strand.hpp>
 
 #include <boost/smart_ptr/atomic_shared_ptr.hpp>
@@ -79,6 +80,7 @@ private:
     ::asio::awaitable<void> serve(jd_connection& connection, jd_session& session,
         char const* name);
     ::asio::awaitable<void> declare_templates();
+    void wake_declarations();
     bool dispatch(jd_declaration::result result);
     void publish_pool();
     void publish_solo();
@@ -95,6 +97,7 @@ private:
     blockchain::block_chain* const chain_;
     std::chrono::seconds const response_timeout_;
     std::optional<std::chrono::steady_clock::time_point> job_deadline_;
+    ::asio::steady_timer declaration_wake_;
     ::asio::experimental::concurrent_channel<void(std::error_code, int)> ready_;
     boost::atomic_shared_ptr<jd_notice> notice_;
     broadcaster<int> publications_;
@@ -103,6 +106,7 @@ private:
     std::atomic_bool stopped_{false};
     bool published_ = false;
     bool pool_live_ = false;
+    bool declaration_changed_ = false;
 };
 
 } // namespace kth::node::sv2
