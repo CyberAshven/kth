@@ -305,6 +305,9 @@ with the raw transactions, and uses the new token from
 and uses the token already allocated. Either mode then sends
 `SetCustomMiningJob` on the mining connection.
 
+Declarations wake on connected-tip notifications and upstream replies. Only
+an outstanding response arms a deadline; an idle client does not poll the chain.
+
 Bitcoin Cash differs from the parts of the specification written for Bitcoin.
 There is no segregated witness, so the declared "wtxid" list carries ordinary
 transaction ids in the template's CTOR order. The coinbase has no witness and

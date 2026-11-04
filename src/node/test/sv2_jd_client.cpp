@@ -738,7 +738,14 @@ declared_template declare_local_template(client_fixture& fixture, miner_link& mi
         fixture.jds.send(declare_mining_job_success{declaration.request_id, {9, 8, 7}});
     }
     auto const custom = fixture.pool.receive<set_custom_mining_job>();
-    if (quiet) CHECK_FALSE(quiet->done);
+    if (quiet) {
+        CHECK_FALSE(quiet->done);
+        // Join the silence read before callers read the JDS socket again.
+        std::error_code error;
+        fixture.jds.socket.cancel(error);
+        REQUIRE_FALSE(error);
+        REQUIRE(fixture.wait_until([&] { return quiet->done; }));
+    }
     REQUIRE(custom.channel_id == 7);
     REQUIRE(custom.request_id == allocation.request_id);
     REQUIRE(custom.mining_job_token == (full ? data_chunk{9, 8, 7} : data_chunk{1, 2, 3}));
@@ -1228,6 +1235,33 @@ TEST_CASE("sv2 JD publications wake every subscriber and coalesce to the latest 
     REQUIRE_THROWS_AS(quiet.get(), std::system_error);
 }
 
+TEST_CASE("sv2 JD client ends both upstreams when chain notifications stop", "[sv2 jd]") {
+    bool before_run = false;
+    SECTION("subscription is already stopped") { before_run = true; }
+    SECTION("waiting for a tip") {}
+    auto chain = started_chain("sv2_jd_chain_stop");
+    client_fixture fixture;
+    if (before_run) REQUIRE(chain->chain().stop());
+    fixture.start(settings(fixture.pool, fixture.jds), &chain->chain());
+    if (before_run) {
+        fixture.finished(false);
+        CHECK_FALSE(fixture.pool.accepted->done);
+        CHECK_FALSE(fixture.jds.accepted->done);
+        return;
+    }
+
+    handshake_upstreams(fixture, true);
+    fixture.await(fixture.ready);
+    REQUIRE_NOTHROW(fixture.ready.get());
+    auto const allocation = fixture.jds.receive<allocate_mining_job_token>();
+    REQUIRE(allocation.request_id != 0);
+    REQUIRE(chain->chain().stop());
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
+    fixture.eof(fixture.pool.socket);
+    fixture.eof(fixture.jds.socket);
+}
+
 TEST_CASE("sv2 JD invalid configuration refuses full node startup before opening the chain", "[sv2 jd]") {
     client_fixture fixture;
     test::chain_fixture directory{"sv2_jd_startup"};
@@ -1356,6 +1390,9 @@ TEST_CASE("sv2 JD forwards a share that meets the upstream target and connects a
             auto const view = chain->chain().chain_view();
             return view && view->connected_tip_height == 2 && view->tip_hash == solved;
         }, 10s));
+        auto const next = fixture.jds.receive<allocate_mining_job_token>();
+        REQUIRE(next.request_id != declared.custom.request_id);
+        REQUIRE(next.user_identifier == "account.worker");
         return;
     }
     fixture.pool.send(submit_shares_success{forwarded.channel_id,
