@@ -18,6 +18,7 @@
 #include <asio/any_io_executor.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/experimental/concurrent_channel.hpp>
+#include <asio/steady_timer.hpp>
 #include <asio/strand.hpp>
 
 #include <boost/smart_ptr/atomic_shared_ptr.hpp>
@@ -106,7 +107,7 @@ private:
     blockchain::block_chain* const chain_;
     std::chrono::seconds const response_timeout_;
     ::asio::experimental::concurrent_channel<void(std::error_code, int)> ready_;
-    ::asio::experimental::concurrent_channel<void(std::error_code, int)> stopping_;
+    ::asio::experimental::concurrent_channel<void(std::error_code, int)> wake_;
     boost::atomic_shared_ptr<jd_notice> notice_;
     boost::atomic_shared_ptr<jd_status> status_;
     broadcaster<int> publications_;

@@ -93,10 +93,17 @@ struct jd_client::attempt {
             endpoint(upstream.jds_address).port, upstream.user_identity, upstream.mode == "full-template")
         , jobs(upstream.user_identity, upstream.mode == "full-template")
         , health(settings.jd)
+        , declaration_wake(executor)
     {}
+
+    void wake_declarations() {
+        declaration_changed = true;
+        declaration_wake.cancel();
+    }
 
     void stop() {
         stopped = true;
+        wake_declarations();
         mining.stop();
         declaration.stop();
     }
@@ -108,6 +115,7 @@ struct jd_client::attempt {
     jd_session declaration_session;
     jd_declaration jobs;
     jd_health_window health;
+    ::asio::steady_timer declaration_wake;
     std::optional<std::chrono::steady_clock::time_point> job_sent;
     std::optional<std::chrono::steady_clock::time_point> job_deadline;
     std::vector<mining::pool_proof> cached;
@@ -117,6 +125,7 @@ struct jd_client::attempt {
     bool ready = false;
     bool healthy = false;
     bool pool_live = false;
+    bool declaration_changed = false;
     bool stopped = false;
     bool done = false;
 };
@@ -130,7 +139,7 @@ jd_client::jd_client(sv2_settings const& settings, ::asio::any_io_executor execu
     , chain_(chain)
     , response_timeout_(settings.jd.response_timeout_seconds)
     , ready_(owner_, 1)
-    , stopping_(owner_, 1)
+    , wake_(owner_, 1)
     , publications_(owner_, 1)
 {
     // Check even dormant entries before any sockets are started.
@@ -168,6 +177,7 @@ void jd_client::fail(attempt& value, jd_failure kind, std::string reason) {
 void jd_client::mark_ready(attempt& value) {
     if (value.ready || ! value.mining_session.ready() || ! value.declaration_session.ready()) return;
     value.ready = true;
+    value.wake_declarations();
     if ( ! chain_) {
         value.healthy = true;
         policy_.healthy(value.index, std::chrono::steady_clock::now());
@@ -177,6 +187,7 @@ void jd_client::mark_ready(attempt& value) {
         (void)ready_.try_send(std::error_code{}, 1);
     }
     update_status();
+    (void)wake_.try_send(std::error_code{}, 1);
     spdlog::info("[sv2 jd] Entry {} both upstreams ready{}", value.index + 1,
         active_.get() == &value ? "; active" : "; probing");
 }
@@ -301,6 +312,7 @@ void jd_client::start_attempt(size_t index, bool probe) {
             catch (std::exception const& e) { fail(*value, jd_failure::transient, e.what()); }
         }
         value->done = true;
+        (void)wake_.try_send(std::error_code{}, 1);
     });
     update_status();
     spdlog::info("[sv2 jd] Entry {} {}", index + 1, probe ? "probing" : "connecting; active");
@@ -308,62 +320,117 @@ void jd_client::start_attempt(size_t index, bool probe) {
 
 ::asio::awaitable<void> jd_client::run_owned() {
     using namespace ::asio::experimental::awaitable_operators;
-    ::asio::steady_timer tick(owner_);
-    std::exception_ptr failure;
-    std::optional<hash_digest> previous;
-    bool solo = false;
-    try {
-        while ( ! stopped_) {
-            if (active_ && active_->done) active_.reset();
-            if (probe_ && probe_->done) probe_.reset();
-            auto const now = std::chrono::steady_clock::now();
-            bool boundary = ! chain_;
-            if (chain_) {
-                auto const view = chain_->chain_view();
-                if (view) {
-                    boundary = previous && *previous != view->tip_hash;
-                    previous = view->tip_hash;
-                }
-            }
-            // The scheduler observes boundaries independently of either pair's
-            // declaration loop, including while every entry is held on solo.
-            if (boundary && recover_at_boundary()) solo = false;
-            if ( ! active_ && ! solo) {
-                if (auto const index = policy_.begin(now)) start_attempt(*index, false);
-                else {
-                    solo = true;
-                    if ( ! published_) {
-                        published_ = true;
-                        (void)ready_.try_send(std::make_error_code(std::errc::connection_aborted), 0);
-                    }
-                    spdlog::info("[sv2 jd] Active entry: solo; all configured entries unavailable");
-                }
-            }
-            if (active_ && probe_ && active_->index < probe_->index && ! probe_->stopped) {
-                // A retry may have restored an even better entry. Join the old
-                // candidate before admitting another background pair.
-                policy_.release_probe();
-                probe_->stop();
-                update_status();
-            }
-            if ((solo || (active_ && ! active_->stopped)) && ! probe_) {
-                if (auto const index = policy_.begin_probe(now)) start_attempt(*index, true);
-            }
-            tick.expires_after(std::chrono::milliseconds(50));
-            (void)co_await (tick.async_wait(::asio::as_tuple(::asio::use_awaitable))
-                || stopping_.async_receive(::asio::as_tuple(::asio::use_awaitable)));
+
+    // Subscribe before the first snapshot so a completed transition cannot
+    // leave the declaration loop asleep on an older tip.
+    auto tips = chain_ ? chain_->subscribe_blockchain() : nullptr;
+    auto const end_tips = [&] {
+        if (tips) {
+            tips->cancel();
+            tips->close();
         }
-    } catch (...) {
-        failure = std::current_exception();
+    };
+    detail::scope_action cleanup([&] {
+        end_tips();
+        if (chain_) chain_->unsubscribe_blockchain(tips);
+    }, true);
+    if (chain_ && ! tips) {
+        stop();
+        co_return;
     }
-    if (active_) { publish_solo(*active_); active_->stop(); }
-    if (probe_) probe_->stop();
-    co_await ::asio::this_coro::reset_cancellation_state(::asio::disable_cancellation());
-    while ((active_ && ! active_->done) || (probe_ && ! probe_->done)) {
-        tick.expires_after(std::chrono::milliseconds(10));
-        (void)co_await tick.async_wait(::asio::as_tuple(::asio::use_awaitable));
-    }
-    if (failure) std::rethrow_exception(failure);
+    auto receive_tips = [&]() -> ::asio::awaitable<void> {
+        if ( ! tips) co_return;
+        for (;;) {
+            auto [error, height, incoming, outgoing] = co_await tips->async_receive(
+                ::asio::as_tuple(::asio::use_awaitable));
+            if (error) {
+                stop();
+                co_return;
+            }
+            if (active_) active_->wake_declarations();
+            if (probe_) probe_->wake_declarations();
+            (void)wake_.try_send(std::error_code{}, 1);
+        }
+    };
+    auto schedule = [&]() -> ::asio::awaitable<void> {
+        // Cancel the pending tip receive before closing and joining it.
+        detail::scope_action finish(end_tips, true);
+        ::asio::steady_timer deadline(owner_);
+        std::exception_ptr failure;
+        std::optional<hash_digest> previous;
+        auto next_probe = std::chrono::steady_clock::time_point{};
+        bool solo = false;
+        try {
+            while ( ! stopped_) {
+                if (active_ && active_->done) active_.reset();
+                if (probe_ && probe_->done) probe_.reset();
+                auto const now = std::chrono::steady_clock::now();
+                bool boundary = ! chain_;
+                if (chain_) {
+                    auto const view = chain_->chain_view();
+                    if (view) {
+                        boundary = previous && *previous != view->tip_hash;
+                        previous = view->tip_hash;
+                    }
+                }
+                // Observe boundaries even while every entry is held on solo.
+                if (boundary && recover_at_boundary()) solo = false;
+                if ( ! active_ && ! solo) {
+                    if (auto const index = policy_.begin(now)) start_attempt(*index, false);
+                    else {
+                        solo = true;
+                        if ( ! published_) {
+                            published_ = true;
+                            (void)ready_.try_send(std::make_error_code(std::errc::connection_aborted), 0);
+                        }
+                        spdlog::info("[sv2 jd] Active entry: solo; all configured entries unavailable");
+                    }
+                }
+                if (active_ && probe_ && active_->index < probe_->index && ! probe_->stopped) {
+                    // Join an obsolete candidate before admitting another pair.
+                    policy_.release_probe();
+                    probe_->stop();
+                    update_status();
+                }
+                auto wake_at = std::chrono::steady_clock::time_point::max();
+                if ((solo || (active_ && ! active_->stopped)) && ! probe_) {
+                    if (auto const index = policy_.begin_probe(now)) {
+                        next_probe = now + std::chrono::seconds(settings_.jd.probe_interval_seconds);
+                        start_attempt(*index, true);
+                    } else {
+                        auto const end = policy_.active().value_or(upstreams_.size());
+                        for (size_t index = 0; index < end; ++index) {
+                            auto const& entry = policy_.entries()[index];
+                            if (entry.health == jd_health::disabled) continue;
+                            wake_at = std::min(wake_at, std::max(next_probe, entry.retry_at));
+                        }
+                    }
+                }
+                // Without a chain, readiness supplies the test-only boundary.
+                // With a chain, recovery still waits for a connected-tip event.
+                if ( ! chain_ && probe_ && ! probe_->stopped && probe_->healthy) {
+                    auto const& entry = policy_.entries()[probe_->index];
+                    if (entry.healthy_since) {
+                        wake_at = std::min(wake_at, *entry.healthy_since
+                            + std::chrono::seconds(settings_.jd.recovery_hold_seconds));
+                    }
+                }
+                deadline.expires_at(wake_at);
+                (void)co_await (deadline.async_wait(::asio::as_tuple(::asio::use_awaitable))
+                    || wake_.async_receive(::asio::as_tuple(::asio::use_awaitable)));
+            }
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        if (active_) { publish_solo(*active_); active_->stop(); }
+        if (probe_) probe_->stop();
+        co_await ::asio::this_coro::reset_cancellation_state(::asio::disable_cancellation());
+        while ((active_ && ! active_->done) || (probe_ && ! probe_->done)) {
+            (void)co_await wake_.async_receive(::asio::as_tuple(::asio::use_awaitable));
+        }
+        if (failure) std::rethrow_exception(failure);
+    };
+    co_await (schedule() && receive_tips());
 }
 
 bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
@@ -385,6 +452,7 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
             value.job_sent.reset();
             value.job_deadline.reset();
         }
+        value.wake_declarations();
     }
     if (( ! result.declaration.empty() && ! value.declaration.send(std::move(result.declaration)))
         || ( ! result.mining.empty() && ! value.mining.send(std::move(result.mining)))) {
@@ -397,6 +465,7 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
             value.healthy = true;
             policy_.healthy(value.index, now);
             update_status();
+            (void)wake_.try_send(std::error_code{}, 1);
         }
         spdlog::info("[sv2 jd] Entry {} accepted local template as job {}", value.index + 1,
             value.jobs.work()->upstream_job_id);
@@ -406,9 +475,11 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
 }
 
 ::asio::awaitable<void> jd_client::declare_templates(attempt& value) {
-    ::asio::steady_timer tick(owner_);
+    // Each pair keeps one outstanding declaration and fetches only the latest
+    // connected tip after a reply. Neither upstream can delay solo jobs.
     std::optional<hash_digest> previous;
     while ( ! stopped_ && ! value.stopped) {
+        value.declaration_changed = false;
         auto const now = std::chrono::steady_clock::now();
         if ((value.job_deadline && now >= *value.job_deadline)
             || ( ! value.submitted.empty() && now - value.submitted.front().sent >= response_timeout_)) {
@@ -441,9 +512,15 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
                 }
             }
         }
-        tick.expires_after(std::chrono::milliseconds(50));
-        auto [error] = co_await tick.async_wait(::asio::as_tuple(::asio::use_awaitable));
-        if (error) co_return;
+        // A tip or reply can arrive while the template fetch is suspended.
+        // Remember that wake even when there was no timer wait to cancel.
+        if (value.declaration_changed) continue;
+        auto wake_at = value.job_deadline.value_or(std::chrono::steady_clock::time_point::max());
+        if ( ! value.submitted.empty()) {
+            wake_at = std::min(wake_at, value.submitted.front().sent + response_timeout_);
+        }
+        value.declaration_wake.expires_at(wake_at);
+        (void)co_await value.declaration_wake.async_wait(::asio::as_tuple(::asio::use_awaitable));
     }
 }
 
@@ -469,6 +546,7 @@ bool jd_client::share_response(attempt& value, message_header const& header, byt
             }
             value.submitted.pop_front();
         }
+        value.wake_declarations();
         return true;
     }
     auto const message = parse<submit_shares_error>(payload);
@@ -488,6 +566,7 @@ bool jd_client::share_response(attempt& value, message_header const& header, byt
     bool const stale = message->error_code == "stale-share" || message->error_code == "invalid-job-id";
     auto const latency = std::chrono::duration_cast<std::chrono::milliseconds>(now - found->sent);
     value.submitted.erase(found);
+    value.wake_declarations();
     if (auto const reason = value.health.sample(stale, true, latency)) {
         fail(value, jd_failure::transient, *reason);
         return false;
@@ -502,7 +581,7 @@ bool jd_client::share_response(attempt& value, message_header const& header, byt
 
 void jd_client::stop() {
     stopped_ = true;
-    (void)stopping_.try_send(std::error_code{}, 1);
+    (void)wake_.try_send(std::error_code{}, 1);
     (void)ready_.try_send(std::make_error_code(std::errc::operation_canceled), 0);
 }
 
@@ -612,6 +691,7 @@ void jd_client::forward_share(attempt& value, mining::pool_proof const& proof) {
         return;
     }
     value.submitted.push_back({message.sequence_number, proof.prev_hash, std::chrono::steady_clock::now()});
+    value.wake_declarations();
 }
 
 void jd_client::flush_cached(attempt& value) {
