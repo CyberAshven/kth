@@ -9,8 +9,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -87,8 +89,17 @@ private:
     void publish_solo();
     void note_share(mining::pool_proof const& proof);
     void forward_share(mining::pool_proof const& proof);
+    void remember_submitted(uint32_t sequence, uint32_t generation);
+    // A share reply names one submission. Success changes nothing. An error
+    // falls back only when that submission is still the accepted declaration
+    // (sv2-spec 6.2). nullopt leaves the mining connection up; a string closes it.
+    [[nodiscard]] std::optional<std::string> share_reply(message_header const& header,
+        byte_span payload);
+    // False when the JDS queue refuses the frame and this client is stopping.
+    [[nodiscard]] bool push_block(mining::pool_proof const& proof);
+    [[nodiscard]] bool flush_pending_solutions();
     void flush_cached();
-    // Drop shares mined on a declaration that is being replaced.
+    // Drop shares and unpushed block proofs from a declaration being replaced.
     void retire_cached();
 
     ::asio::strand<::asio::any_io_executor> owner_;
@@ -112,6 +123,18 @@ private:
     // Proofs found before SetCustomMiningJob.Success. Each proof's generation
     // is the declaration it was mined on; a replacement drops the vector.
     std::vector<mining::pool_proof> cached_;
+    // sequence_number and declared_work::generation of each SubmitSharesExtended
+    // this channel sent. Bounded so a slow pool cannot pin every share. A reply
+    // for a sequence that has aged out is ignored, same as one never sent.
+    struct submitted_share {
+        uint32_t sequence = 0;
+        uint32_t generation = 0;
+    };
+    std::deque<submitted_share> submitted_;
+    // Full-template blocks found before DeclareMiningJob.Success. Sent once
+    // can_push_solution() is true for that generation. Two covers a pair found
+    // on the same coinbase; a later one is dropped rather than queued forever.
+    std::vector<mining::pool_proof> pending_solutions_;
     uint32_t share_sequence_ = 0;
     std::atomic_bool stopped_{false};
     bool published_ = false;

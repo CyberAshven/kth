@@ -41,6 +41,9 @@ struct jd_declaration {
     // Full-template only, and only after DeclareMiningJob.Success. Spec 6.4.9
     // does not define PushSolution for coinbase-only.
     [[nodiscard]] bool can_push_solution() const;
+    // Coinbase-only never sends PushSolution. Callers use this so they do not
+    // hold a block they are not going to push.
+    [[nodiscard]] bool full_template() const;
     // Drop an in-flight declaration whose tip is no longer current. A late
     // reply is ignored instead of failing the upstream.
     void supersede();

@@ -82,6 +82,10 @@ bool jd_declaration::can_push_solution() const {
     return full_template_ && (state_ == state::installing || state_ == state::accepted);
 }
 
+bool jd_declaration::full_template() const {
+    return full_template_;
+}
+
 void jd_declaration::supersede() {
     if ( ! pending()) return;
     state_ = state::idle;
