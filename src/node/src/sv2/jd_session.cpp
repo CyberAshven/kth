@@ -106,7 +106,14 @@ jd_session::result jd_session::process_setup(message_header const& header, byte_
     if (header.msg_type == setup_connection_error::message_type) {
         auto const error = parse<setup_connection_error>(payload);
         if ( ! error) return fail("malformed upstream setup error");
-        return fail("upstream refused setup (" + printable_error_code(error->error_code) + ")");
+        auto reason = "upstream refused setup (" + printable_error_code(error->error_code) + ")";
+        // SetupConnection.Error names the flags behind the refusal. A JDS that
+        // wants DECLARE_TX_DATA accepts only full-template declarations.
+        if (peer_ == jd_peer::declaration && ! full_template_
+            && (error->flags & jd_flag_declare_tx_data) != 0) {
+            reason += "; this JDS requires full-template (sv2.jd.mode = full-template)";
+        }
+        return fail(std::move(reason));
     }
     if (header.msg_type != setup_connection_success::message_type) {
         return fail("unexpected upstream setup message");
@@ -157,6 +164,17 @@ bool jd_session::matches_channel(uint32_t id) const {
 }
 
 jd_session::result jd_session::process_mining(message_header const& header, byte_span payload) {
+    // SetGroupChannel (type 0x25) has the channel bit clear. The check below
+    // would close a regrouping of this extended channel (sv2-spec 5.3.22).
+    if ( ! header.channel_msg() && header.msg_type == set_group_channel::message_type) {
+        auto const message = parse<set_group_channel>(payload);
+        if ( ! message) return fail("invalid upstream group channel");
+        if (std::find(message->channel_ids.begin(), message->channel_ids.end(),
+                channel_->channel_id) != message->channel_ids.end()) {
+            channel_->group_channel_id = message->group_channel_id;
+        }
+        return {{}, false, true, {}};
+    }
     if ( ! header.channel_msg()) return fail("invalid upstream mining frame");
     switch (header.msg_type) {
         case set_target::message_type: {

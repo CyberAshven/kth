@@ -231,20 +231,25 @@ TEST_CASE("sv2 jd declaration and transaction response respect the upstream fram
     declaration.coinbase_tx_prefix.resize(b0_64k_max);
     declaration.coinbase_tx_suffix.resize(b0_64k_max);
     declaration.excess_data.resize(b0_64k_max);
-    declaration.wtxid_list.resize((jd_message_max_payload - declaration.serialized_size()) / hash_size);
+    // Even with every field at its maximum, DeclareMiningJob stays under the
+    // U24 frame cap; what bounds it is the SEQ0_64K transaction id list.
+    declaration.wtxid_list.resize(65535);
+    REQUIRE(declaration.serialized_size() <= jd_frame_max_payload);
     REQUIRE(from_data_chunk<declare_mining_job>(to_data_chunk(declaration)).has_value());
     declaration.wtxid_list.push_back({});
     require_refused(declaration);
-    REQUIRE_FALSE(from_data_chunk<declare_mining_job>(data_chunk(jd_message_max_payload + 1)).has_value());
+    REQUIRE_FALSE(from_data_chunk<declare_mining_job>(data_chunk(jd_frame_max_payload + 1)).has_value());
 
-    provide_missing_transactions_success transactions{1, {data_chunk(jd_message_max_payload - 9, 0xab)}};
-    REQUIRE(transactions.serialized_size() == jd_message_max_payload);
+    // ProvideMissingTransactions.Success can reach the U24 frame cap: request id,
+    // a SEQ0_64K count and one B0_16M length prefix are 9 bytes of overhead.
+    provide_missing_transactions_success transactions{1, {data_chunk(jd_frame_max_payload - 9, 0xab)}};
+    REQUIRE(transactions.serialized_size() == jd_frame_max_payload);
     auto const parsed = from_data_chunk<provide_missing_transactions_success>(to_data_chunk(transactions));
     REQUIRE(parsed.has_value());
     REQUIRE(parsed->transaction_list == transactions.transaction_list);
     transactions.transaction_list.front().push_back(0);
     require_refused(transactions);
-    REQUIRE_FALSE(from_data_chunk<provide_missing_transactions_success>(data_chunk(jd_message_max_payload + 1)).has_value());
+    REQUIRE_FALSE(from_data_chunk<provide_missing_transactions_success>(data_chunk(jd_frame_max_payload + 1)).has_value());
 
     declare_mining_job small;
     SECTION("token") { small.mining_job_token.resize(b0_255_max + 1); }

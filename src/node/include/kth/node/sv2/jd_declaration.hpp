@@ -5,7 +5,9 @@
 #ifndef KTH_NODE_SV2_JD_DECLARATION_HPP
 #define KTH_NODE_SV2_JD_DECLARATION_HPP
 
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <optional>
 #include <string>
 
@@ -44,8 +46,9 @@ struct jd_declaration {
     // Coinbase-only never sends PushSolution. Callers use this so they do not
     // hold a block they are not going to push.
     [[nodiscard]] bool full_template() const;
-    // Drop an in-flight declaration whose tip is no longer current. A late
-    // reply is ignored instead of failing the upstream.
+    // Drop an in-flight declaration whose tip is no longer current. Its
+    // request id stays recognized, so a late reply is ignored after the next
+    // declaration has started.
     void supersede();
     void note_target(hash_digest const& target);
 
@@ -54,13 +57,18 @@ private:
 
     [[nodiscard]] result fail(std::string reason);
     [[nodiscard]] result install(data_chunk token);
+    [[nodiscard]] bool retired(uint32_t id) const;
+
+    // One id per replaced declaration. A handful of tip changes can outrun a
+    // reply; an id older than this is treated as one this client never sent.
+    static constexpr size_t max_retired_request_ids = 8;
 
     std::string identity_;
     bool full_template_;
     bool has_template_ = false;
-    bool superseded_ = false;
     state state_ = state::idle;
     uint32_t request_id_ = 0;
+    std::deque<uint32_t> retired_request_ids_;
     blockchain::mining_template template_{};
     open_extended_mining_channel_success channel_;
     std::optional<mining::declared_work> work_;

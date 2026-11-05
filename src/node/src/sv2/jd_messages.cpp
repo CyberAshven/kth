@@ -80,7 +80,9 @@ size_t declare_mining_job::serialized_size() const {
 }
 
 expect<void> declare_mining_job::to_data(byte_writer& sink) const {
-    if (serialized_size() > jd_message_max_payload) return std::unexpected(error::operation_failed);
+    // msg_length is a U24. The hash list of a full template can pass 1 MiB
+    // and still be a legal frame.
+    if (serialized_size() > jd_frame_max_payload) return std::unexpected(error::operation_failed);
     if (auto r = sink.write_little_endian<uint32_t>(request_id); ! r) return r;
     if (auto r = write_bytes_u8(sink, mining_job_token); ! r) return r;
     if (auto r = sink.write_little_endian<uint32_t>(version); ! r) return r;
@@ -91,7 +93,7 @@ expect<void> declare_mining_job::to_data(byte_writer& sink) const {
 }
 
 expect<declare_mining_job> declare_mining_job::from_data(byte_reader& source) {
-    if (source.remaining_size() > jd_message_max_payload) return std::unexpected(error::operation_failed);
+    if (source.remaining_size() > jd_frame_max_payload) return std::unexpected(error::operation_failed);
     auto const request_id = source.read_little_endian<uint32_t>();
     if ( ! request_id) return std::unexpected(request_id.error());
     auto const mining_job_token = read_bytes_u8(source);
@@ -176,13 +178,15 @@ size_t provide_missing_transactions_success::serialized_size() const {
 }
 
 expect<void> provide_missing_transactions_success::to_data(byte_writer& sink) const {
-    if (serialized_size() > jd_message_max_payload) return std::unexpected(error::operation_failed);
+    // The transactions the server asked for, not the whole template. A legal
+    // reply can be larger than the 1 MiB inbound cap and at most one U24.
+    if (serialized_size() > jd_frame_max_payload) return std::unexpected(error::operation_failed);
     if (auto r = sink.write_little_endian<uint32_t>(request_id); ! r) return r;
     return write_bytes_seq_u16(sink, transaction_list);
 }
 
 expect<provide_missing_transactions_success> provide_missing_transactions_success::from_data(byte_reader& source) {
-    if (source.remaining_size() > jd_message_max_payload) return std::unexpected(error::operation_failed);
+    if (source.remaining_size() > jd_frame_max_payload) return std::unexpected(error::operation_failed);
     auto const request_id = source.read_little_endian<uint32_t>();
     if ( ! request_id) return std::unexpected(request_id.error());
     auto const count = source.read_little_endian<uint16_t>();

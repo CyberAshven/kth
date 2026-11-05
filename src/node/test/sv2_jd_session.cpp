@@ -268,6 +268,24 @@ TEST_CASE("sv2 jd upstream request fits eight bytes and accepts larger grants", 
     REQUIRE(refused.error == "invalid upstream extended channel");
 }
 
+TEST_CASE("sv2 jd names full-template when a JDS refuses coinbase-only setup", "[sv2 jd]") {
+    // SetupConnection.Error carries the flags behind the refusal. DECLARE_TX_DATA
+    // (bit 0) from a JDS means it accepts only full-template declarations.
+    auto coinbase_only = waiting(jd_peer::declaration, false);
+    auto const refused = process(coinbase_only, setup_connection_error{1, "unsupported-feature-flags"});
+    require_closed(coinbase_only, refused);
+    REQUIRE(refused.error == "upstream refused setup (unsupported-feature-flags); "
+        "this JDS requires full-template (sv2.jd.mode = full-template)");
+
+    // The hint is only for the JDS, and only when this node did not offer the flag.
+    for (auto const& [peer, full] : {std::pair{jd_peer::declaration, true}, std::pair{jd_peer::mining, false}}) {
+        auto setup = waiting(peer, full);
+        auto const plain = process(setup, setup_connection_error{1, "unsupported-feature-flags"});
+        require_closed(setup, plain);
+        REQUIRE(plain.error == "upstream refused setup (unsupported-feature-flags)");
+    }
+}
+
 TEST_CASE("sv2 jd refusal diagnostics retain bounded printable upstream error codes", "[sv2 jd]") {
     std::string const controls{'\0', '\t', '\n', '\r', '\x1b', '\x7f'};
     auto const cases = std::vector<std::pair<std::string, std::string>>{
@@ -377,4 +395,23 @@ TEST_CASE("sv2 jd extensions are discarded only within the frame length bound", 
     require_closed(oversized, process(oversized, 0x4000, 0xff, large));
     auto undefined = ready();
     require_closed(undefined, process(undefined, message_header::channel_msg_flag, 0xff, {}));
+}
+
+TEST_CASE("sv2 jd SetGroupChannel regroups this extended channel and ignores the rest", "[sv2 jd]") {
+    auto session = ready();
+    require_silent(process(session, set_group_channel{42, {1, 7}}));
+    REQUIRE(session.ready());
+    REQUIRE(session.channel()->channel_id == 7);
+    REQUIRE(session.channel()->group_channel_id == 42);
+    REQUIRE(session.channel()->extranonce_prefix == data_chunk{1, 2});
+
+    require_silent(process(session, set_group_channel{99, {1, 2, 8}}));
+    REQUIRE(session.channel()->group_channel_id == 42);
+    require_silent(process(session, set_group_channel{100, {}}));
+    REQUIRE(session.channel()->group_channel_id == 42);
+
+    refuse_incomplete(set_group_channel{42, {7}}, ready);
+    auto flagged = ready();
+    require_closed(flagged, process(flagged, message_header::channel_msg_flag,
+        set_group_channel::message_type, to_data_chunk(set_group_channel{42, {7}})));
 }
