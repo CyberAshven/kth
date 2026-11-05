@@ -15,11 +15,19 @@
 #include <kth/infrastructure/utility/byte_reader.hpp>
 #include <kth/infrastructure/utility/byte_writer.hpp>
 #include <kth/infrastructure/utility/data.hpp>
+#include <kth/node/sv2/framing.hpp>
 
 namespace kth::node::sv2 {
 
-// Match the upstream transport's frame bound before allocating nested data.
+// Frames this declaration state machine accepts. Tokens, errors, and a
+// missing-transaction index list (at most 4 + 2 + 2*65535 bytes) fit well
+// below 1 MiB. jd_session::max_payload_size and jd_connection::max_payload_size
+// are the same cap on frames the connection reads.
 inline constexpr size_t jd_message_max_payload = 1024 * 1024;
+
+// Outbound payload cap. A frame's msg_length is a U24 (sv2-spec 3.2), so one
+// message carries at most 2^24 - 1 bytes. u24_max is that width.
+inline constexpr size_t jd_frame_max_payload = u24_max;
 
 struct allocate_mining_job_token {
     static constexpr uint8_t message_type = 0x50;

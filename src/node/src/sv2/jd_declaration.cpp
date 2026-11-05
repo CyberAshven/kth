@@ -6,8 +6,11 @@
 
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <utility>
 #include <vector>
+
+#include <spdlog/spdlog.h>
 
 #include <kth/domain/chain/output.hpp>
 #include <kth/domain/chain/transaction.hpp>
@@ -33,6 +36,56 @@ std::optional<Message> parse(byte_span payload) {
     auto message = Message::from_data(source);
     if ( ! message || ! source.is_exhausted()) return std::nullopt;
     return std::move(*message);
+}
+
+// Request id of a reply this client understands, when the frame parses.
+// Empty when the frame is not one of those replies or does not parse: the
+// caller then applies the ordinary state checks.
+std::optional<uint32_t> reply_request_id(jd_peer peer, message_header const& header,
+    byte_span payload) {
+    if (peer == jd_peer::declaration && ! header.channel_msg()) {
+        switch (header.msg_type) {
+            case allocate_mining_job_token_success::message_type:
+                if (auto message = parse<allocate_mining_job_token_success>(payload)) {
+                    return message->request_id;
+                }
+                return std::nullopt;
+            case declare_mining_job_success::message_type:
+                if (auto message = parse<declare_mining_job_success>(payload)) {
+                    return message->request_id;
+                }
+                return std::nullopt;
+            case declare_mining_job_error::message_type:
+                if (auto message = parse<declare_mining_job_error>(payload)) {
+                    return message->request_id;
+                }
+                return std::nullopt;
+            case provide_missing_transactions::message_type:
+                if (auto message = parse<provide_missing_transactions>(payload)) {
+                    return message->request_id;
+                }
+                return std::nullopt;
+            default:
+                break;
+        }
+    }
+    if (peer == jd_peer::mining && header.channel_msg()) {
+        switch (header.msg_type) {
+            case set_custom_mining_job_success::message_type:
+                if (auto message = parse<set_custom_mining_job_success>(payload)) {
+                    return message->request_id;
+                }
+                return std::nullopt;
+            case set_custom_mining_job_error::message_type:
+                if (auto message = parse<set_custom_mining_job_error>(payload)) {
+                    return message->request_id;
+                }
+                return std::nullopt;
+            default:
+                break;
+        }
+    }
+    return std::nullopt;
 }
 
 std::optional<domain::chain::output::list> pool_outputs(byte_span bytes, uint64_t revenue) {
@@ -88,10 +141,20 @@ bool jd_declaration::full_template() const {
 
 void jd_declaration::supersede() {
     if ( ! pending()) return;
+    // start() will issue the next id on this same object. Remember this one
+    // so a reply that arrives after that start is not applied to the new work.
+    if (retired_request_ids_.size() == max_retired_request_ids) {
+        retired_request_ids_.pop_front();
+    }
+    retired_request_ids_.push_back(request_id_);
     state_ = state::idle;
-    superseded_ = true;
     work_.reset();
     transactions_.clear();
+}
+
+bool jd_declaration::retired(uint32_t id) const {
+    return std::find(retired_request_ids_.begin(), retired_request_ids_.end(), id)
+        != retired_request_ids_.end();
 }
 
 void jd_declaration::note_target(hash_digest const& target) {
@@ -126,18 +189,27 @@ jd_declaration::result jd_declaration::start(blockchain::mining_template value,
         || std::all_of(channel.target.begin(), channel.target.end(), [](uint8_t x) { return x == 0; })) {
         return fail("invalid declaration channel");
     }
-    if (value.selection.txs.size() > b0_64k_max) return fail("too many declaration transactions");
+    if (full_template_ && value.selection.txs.size() > b0_64k_max) {
+        // Full-template puts every txid in DeclareMiningJob.wtxid_list, which
+        // is SEQ0_64K[U256] (sv2-spec 6.4.4). Coinbase-only sends only the
+        // merkle path, so a Bitcoin Cash block of any transaction count fits.
+        return fail("full-template transaction list exceeds the SEQ0_64K limit of 65535");
+    }
     transactions_.clear();
-    uint64_t size = 4 + 2;
+    size_t retained = 0;
     for (auto const& tx : value.selection.txs) {
         if ( ! tx) return fail("null declaration transaction");
         if (full_template_) {
             domain::chain::transaction const& transaction = *tx;
             auto const raw_size = transaction.serialized_size(true);
-            if (raw_size > b0_16m_max || size + 3 + raw_size > jd_message_max_payload) {
-                return fail("declaration transaction data exceeds the local frame limit");
+            // The whole template stays local. A ProvideMissingTransactions
+            // reply is checked later, and only for the transactions named in it.
+            // Bitcoin Cash's block size limit is adaptive (ABLA), so the bound is
+            // this template's own consensus size limit, not a fixed number.
+            if (raw_size > value.size_limit || retained > value.size_limit - raw_size) {
+                return fail("retained template transactions exceed the template's consensus block size limit");
             }
-            size += 3 + raw_size;
+            retained += raw_size;
             // These are the same BCH network bytes the local Template Provider
             // returns. Keep them once so missing-transaction replies use them intact.
             transactions_.push_back(to_data_chunk(transaction, true));
@@ -147,7 +219,6 @@ jd_declaration::result jd_declaration::start(blockchain::mining_template value,
     channel_ = channel;
     template_ = std::move(value);
     has_template_ = true;
-    superseded_ = false;
     // The replacement is a new declaration. It stays unaccepted until
     // SetCustomMiningJob.Success, whose job id may be zero.
     work_.reset();
@@ -182,13 +253,19 @@ jd_declaration::result jd_declaration::install(data_chunk token) {
 
 jd_declaration::result jd_declaration::process(jd_peer peer,
     message_header const& header, byte_span payload) {
+    // Inbound cap. Received JD messages are small. Outbound frames are checked
+    // against jd_frame_max_payload when they are built.
     if (header.msg_length != payload.size() || payload.size() > jd_message_max_payload) {
         return fail("invalid declaration frame length");
     }
     if (header.extension() != 0) return {};
-    // The tip moved while this request was outstanding. The reply belongs to
-    // work we are no longer installing, so it must not take the connection down.
-    if (state_ == state::idle && superseded_) return {};
+    // A replaced declaration's reply can arrive after the next start().
+    // Ignore it and leave the declaration now in flight alone.
+    if (auto const id = reply_request_id(peer, header, payload); id && retired(*id)) {
+        spdlog::debug("[sv2 jd] ignoring reply type {} for retired request {}",
+            static_cast<unsigned>(header.msg_type), *id);
+        return {};
+    }
     if (state_ == state::failed || ! pending()) return fail("unexpected declaration response");
     if (state_ == state::allocating && peer == jd_peer::declaration && ! header.channel_msg()
         && header.msg_type == allocate_mining_job_token_success::message_type) {
@@ -217,8 +294,8 @@ jd_declaration::result jd_declaration::process(jd_peer peer,
         // BCH has no SegWit: the spec's wtxid list carries ordinary transaction
         // ids in the Template Provider's CTOR order, with no witness commitment.
         for (auto const& tx : template_.selection.txs) message.wtxid_list.push_back(tx->hash());
-        if (message.serialized_size() > jd_message_max_payload) {
-            return fail("declaration exceeds the local frame limit");
+        if (message.serialized_size() > jd_frame_max_payload) {
+            return fail("DeclareMiningJob exceeds the SV2 frame maximum");
         }
         state_ = state::declaring;
         result out;
@@ -253,6 +330,12 @@ jd_declaration::result jd_declaration::process(jd_peer peer,
                 }
                 supplied[index] = true;
                 response.transaction_list.push_back(transactions_[index]);
+            }
+            // Only the named transactions are on the wire. The retained
+            // template may be as large as the block's ABLA limit; one message
+            // may not exceed the U24 frame.
+            if (response.serialized_size() > jd_frame_max_payload) {
+                return fail("ProvideMissingTransactions.Success exceeds the SV2 frame maximum");
             }
             result out;
             out.declaration = frame(response);
