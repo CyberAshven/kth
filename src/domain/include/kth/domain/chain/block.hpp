@@ -192,7 +192,8 @@ struct KD_API block {
     [[nodiscard]]
     bool is_valid_merkle_root() const;
 
-    code check() const;
+    /// Proof-of-work ceiling follows `retarget` (`false` is regtest). No default.
+    code check(bool retarget) const;
 
     /// Check block body only (skip header validation for headers-first sync).
     /// Use this when headers have already been validated during header sync.

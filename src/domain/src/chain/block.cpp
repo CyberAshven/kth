@@ -617,9 +617,11 @@ code block::check_transactions() const {
 //-----------------------------------------------------------------------------
 
 // Structural validation — no context needed, no prevout cache needed.
-code block::check() const {
+// `retarget` selects the proof-of-work ceiling. There is no default:
+// the caller has to name its network.
+code block::check(bool retarget) const {
     code ec;
-    if ((ec = header_.check(chain::hash(header_), false))) {
+    if ((ec = header_.check(chain::hash(header_), retarget))) {
         return ec;
     }
     return check_body();

@@ -117,7 +117,7 @@ KTH_EXPORT
 kth_hash_t kth_domain_chain_block_generate_merkle_root(kth_block_const_t self);
 
 KTH_EXPORT
-kth_error_code_t kth_domain_chain_block_check(kth_block_const_t self);
+kth_error_code_t kth_domain_chain_block_check(kth_block_const_t self, kth_bool_t retarget);
 
 KTH_EXPORT
 kth_error_code_t kth_domain_chain_block_check_body(kth_block_const_t self);

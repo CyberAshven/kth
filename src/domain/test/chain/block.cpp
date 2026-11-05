@@ -252,6 +252,17 @@ TEST_CASE("block genesis regtest valid structure", "[block serialization]") {
     REQUIRE(genesis.header().merkle() == genesis.generate_merkle_root());
 }
 
+// `false` is the regtest proof-of-work ceiling. The regtest genesis target
+// is that ceiling, so the same block passes only when the caller asks for it.
+TEST_CASE("block check proof of work ceiling follows retarget", "[chain block]") {
+    auto const regtest = chain::block::genesis_regtest();
+    REQUIRE(regtest.check(false) == error::success);
+    REQUIRE(regtest.check(true) == error::invalid_proof_of_work);
+
+    auto const mainnet = chain::block::genesis_mainnet();
+    REQUIRE(mainnet.check(true) == error::success);
+}
+
 #if defined(KTH_CURRENCY_BCH)
 TEST_CASE("block genesis testnet4 valid structure", "[block serialization]") {
     auto const genesis = chain::block::genesis_testnet4();

@@ -158,10 +158,11 @@ kth_hash_t kth_domain_chain_block_generate_merkle_root(kth_block_const_t self) {
     return kth::to_hash_t(kth::cpp_ref<cpp_t>(self).generate_merkle_root());
 }
 
-kth_error_code_t kth_domain_chain_block_check(kth_block_const_t self) {
+kth_error_code_t kth_domain_chain_block_check(kth_block_const_t self, kth_bool_t retarget) {
     KTH_PRECONDITION(self != nullptr);
-    auto operation = [&]() noexcept(noexcept(kth::to_c_err(kth::cpp_ref<cpp_t>(self).check()))) -> kth_error_code_t {
-        return kth::to_c_err(kth::cpp_ref<cpp_t>(self).check());
+    auto const retarget_cpp = kth::int_to_bool(retarget);
+    auto operation = [&]() noexcept(noexcept(kth::to_c_err(kth::cpp_ref<cpp_t>(self).check(retarget_cpp)))) -> kth_error_code_t {
+        return kth::to_c_err(kth::cpp_ref<cpp_t>(self).check(retarget_cpp));
     };
 #if defined(KTH_CAPI_EXCEPTION_BARRIERS)
     return kth::capi_invoke(operation);

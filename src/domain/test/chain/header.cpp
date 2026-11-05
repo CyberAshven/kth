@@ -411,12 +411,47 @@ TEST_CASE("chain header is valid proof of work bits exceeds maximum returns fals
 }
 
 TEST_CASE("chain header is valid proof of work retarget bits exceeds maximum returns false", "[chain header]") {
-    chain::header const instance{
-        1u, null_hash, null_hash, 0u,
-        no_retarget_proof_of_work_limit + 1, 0u
-    };
-    auto const hdr_hash = hash(instance);
-    REQUIRE( ! instance.is_valid_proof_of_work(hdr_hash, false));
+    // 0x207fffff is the regtest ceiling, and the regtest genesis header,
+    // whose hash meets it, passes at that ceiling. This case used to test
+    // 0x20800000, which sets the compact sign bit and decodes to a zero
+    // target, so it was refused for that and never compared to a ceiling.
+    // 0x21008000 decodes to 2^255, just above the regtest ceiling, and does
+    // not overflow 256 bits.
+    static_assert(no_retarget_proof_of_work_limit == 0x207fffffu);
+    auto const regtest = chain::block::genesis_regtest();
+    auto const& at_ceiling = regtest.header();
+    REQUIRE(at_ceiling.bits() == 0x207fffffu);
+    REQUIRE(at_ceiling.is_valid_proof_of_work(hash(at_ceiling), false));
+
+    chain::header const above{
+        at_ceiling.version(),
+        at_ceiling.previous_block_hash(),
+        at_ceiling.merkle(),
+        at_ceiling.timestamp(),
+        0x21008000u,
+        at_ceiling.nonce()};
+    REQUIRE( ! above.is_valid_proof_of_work(hash(above), false));
+}
+
+// The regtest genesis target is 0x207fffff: above the mainnet ceiling and
+// equal to the regtest ceiling, and the header hash meets it. With a
+// function-local static ceiling, one of these two cases fails whichever
+// runs first.
+TEST_CASE("chain header is valid proof of work mainnet ceiling checked before regtest", "[chain header]") {
+    auto const regtest = chain::block::genesis_regtest();
+    auto const& header = regtest.header();
+    auto const hdr_hash = hash(header);
+    REQUIRE(header.bits() == 0x207fffffu);
+    REQUIRE( ! header.is_valid_proof_of_work(hdr_hash, true));
+    REQUIRE(header.is_valid_proof_of_work(hdr_hash, false));
+}
+
+TEST_CASE("chain header is valid proof of work regtest ceiling checked before mainnet", "[chain header]") {
+    auto const regtest = chain::block::genesis_regtest();
+    auto const& header = regtest.header();
+    auto const hdr_hash = hash(header);
+    REQUIRE(header.is_valid_proof_of_work(hdr_hash, false));
+    REQUIRE( ! header.is_valid_proof_of_work(hdr_hash, true));
 }
 
 TEST_CASE("chain header is valid proof of work hash greater bits returns false", "[chain header]") {
