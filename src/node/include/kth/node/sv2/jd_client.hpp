@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -98,6 +99,11 @@ private:
     std::chrono::seconds const response_timeout_;
     std::optional<std::chrono::steady_clock::time_point> job_deadline_;
     ::asio::steady_timer declaration_wake_;
+    // Installed and cleared by run_owned(), and invoked only on owner_.
+    // Client stop has to finish a parked receive. The channel is created on
+    // owner_, so the close notice is posted there rather than on the chain
+    // executor that stop() then shuts down.
+    std::function<void()> cancel_tips_;
     ::asio::experimental::concurrent_channel<void(std::error_code, int)> ready_;
     boost::atomic_shared_ptr<jd_notice> notice_;
     broadcaster<int> publications_;

@@ -315,7 +315,7 @@ std::optional<declared_work> make_declared_work(blockchain::mining_template cons
     data_chunk const& upstream_prefix, uint16_t upstream_extranonce_size) {
     auto const target = domain::chain::compact::from_compact(tmpl.bits);
     if ( ! target || target->big() == 0 || tmpl.current_time < tmpl.min_time
-        || upstream_extranonce_size < 24 || upstream_extranonce_size > 32
+        || upstream_extranonce_size < jd_min_extranonce_size || upstream_extranonce_size > 32
         || upstream_prefix.size() > 32 - size_t{upstream_extranonce_size}
         || tmpl.selection.txs.size() > 65535) {
         return std::nullopt;
@@ -466,8 +466,9 @@ std::optional<payout> payout_from_address(std::string_view address,
 #endif
 }
 
-work_engine::work_engine(uint64_t connection_salt)
+work_engine::work_engine(uint64_t connection_salt, std::shared_ptr<uint64_t> pool_allocations)
     : salt_(connection_salt)
+    , pool_allocations_(std::move(pool_allocations))
 {}
 
 hash_digest work_engine::choose_target(float hashrate, hash_digest const& max_target) const {
@@ -524,8 +525,9 @@ opened_channel work_engine::open(open_request const& request) {
 
     uint16_t extranonce_size = 0;
     if (request.kind == channel_kind::extended) {
-        auto const size = std::max<size_t>(request.min_extranonce_size, extranonce_prefix_size);
-        if (request.min_extranonce_size > 32 || size > 32
+        auto const size = pool_allocations_ ? size_t{jd_downstream_extranonce_size}
+            : std::max<size_t>(request.min_extranonce_size, extranonce_prefix_size);
+        if (request.min_extranonce_size > size || size > 32
             || bip34_reserve + extranonce_prefix_size + size > coinbase_script_limit) {
             return rejected(error_extranonce_too_large);
         }
@@ -548,7 +550,10 @@ opened_channel work_engine::open(open_request const& request) {
     // Fallback restores it without inventing a new channel id.
     slot.solo_prefix = slot.extranonce_prefix;
     slot.announced_prefix = slot.extranonce_prefix;
-    if (pool_.active && assign_pool(slot)) slot.announced_prefix = slot.extranonce_prefix;
+    if (pool_.active) {
+        if (assign_pool(slot)) slot.announced_prefix = slot.extranonce_prefix;
+        else if (pool_allocations_) return rejected(error_too_many_channels);
+    }
     channels_.push_back(std::move(slot));
     auto const& opened_slot = channels_.back();
 
@@ -624,11 +629,20 @@ bool work_engine::assign_pool(channel& slot) {
     // and that roll. BCH has no witness commitment in this script.
     if ( ! pool_.active || slot.extranonce_size > pool_.extranonce_size) return false;
     auto const alloc = size_t{pool_.extranonce_size} - slot.extranonce_size;
-    if (alloc < 4 || pool_.prefix.size() + size_t{pool_.extranonce_size} > 32) return false;
+    if (alloc < jd_allocation_size || pool_.prefix.size() + size_t{pool_.extranonce_size} > 32) return false;
     data_chunk prefix = pool_.prefix;
     prefix.resize(pool_.prefix.size() + alloc, 0);
     auto const at = pool_.prefix.size();
-    if (alloc >= 8) {
+    if (pool_allocations_) {
+        if ( ! slot.pool_allocation) {
+            // Connections share this counter: local channel ids alone collide.
+            // Stop allocating before the four-byte namespace can wrap.
+            if (*pool_allocations_ > std::numeric_limits<uint32_t>::max()) return false;
+            slot.pool_allocation = static_cast<uint32_t>((*pool_allocations_)++);
+        }
+        auto const bytes = to_little_endian(*slot.pool_allocation);
+        std::copy(bytes.begin(), bytes.end(), prefix.begin() + static_cast<std::ptrdiff_t>(at));
+    } else if (alloc >= 8) {
         auto const id = to_little_endian(slot.id);
         auto const roll = to_little_endian(slot.pool_roll);
         std::copy(id.begin(), id.end(), prefix.begin() + static_cast<std::ptrdiff_t>(at));
@@ -653,6 +667,7 @@ void work_engine::clear_pool_binding() {
         slot.extranonce_prefix = slot.solo_prefix;
         slot.pool_bound = false;
         slot.pool_roll = 0;
+        slot.pool_allocation.reset();
         slot.pool_prefix_length = 0;
         slot.pool_extranonce_size = 0;
     }
@@ -665,6 +680,7 @@ std::optional<work_job> work_engine::build(channel& slot,
     }
     slot.shares.clear();
     bool const pooled = pool_.active && assign_pool(slot);
+    if (pool_.active && ! pooled && pool_allocations_) return std::nullopt;
     if (pool_.active && ! pooled) {
         slot.extranonce_prefix = slot.solo_prefix;
         slot.pool_bound = false;
@@ -772,7 +788,7 @@ std::vector<work_job> work_engine::on_template(blockchain::mining_template const
 std::optional<std::vector<work_job>> work_engine::on_pool_template(
     blockchain::mining_template const& tmpl, domain::chain::output::list const& pool_outputs,
     domain::chain::output::list const& solo_outputs, pool_binding const& binding) {
-    if (binding.extranonce_size < 4
+    if (binding.extranonce_size < (pool_allocations_ ? jd_min_extranonce_size : jd_allocation_size)
         || binding.prefix.size() + size_t{binding.extranonce_size} > 32
         || pool_outputs.empty() || ! outputs_pay(pool_outputs, tmpl.coinbase_value)) {
         return std::nullopt;
@@ -809,6 +825,10 @@ void work_engine::bump_pool_roll(uint32_t channel_id) {
     if ( ! pool_.active) return;
     auto* slot = find(channel_id);
     if (slot == nullptr || ! slot->pool_bound) return;
+    if (pool_allocations_) {
+        slot->pool_allocation.reset();
+        return;
+    }
     ++slot->pool_roll;
 }
 

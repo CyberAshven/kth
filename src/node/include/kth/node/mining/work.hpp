@@ -49,6 +49,12 @@ inline constexpr size_t max_remembered_requests = 1024;
 inline constexpr size_t extranonce_prefix_size = 12;
 inline constexpr size_t coinbase_script_limit = 100;
 
+// Four allocation bytes distinguish channels and renewals across connections;
+// four rollable bytes leave miners 2^32 coinbases and fit an eight-byte grant.
+inline constexpr uint16_t jd_allocation_size = 4;
+inline constexpr uint16_t jd_downstream_extranonce_size = 4;
+inline constexpr uint16_t jd_min_extranonce_size = jd_allocation_size + jd_downstream_extranonce_size;
+
 // Share and channel strings this server documents. sv2-spec 3.5 leaves the
 // text to the implementation and requires it to be printable ASCII.
 inline constexpr std::string_view error_invalid_channel_id = "invalid-channel-id";
@@ -237,7 +243,10 @@ class work_engine {
 public:
     // `connection_salt` keeps extranonce prefixes from colliding across
     // connections that would otherwise reuse channel ids.
-    explicit work_engine(uint64_t connection_salt);
+    // A shared allocation counter enables JD's fixed downstream reserve. Its
+    // users must run on the same strand, as the listener's connections do.
+    explicit work_engine(uint64_t connection_salt,
+        std::shared_ptr<uint64_t> pool_allocations = {});
 
     [[nodiscard]] opened_channel open(open_request const& request);
     [[nodiscard]] update_result update(uint32_t channel_id, float nominal_hash_rate,
@@ -251,10 +260,9 @@ public:
     [[nodiscard]] std::vector<work_job> on_template(blockchain::mining_template const& tmpl,
         domain::chain::output::list const& outputs);
 
-    // Pool coinbase for channels that fit in `binding`. A channel whose
-    // rollable extranonce leaves fewer than four alloc bytes keeps solo outputs.
-    // `solo_outputs` pays those channels. Nullopt when the binding or template
-    // cannot be represented.
+    // JD channels all use the pool coinbase or fail together. Without JD's
+    // reserve, channels that cannot fit keep `solo_outputs`. Nullopt when the
+    // binding or template cannot be represented.
     [[nodiscard]] std::optional<std::vector<work_job>> on_pool_template(
         blockchain::mining_template const& tmpl,
         domain::chain::output::list const& pool_outputs,
@@ -319,6 +327,7 @@ private:
         data_chunk announced_prefix;
         bool pool_bound = false;
         uint32_t pool_roll = 0;
+        std::optional<uint32_t> pool_allocation;
         size_t pool_prefix_length = 0;
         uint16_t pool_extranonce_size = 0;
         uint16_t extranonce_size = 0;
@@ -350,6 +359,7 @@ private:
     [[nodiscard]] channel* find(uint32_t channel_id);
 
     uint64_t const salt_;
+    std::shared_ptr<uint64_t> pool_allocations_;
     pool_state pool_;
     uint32_t next_channel_ = 1;
     uint32_t next_job_ = 1;

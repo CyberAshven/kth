@@ -40,6 +40,16 @@ bool nonzero(hash_digest const& target) {
     return std::any_of(target.begin(), target.end(), [](uint8_t byte) { return byte != 0; });
 }
 
+std::string printable_error_code(std::string const& code) {
+    // Upstream text reaches the log. Keep it on one bounded ASCII line.
+    auto text = code.substr(0, 64);
+    for (auto& character : text) {
+        auto const byte = static_cast<unsigned char>(character);
+        if (byte < 0x20 || byte > 0x7e) character = '?';
+    }
+    return text;
+}
+
 } // namespace
 
 jd_session::jd_session(jd_peer peer, std::string host, uint16_t port,
@@ -111,8 +121,9 @@ jd_session::result jd_session::fail(std::string error) {
 jd_session::result jd_session::process_setup(message_header const& header, byte_span payload) {
     if (header.channel_msg()) return fail("invalid upstream setup frame");
     if (header.msg_type == setup_connection_error::message_type) {
-        if ( ! parse<setup_connection_error>(payload)) return fail("malformed upstream setup error");
-        return fail("upstream refused setup");
+        auto const error = parse<setup_connection_error>(payload);
+        if ( ! error) return fail("malformed upstream setup error");
+        return fail("upstream refused setup (" + printable_error_code(error->error_code) + ")");
     }
     if (header.msg_type != setup_connection_success::message_type) {
         return fail("unexpected upstream setup message");
@@ -182,7 +193,7 @@ jd_session::result jd_session::process_channel(message_header const& header, byt
         if ( ! error || error->request_id != channel_request_id) {
             return fail("invalid upstream channel error");
         }
-        return fail("upstream refused extended channel");
+        return fail("upstream refused extended channel (" + printable_error_code(error->error_code) + ")");
     }
     if (header.msg_type != open_extended_mining_channel_success::message_type) {
         return fail("unexpected upstream channel message");

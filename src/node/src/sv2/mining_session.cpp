@@ -63,8 +63,9 @@ void append_frame(data_chunk& bytes, Message const& message) {
 
 } // namespace
 
-mining_session::mining_session(uint64_t connection_salt, domain::chain::script payout)
-    : engine_(connection_salt)
+mining_session::mining_session(uint64_t connection_salt, domain::chain::script payout,
+    std::shared_ptr<uint64_t> pool_allocations)
+    : engine_(connection_salt, std::move(pool_allocations))
     , payout_(std::move(payout))
 {}
 
@@ -195,8 +196,12 @@ mining_session::result mining_session::finish_share(uint8_t message_type, byte_s
         // Renewal changes only a fixed-width generation in the coinbase.
         auto const& current = current_.value();
         auto const job = engine_.on_channel(share.channel_id, current,
-            coinbase_outputs(current.coinbase_value)).value();
-        auto framed = job_frames(job);
+            coinbase_outputs(current.coinbase_value));
+        if ( ! job) {
+            out.close = true;
+            return out;
+        }
+        auto framed = job_frames(*job);
         out.response.insert(out.response.end(), framed.begin(), framed.end());
     }
     return out;

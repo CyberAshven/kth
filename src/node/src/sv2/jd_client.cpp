@@ -208,9 +208,16 @@ jd_client::jd_client(sv2_settings const& settings, ::asio::any_io_executor execu
     using namespace ::asio::experimental::awaitable_operators;
 
     // Subscribe before the first snapshot so a completed transition cannot
-    // leave the declaration loop asleep on an older tip.
-    auto tips = chain_ ? chain_->subscribe_blockchain() : nullptr;
-    auto const end_tips = [&] {
+    // leave the declaration loop asleep on an older tip. The channel's
+    // executor is this strand: a completion, including the close notice, is
+    // posted there. Chain stop closes subscribers and then stops the chain
+    // executor, so a receive posted on that executor never resumes.
+    auto tips = chain_
+        ? chain_->subscribe_blockchain(::asio::any_io_executor(owner_))
+        : nullptr;
+    // The hook is stored on the client, so it has to own the channel.
+    // Invoked only on owner_.
+    auto const end_tips = [tips] {
         if (tips) {
             tips->cancel();
             tips->close();
@@ -218,18 +225,21 @@ jd_client::jd_client(sv2_settings const& settings, ::asio::any_io_executor execu
     };
     detail::scope_action cleanup([&] {
         end_tips();
+        cancel_tips_ = {};
         if (chain_) chain_->unsubscribe_blockchain(tips);
     }, true);
+    cancel_tips_ = end_tips;
     if (chain_ && ! tips) {
         stop();
         co_return;
     }
     auto receive_tips = [&]() -> ::asio::awaitable<void> {
         if ( ! tips) co_return;
-        for (;;) {
+        while ( ! stopped_) {
             auto [error, height, incoming, outgoing] = co_await tips->async_receive(
                 ::asio::as_tuple(::asio::use_awaitable));
-            if (error) {
+            if (stopped_) co_return;
+            if (error || chain_->stopped()) {
                 stop();
                 co_return;
             }
@@ -237,7 +247,7 @@ jd_client::jd_client(sv2_settings const& settings, ::asio::any_io_executor execu
         }
     };
     auto declarations = [&]() -> ::asio::awaitable<void> {
-        // Cancel the pending tip receive before closing and joining it.
+        // Drop the subscription before the join observes this child finishing.
         detail::scope_action finish(end_tips, true);
         co_await declare_templates();
     };
@@ -343,10 +353,12 @@ void jd_client::stop() {
         // before run() can return and destroy the client.
         if (owner_.running_in_this_thread()) {
             wake_declarations();
+            if (cancel_tips_) cancel_tips_();
             if (pool_live_) publish_solo();
         } else {
             ::asio::post(owner_, [this] {
                 wake_declarations();
+                if (cancel_tips_) cancel_tips_();
                 if (pool_live_) publish_solo();
             });
         }

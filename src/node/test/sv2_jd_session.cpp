@@ -4,6 +4,7 @@
 
 #include <test_helpers.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -252,7 +253,7 @@ TEST_CASE("sv2 jd extended channel replies must match and leave bounded extranon
         if (variant == 1) success.target.fill(0);
         if (variant == 2) success.extranonce_size = jd_session::min_extranonce_size - 1;
         if (variant == 3) success.extranonce_size = 33;
-        if (variant == 4) success.extranonce_prefix.resize(9);
+        if (variant == 4) success.extranonce_prefix.resize(33 - success.extranonce_size);
         if (variant == 5) success.group_channel_id = success.channel_id;
         auto session = opening();
         require_closed(session, process(session, success));
@@ -275,6 +276,59 @@ TEST_CASE("sv2 jd extended channel replies must match and leave bounded extranon
     require_silent(process(session, maximum));
 }
 
+TEST_CASE("sv2 jd upstream request fits eight bytes and accepts larger grants", "[sv2 jd]") {
+    auto session = waiting();
+    auto const result = process(session, setup_connection_success{2, 0});
+    auto const request = single<open_extended_mining_channel>(result.response);
+    REQUIRE(request.min_extranonce_size == 8);
+    for (uint16_t size = 8; size <= 32; ++size) {
+        CAPTURE(size);
+        auto opened_session = opening();
+        auto success = opened();
+        success.extranonce_size = size;
+        success.extranonce_prefix = {0xa1, 0xb2, 0xc3, 0xd4};
+        success.extranonce_prefix.resize(std::min<size_t>(4, 32 - size));
+        require_silent(process(opened_session, success));
+        REQUIRE(opened_session.channel()->extranonce_size == size);
+        REQUIRE(opened_session.channel()->extranonce_prefix == success.extranonce_prefix);
+    }
+    auto too_small = opening();
+    auto success = opened();
+    success.extranonce_size = request.min_extranonce_size - 1;
+    auto const refused = process(too_small, success);
+    require_closed(too_small, refused);
+    REQUIRE(refused.error == "invalid upstream extended channel");
+}
+
+TEST_CASE("sv2 jd refusal diagnostics retain bounded printable upstream error codes", "[sv2 jd]") {
+    std::string const controls{'\0', '\t', '\n', '\r', '\x1b', '\x7f'};
+    auto const cases = std::vector<std::pair<std::string, std::string>>{
+        {"min-extranonce-size-too-large", "min-extranonce-size-too-large"},
+        {"unsupported-feature-flags", "unsupported-feature-flags"},
+        {" ~", " ~"}, {"", ""},
+        {controls + "\xc3\xa9", "????????"},
+        {std::string(255, 'x'), std::string(64, 'x')}};
+    for (auto const& [code, printable] : cases) {
+        CAPTURE(code.size());
+        for (auto const peer : {jd_peer::mining, jd_peer::declaration}) {
+            auto setup = waiting(peer);
+            auto const refused = process(setup, setup_connection_error{0, code});
+            require_closed(setup, refused);
+            REQUIRE(refused.error == "upstream refused setup (" + printable + ")");
+            REQUIRE(std::all_of(refused.error.begin(), refused.error.end(), [](unsigned char byte) {
+                return byte >= 0x20 && byte <= 0x7e;
+            }));
+        }
+        auto channel = opening();
+        auto const refused = process(channel, open_mining_channel_error{1, code});
+        require_closed(channel, refused);
+        REQUIRE(refused.error == "upstream refused extended channel (" + printable + ")");
+        REQUIRE(std::all_of(refused.error.begin(), refused.error.end(), [](unsigned char byte) {
+            return byte >= 0x20 && byte <= 0x7e;
+        }));
+    }
+}
+
 TEST_CASE("sv2 jd upstream jobs do not replace selected work and channel updates remain bounded", "[sv2 jd]") {
     auto session = ready();
     auto updated = target();
@@ -289,9 +343,10 @@ TEST_CASE("sv2 jd upstream jobs do not replace selected work and channel updates
     }
     require_silent(process(session, set_extranonce_prefix{9, data_chunk(32, 3)}));
     REQUIRE(session.channel()->extranonce_prefix == data_chunk{1, 2});
-    require_silent(process(session, set_extranonce_prefix{7, data_chunk(8, 3)}));
-    REQUIRE(session.channel()->extranonce_prefix == data_chunk(8, 3));
-    require_closed(session, process(session, set_extranonce_prefix{7, data_chunk(9, 3)}));
+    auto const prefix_size = 32 - jd_session::min_extranonce_size;
+    require_silent(process(session, set_extranonce_prefix{7, data_chunk(prefix_size, 3)}));
+    REQUIRE(session.channel()->extranonce_prefix == data_chunk(prefix_size, 3));
+    require_closed(session, process(session, set_extranonce_prefix{7, data_chunk(prefix_size + 1, 3)}));
 }
 
 TEST_CASE("sv2 jd ready upstream refuses malformed misplaced and unsolicited base messages", "[sv2 jd]") {
