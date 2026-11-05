@@ -380,6 +380,21 @@ Message receive_plain(io_driver& driver, ::asio::ip::tcp::socket& socket) {
     return decode<Message>(bytes);
 }
 
+struct plain_frame {
+    message_header header;
+    data_chunk bytes;
+};
+
+plain_frame read_plain_frame(io_driver& driver, ::asio::ip::tcp::socket& socket) {
+    auto bytes = driver.read(socket, message_header::size);
+    auto const header = from_data_chunk<message_header>(bytes);
+    REQUIRE(header);
+    REQUIRE(header->msg_length <= 65536);
+    auto const payload = driver.read(socket, header->msg_length);
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return {*header, std::move(bytes)};
+}
+
 void solo_job(io_driver& driver, uint16_t port, domain::chain::script const& payout) {
     ::asio::ip::tcp::socket miner(driver.io);
     auto connected = std::make_shared<operation>();
@@ -1910,4 +1925,61 @@ TEST_CASE("sv2 JD coinbase-only does not push a block to the JDS", "[sv2 jd]") {
     REQUIRE(forwarded.nonce == nonce);
     REQUIRE(fixture.jds.frames.empty());
     expect_idle(fixture, fixture.jds.socket);
+}
+
+TEST_CASE("sv2 JD opens a new channel on the live pool coinbase without SetExtranoncePrefix", "[sv2 jd]") {
+    auto chain = started_chain("sv2_jd_open_pool");
+    client_fixture fixture;
+    auto const configuration = settings(fixture.pool, fixture.jds);
+    provider_run provider(fixture, configuration, chain);
+    handshake_upstreams(fixture, true);
+    // Opens while the declaration is still solo. The switch that follows is
+    // the SetExtranoncePrefix path; this case starts a connection afterwards.
+    miner_link early(fixture, provider.port);
+    auto const declared = declare_local_template(fixture, early, true);
+    fixture.pool.send(set_custom_mining_job_success{declared.custom.channel_id,
+        declared.custom.request_id, 77});
+
+    ::asio::ip::tcp::socket late(fixture.io);
+    auto connected = std::make_shared<operation>();
+    late.async_connect({::asio::ip::address_v4::loopback(), provider.port},
+        [connected](std::error_code error) {
+            connected->error = error;
+            connected->done = true;
+        });
+    REQUIRE(fixture.wait_until([&] { return connected->done; }));
+    REQUIRE_FALSE(connected->error);
+    setup_connection setup;
+    setup.protocol = setup_connection::protocol_mining;
+    setup.min_version = 2;
+    setup.max_version = 2;
+    fixture.write(late, frame(setup));
+    REQUIRE(receive_plain<setup_connection_success>(fixture, late).used_version == 2);
+    hash_digest target;
+    target.fill(0xff);
+    fixture.write(late, frame(open_extended_mining_channel{1, "late", 0.f, target,
+        node::mining::jd_downstream_extranonce_size}));
+
+    auto const opened_frame = read_plain_frame(fixture, late);
+    auto const job_frame = read_plain_frame(fixture, late);
+    auto const prev_frame = read_plain_frame(fixture, late);
+    // The whole activation, in order: success, future job, SetNewPrevHash.
+    // A corrected prefix is its own frame and would land before the job.
+    REQUIRE(opened_frame.header.msg_type == open_extended_mining_channel_success::message_type);
+    REQUIRE(job_frame.header.msg_type == new_extended_mining_job::message_type);
+    REQUIRE(prev_frame.header.msg_type == mining_set_new_prev_hash::message_type);
+    auto const opened = decode<open_extended_mining_channel_success>(opened_frame.bytes);
+    REQUIRE(opened.request_id == 1);
+    REQUIRE(opened.extranonce_size == node::mining::jd_downstream_extranonce_size);
+    REQUIRE(opened.extranonce_prefix.size() == 8 + node::mining::jd_allocation_size);
+    REQUIRE(std::equal(opened.extranonce_prefix.begin(), opened.extranonce_prefix.begin() + 8,
+        data_chunk(8, 0x12).begin()));
+    auto const job = decode<new_extended_mining_job>(job_frame.bytes);
+    auto const prev = decode<mining_set_new_prev_hash>(prev_frame.bytes);
+    REQUIRE(job.channel_id == opened.channel_id);
+    REQUIRE_FALSE(job.ntime_start.has_value());
+    REQUIRE(prev.channel_id == opened.channel_id);
+    REQUIRE(prev.job_id == job.job_id);
+    downstream_work const work{opened.extranonce_prefix, opened.extranonce_size, job, prev};
+    REQUIRE(pays(coinbase_from(work), pool_script(), 2));
 }
