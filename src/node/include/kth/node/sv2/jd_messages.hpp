@@ -191,9 +191,9 @@ struct set_custom_mining_job_error {
 // connection immediately after SetupConnection.Success.
 inline constexpr uint16_t extensions_negotiation_type = 0x0001;
 
-// sv2-spec PR #249 assigns Requested Payout Outputs the identifier 0x0004.
-// The BCH P2Pool node serves the experimental identifier 0x5052 until that
-// pull request is merged.
+// Requested Payout Outputs uses the experimental identifier 0x5052, which is
+// not in the SV2 extension registry. sv2-spec PR #249 proposed it as 0x0004
+// and was closed.
 inline constexpr uint16_t requested_payout_outputs_extension = 0x5052;
 
 // Bit 0 of RequestPayoutOutputs.Success.flags. Every other bit must be clear.
