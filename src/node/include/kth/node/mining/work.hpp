@@ -143,6 +143,10 @@ struct pool_proof {
     uint32_t nonce = 0;
     uint32_t bits = 0;
     bool block = false;
+    // declared_work::generation of the coinbase this share was mined on.
+    // A pooled job keeps that generation; it is not the downstream job id.
+    // Flushing a cache under a later declaration would submit the old coinbase.
+    uint32_t generation = 0;
 };
 
 // One coinbase and transaction selection shared by every downstream channel.
@@ -160,6 +164,9 @@ struct declared_work {
     uint16_t upstream_extranonce_size = 0;
     uint32_t upstream_channel_id = 0;
     uint32_t upstream_job_id = 0;
+    // SetCustomMiningJob.Success may assign any job id, including zero.
+    // Zero is not "not yet accepted".
+    bool upstream_accepted = false;
     hash_digest upstream_target{};
 };
 
@@ -274,6 +281,9 @@ private:
         bool pool = false;
         size_t pool_prefix_length = 0;
         uint16_t pool_extranonce_size = 0;
+        // Coinbase generation this job was built with. For a pool job that is
+        // declared_work::generation, not `id`.
+        uint32_t generation = 0;
         std::shared_ptr<std::vector<transaction_const_ptr> const> txs;
     };
 

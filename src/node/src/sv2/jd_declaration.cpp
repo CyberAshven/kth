@@ -82,6 +82,10 @@ bool jd_declaration::can_push_solution() const {
     return full_template_ && (state_ == state::installing || state_ == state::accepted);
 }
 
+bool jd_declaration::full_template() const {
+    return full_template_;
+}
+
 void jd_declaration::supersede() {
     if ( ! pending()) return;
     state_ = state::idle;
@@ -144,6 +148,8 @@ jd_declaration::result jd_declaration::start(blockchain::mining_template value,
     template_ = std::move(value);
     has_template_ = true;
     superseded_ = false;
+    // The replacement is a new declaration. It stays unaccepted until
+    // SetCustomMiningJob.Success, whose job id may be zero.
     work_.reset();
     state_ = state::allocating;
     result out;
@@ -197,6 +203,9 @@ jd_declaration::result jd_declaration::process(jd_peer peer,
         if ( ! work_) return fail("declared coinbase or template exceeds mining limits");
         work_->upstream_channel_id = channel_.channel_id;
         work_->upstream_target = channel_.target;
+        // This coinbase is not accepted yet. Success is the only place that
+        // records the pool job id, and that id may be zero.
+        work_->upstream_accepted = false;
         if ( ! full_template_) return install(allocation->mining_job_token);
 
         declare_mining_job message;
@@ -265,6 +274,7 @@ jd_declaration::result jd_declaration::process(jd_peer peer,
                 return fail("invalid custom job success");
             }
             work_->upstream_job_id = message->job_id;
+            work_->upstream_accepted = true;
             state_ = state::accepted;
             transactions_.clear();
             result out;
