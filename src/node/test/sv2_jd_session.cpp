@@ -105,7 +105,7 @@ void require_silent(jd_session::result const& result, bool is_ready = true) {
 
 // SetupConnection.Success on the declaration peer asks for Requested Payout
 // Outputs before any Job Declaration message. `grant` lists that extension.
-void finish_extensions(jd_session& session, bool grant) {
+void finish_extensions(jd_session& session, bool grant, bool full_template = true) {
     auto const asked = process(session, setup_connection_success{2, 0});
     REQUIRE_FALSE(asked.close);
     REQUIRE_FALSE(asked.ready);
@@ -113,7 +113,10 @@ void finish_extensions(jd_session& session, bool grant) {
     REQUIRE_FALSE(session.payout_outputs());
     auto const request = single<request_extensions>(asked.response);
     REQUIRE(request.request_id == 1);
-    REQUIRE(request.requested_extensions == std::vector<uint16_t>{requested_payout_outputs_extension});
+    // Full-template also asks for BCH large templates; coinbase-only has no list to page.
+    REQUIRE(request.requested_extensions == (full_template
+        ? std::vector<uint16_t>{requested_payout_outputs_extension, large_templates_extension}
+        : std::vector<uint16_t>{requested_payout_outputs_extension}));
     if (grant) {
         require_silent(process(session, request_extensions_success{1,
             {requested_payout_outputs_extension}}));
@@ -170,7 +173,7 @@ TEST_CASE("sv2 jd setup selects the requested mode and opens one extended upstre
         REQUIRE(setup.endpoint_host == "jds.example");
         REQUIRE(setup.endpoint_port == 8443);
         REQUIRE(setup.vendor == "Knuth");
-        finish_extensions(session, false);
+        finish_extensions(session, false, full_template);
     }
     for (uint32_t const flags : {0u, mining_flag_requires_extended_channels}) {
         CAPTURE(flags);

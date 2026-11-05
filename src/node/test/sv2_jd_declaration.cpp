@@ -21,6 +21,7 @@
 #include <kth/infrastructure/machine/number.hpp>
 #include <kth/node/sv2/connection.hpp>
 #include <kth/node/sv2/jd_declaration.hpp>
+#include <kth/node/sv2/primitives.hpp>
 
 using namespace kth;
 using namespace kth::node::sv2;
@@ -1251,6 +1252,8 @@ TEST_CASE("sv2 JD splits a reply above one frame under BCH large templates", "[s
     auto const first = process(state, jd_peer::declaration,
         provide_missing_transactions_positions{1, everything});
     REQUIRE(first.error.empty());
+    // A prefix renews the declaration deadline: the JDS has to ask again.
+    REQUIRE(first.progress);
     auto const prefix = decode<provide_missing_transactions_success>(first.declaration);
     REQUIRE(prefix.serialized_size() <= jd_frame_max_payload);
     REQUIRE_FALSE(prefix.transaction_list.empty());
@@ -1262,6 +1265,7 @@ TEST_CASE("sv2 JD splits a reply above one frame under BCH large templates", "[s
     std::vector<uint32_t> const rest(everything.begin() + prefix.transaction_list.size(), everything.end());
     auto const second = process(state, jd_peer::declaration, provide_missing_transactions_positions{1, rest});
     REQUIRE(second.error.empty());
+    REQUIRE_FALSE(second.progress);
     auto const remainder = decode<provide_missing_transactions_success>(second.declaration);
     REQUIRE(prefix.transaction_list.size() + remainder.transaction_list.size() == count);
     REQUIRE(remainder.transaction_list.back() == transaction_bytes(tmpl.selection.txs.back()));

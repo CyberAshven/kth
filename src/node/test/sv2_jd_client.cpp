@@ -691,10 +691,16 @@ struct submission_pipeline {
     }
 };
 
-void answer_extensions(client_fixture& fixture, bool grant) {
+// Full-template also asks for BCH large templates; coinbase-only has no list to page.
+std::vector<uint16_t> requested_extensions(bool full_template) {
+    if (full_template) return {requested_payout_outputs_extension, large_templates_extension};
+    return {requested_payout_outputs_extension};
+}
+
+void answer_extensions(client_fixture& fixture, bool grant, bool full_template = true) {
     auto const request = fixture.jds.receive<request_extensions>();
     REQUIRE(request.request_id == 1);
-    REQUIRE(request.requested_extensions == std::vector<uint16_t>{requested_payout_outputs_extension});
+    REQUIRE(request.requested_extensions == requested_extensions(full_template));
     if (grant) {
         fixture.jds.send(request_extensions_success{request.request_id,
             {requested_payout_outputs_extension}});
@@ -712,7 +718,7 @@ void handshake_upstreams(client_fixture& fixture, bool full, hash_digest const* 
     REQUIRE(declaration.protocol == setup_connection::protocol_job_declaration);
     REQUIRE(declaration.flags == (full ? 1u : 0u));
     fixture.jds.send(setup_connection_success{2, 0});
-    answer_extensions(fixture, grant);
+    answer_extensions(fixture, grant, full);
     auto const request = fixture.open();
     if (target == nullptr) {
         fixture.accept(request);
@@ -1029,7 +1035,7 @@ TEST_CASE("sv2 JD client negotiates both modes and consumes either upstream disc
             REQUIRE(declaration.flags == (full_template ? 1u : 0u));
             REQUIRE(declaration.endpoint_port == fixture.jds.port);
             fixture.jds.send(setup_connection_success{2, 0});
-            answer_extensions(fixture, false);
+            answer_extensions(fixture, false, full_template);
             auto const request = fixture.open();
             fixture.accept(request);
             fixture.await(fixture.ready);
@@ -1160,7 +1166,7 @@ TEST_CASE("sv2 JD silent setup or channel closes both upstreams while solo jobs 
         // The extension request is not a setup answer. Leave it unanswered so
         // the setup or channel deadline is what closes the pair.
         auto const extensions = fixture.jds.receive<request_extensions>();
-        REQUIRE(extensions.requested_extensions == std::vector<uint16_t>{requested_payout_outputs_extension});
+        REQUIRE(extensions.requested_extensions == requested_extensions(true));
     }
     if (stage != silence::pool_setup) {
         auto const request = fixture.open();
@@ -1661,7 +1667,7 @@ TEST_CASE("sv2 JD extension silence stays connected and then asks for a base tok
     fixture.jds.send(setup_connection_success{2, 0});
     auto const extensions = fixture.jds.receive<request_extensions>();
     REQUIRE(extensions.request_id == 1);
-    REQUIRE(extensions.requested_extensions == std::vector<uint16_t>{requested_payout_outputs_extension});
+    REQUIRE(extensions.requested_extensions == requested_extensions(true));
     auto const began = std::chrono::steady_clock::now();
     auto const channel = fixture.open();
     fixture.accept(channel);

@@ -485,6 +485,7 @@ jd_declaration::result jd_declaration::supply(std::vector<uint32_t> const& posit
     // U24 frame: the request id, the SEQ0_64K count, and a B0_16M length
     // before each transaction.
     size_t size = 4 + 2;
+    bool partial = false;
     for (auto const index : positions) {
         if (index >= transactions_.size() || supplied[index]) {
             return fail("invalid missing transaction position");
@@ -495,7 +496,10 @@ jd_declaration::result jd_declaration::supply(std::vector<uint32_t> const& posit
             // With 0x4C54 the reply carries the longest prefix that fits and
             // the JDS asks again for the rest. A BCH transaction is at most
             // 1,000,000 bytes, so the prefix is never empty for a valid block.
-            if (large_templates_ && ! response.transaction_list.empty()) break;
+            if (large_templates_ && ! response.transaction_list.empty()) {
+                partial = true;
+                break;
+            }
             return fail("ProvideMissingTransactions.Success exceeds the SV2 frame maximum");
         }
         size += 3 + transaction.size();
@@ -503,7 +507,10 @@ jd_declaration::result jd_declaration::supply(std::vector<uint32_t> const& posit
     }
     result out;
     out.declaration = frame(response);
-    // Supplying data does not renew the declaration's response deadline.
+    // A complete reply does not renew the declaration's response deadline.
+    // A prefix does: the JDS has to ask again, and every round of a large
+    // template would otherwise share one deadline.
+    out.progress = partial;
     return out;
 }
 
