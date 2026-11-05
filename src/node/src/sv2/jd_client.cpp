@@ -226,6 +226,10 @@ jd_client::jd_client(sv2_settings const& settings, ::asio::any_io_executor execu
                     (void)ready_.try_send(std::error_code{}, 1);
                     spdlog::info("[sv2 jd] Both upstreams ready; starting local declarations");
                 }
+                // Readiness or the switch to the base coinbase is new work for
+                // the declaration loop. Without a wake it sleeps until the
+                // next chain tip, though nothing else will wake it before then.
+                wake_declarations();
                 continue;
             }
             timed_out = true;
