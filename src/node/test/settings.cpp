@@ -40,7 +40,7 @@ TEST_CASE("sv2 Job Declaration defaults to disabled without upstreams or a mode"
     CHECK(configuration.jd.jds_address.empty());
     CHECK(configuration.jd.jds_authority_public_key.empty());
     CHECK(configuration.jd.user_identity.empty());
-    CHECK(configuration.jd.mode.empty());
+    CHECK(configuration.jd.mode == "coinbase-only");
     CHECK(configuration.jd.upstreams.empty());
     CHECK(configuration.jd.response_timeout_seconds == 10u);
     CHECK(configuration.jd.retry_initial_seconds == 5u);

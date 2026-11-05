@@ -2817,3 +2817,54 @@ TEST_CASE("sv2 JD opens a new channel on the live pool coinbase without SetExtra
     downstream_work const work{opened.extranonce_prefix, opened.extranonce_size, job, prev};
     REQUIRE(pays(coinbase_from(work), pool_script(), 2));
 }
+
+TEST_CASE("sv2 JD installs a pool publication once while a template fetch is in flight", "[sv2 jd]") {
+    // Coinbase-only publishes on the allocate token, which is the notice a
+    // downstream fetch can observe. One channel gets that coinbase once.
+    // Opening another channel on the same connection must not install it again:
+    // a second apply would emit another job id for the first channel.
+    auto chain = started_chain("sv2_jd_publish_once");
+    client_fixture fixture;
+    auto configuration = settings(fixture.pool, fixture.jds);
+    configuration.jd.mode = "coinbase-only";
+    provider_run provider(fixture, configuration, chain);
+    handshake_upstreams(fixture, false);
+    miner_link miner(fixture, provider.port);
+    auto const declared = declare_local_template(fixture, miner, false);
+    REQUIRE(pays(coinbase_from(declared.pooled), pool_script(), 2));
+    std::error_code error;
+    fixture.io.restart();
+    fixture.io.poll();
+    REQUIRE(miner.socket.available(error) == 0);
+    REQUIRE_FALSE(error);
+
+    hash_digest target;
+    target.fill(0xff);
+    fixture.write(miner.socket, frame(open_extended_mining_channel{2, "other", 0.f, target,
+        node::mining::jd_downstream_extranonce_size}));
+    auto const opened = receive_plain<open_extended_mining_channel_success>(fixture, miner.socket);
+    REQUIRE(opened.request_id == 2);
+    REQUIRE(opened.channel_id != miner.opened.channel_id);
+    REQUIRE(opened.extranonce_prefix.size() == declared.pooled.prefix.size());
+    REQUIRE(opened.extranonce_prefix != declared.pooled.prefix);
+    REQUIRE(std::equal(opened.extranonce_prefix.begin(), opened.extranonce_prefix.begin() + 8,
+        data_chunk(8, 0x12).begin()));
+    auto const job_frame = read_plain_frame(fixture, miner.socket);
+    auto const prev_frame = read_plain_frame(fixture, miner.socket);
+    REQUIRE(job_frame.header.msg_type == new_extended_mining_job::message_type);
+    REQUIRE(prev_frame.header.msg_type == mining_set_new_prev_hash::message_type);
+    auto const job = decode<new_extended_mining_job>(job_frame.bytes);
+    auto const prev = decode<mining_set_new_prev_hash>(prev_frame.bytes);
+    REQUIRE(job.channel_id == opened.channel_id);
+    REQUIRE(prev.channel_id == opened.channel_id);
+    REQUIRE(prev.job_id == job.job_id);
+    REQUIRE(job.job_id != declared.pooled.job.job_id);
+    REQUIRE(job.coinbase_tx_prefix == declared.pooled.job.coinbase_tx_prefix);
+    REQUIRE(job.coinbase_tx_suffix == declared.pooled.job.coinbase_tx_suffix);
+    downstream_work const second{opened.extranonce_prefix, opened.extranonce_size, job, prev};
+    REQUIRE(pays(coinbase_from(second), pool_script(), 2));
+    fixture.io.restart();
+    fixture.io.poll();
+    REQUIRE(miner.socket.available(error) == 0);
+    REQUIRE_FALSE(error);
+}

@@ -165,7 +165,8 @@ bool validate_jd_settings(sv2_settings const& settings, std::string& error) {
     if ( ! jd.upstreams.empty()) {
         if ( ! jd.mining_address.empty() || ! jd.mining_authority_public_key.empty()
             || ! jd.jds_address.empty() || ! jd.jds_authority_public_key.empty()
-            || ! jd.user_identity.empty() || ! jd.mode.empty()) {
+            || ! jd.user_identity.empty()
+            || ( ! jd.mode.empty() && jd.mode != sv2_settings::jd_settings{}.mode)) {
             error = "sv2.jd.upstream cannot be combined with legacy single-pool settings";
             return false;
         }

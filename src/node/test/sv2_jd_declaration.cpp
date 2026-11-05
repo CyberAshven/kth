@@ -112,6 +112,7 @@ blockchain::mining_template mining_template() {
     value.min_time = 100;
     value.current_time = 101;
     value.coinbase_value = 5000000042;
+    // ABLA's floor. The real limit is adaptive and comes with each template.
     value.size_limit = 32000000;
     value.sigchecks_limit = 640000;
     for (uint32_t id = 1; id <= 3; ++id) {
@@ -192,6 +193,21 @@ void refuse_incomplete(Message const& message, jd_peer peer, Factory factory) {
     auto trailing = bytes;
     trailing.push_back(0);
     require_failure(state, process(state, peer, extension<Message>(), Message::message_type, trailing));
+}
+
+// One non-coinbase transaction whose script is `script_size` raw bytes.
+// The declaration's hash list stays one id; the missing-transaction reply
+// carries the script.
+blockchain::mining_template template_with_script(size_t script_size) {
+    auto value = mining_template();
+    auto paid = outputs();
+    paid.resize(1);
+    paid.front().set_value(1);
+    paid.front().set_script(domain::chain::script(data_chunk(script_size, 0x51), false));
+    value.selection.txs = {std::make_shared<domain::message::transaction>(
+        domain::chain::transaction{1, 1, {}, std::move(paid)})};
+    value.selection.total_size = transaction_bytes(value.selection.txs.front()).size();
+    return value;
 }
 
 } // namespace
@@ -387,14 +403,15 @@ TEST_CASE("sv2 JD bounds local input and refuses replacing an outstanding declar
         auto tmpl = mining_template();
         if (variant == 0) tmpl.selection.txs.front().reset();
         if (variant == 1) tmpl.selection.txs.resize(65536, tmpl.selection.txs.front());
-        if (variant == 2) {
-            auto paid = outputs();
-            paid.front().set_script(domain::chain::script(data_chunk(jd_message_max_payload, 0x51), false));
-            tmpl.selection.txs = {std::make_shared<domain::message::transaction>(
-                domain::chain::transaction{1, 0, {}, std::move(paid)})};
-        }
+        // The kept transactions are bounded by the template's own consensus
+        // size limit (ABLA), so a template whose transactions exceed it fails.
+        if (variant == 2) tmpl.size_limit = 1;
         jd_declaration state("worker", true);
-        require_failure(state, state.start(std::move(tmpl), channel()));
+        auto const result = state.start(std::move(tmpl), channel());
+        require_failure(state, result);
+        if (variant == 2) {
+            REQUIRE(result.error.find("consensus block size limit") != std::string::npos);
+        }
     }
     auto pending = allocating();
     require_failure(pending, pending.start(mining_template(), channel()));
@@ -411,15 +428,21 @@ TEST_CASE("sv2 JD bounds local input and refuses replacing an outstanding declar
         }
         return tmpl;
     };
+    // 32768 ids are past the old 1 MiB payload cap and under the U24 frame
+    // maximum. The raw transactions stay inside the retention bound, so the
+    // declaration is sent.
     jd_declaration full("worker", true);
     auto const full_start = full.start(large(), channel());
-    // The raw transaction list can already exceed the local frame limit. The
-    // declaration's hash-list check catches it otherwise, before serialization.
-    if (full_start.error.empty()) {
-        require_failure(full, process(full, jd_peer::declaration, allocation()));
-    } else {
-        require_failure(full, full_start);
-    }
+    REQUIRE(full_start.error.empty());
+    REQUIRE(full_start.progress);
+    auto const declared = process(full, jd_peer::declaration, allocation());
+    REQUIRE(declared.error.empty());
+    REQUIRE(declared.progress);
+    auto const job = decode<declare_mining_job>(declared.declaration);
+    REQUIRE(job.request_id == 1);
+    REQUIRE(job.wtxid_list.size() == 32768);
+    REQUIRE(job.serialized_size() > jd_message_max_payload);
+    REQUIRE(job.serialized_size() <= jd_frame_max_payload);
     jd_declaration coinbase_only("worker", false);
     REQUIRE(coinbase_only.start(large(), channel()).error.empty());
     auto const installed = process(coinbase_only, jd_peer::declaration, allocation());
@@ -598,4 +621,170 @@ TEST_CASE("sv2 JD superseded declaration ignores a late reply and PushSolution f
     REQUIRE(refused.template_value().previous_block_hash == mining_template().previous_block_hash);
     REQUIRE_FALSE(refused.work());
     REQUIRE_FALSE(refused.can_push_solution());
+}
+
+TEST_CASE("sv2 JD ignores a superseded reply after the next declaration starts", "[sv2 jd]") {
+    auto state = allocating();
+    state.supersede();
+    auto const restarted = state.start(mining_template(), channel());
+    REQUIRE(restarted.error.empty());
+    REQUIRE(decode<allocate_mining_job_token>(restarted.declaration).request_id == 2);
+    REQUIRE(state.pending());
+    REQUIRE_FALSE(state.work());
+
+    auto const late_token = process(state, jd_peer::declaration, allocation(1));
+    REQUIRE(late_token.error.empty());
+    REQUIRE(late_token.declaration.empty());
+    REQUIRE(late_token.mining.empty());
+    REQUIRE_FALSE(late_token.progress);
+    REQUIRE_FALSE(late_token.accepted);
+    REQUIRE(state.pending());
+    REQUIRE_FALSE(state.work());
+
+    auto const current_token = process(state, jd_peer::declaration, allocation(2));
+    REQUIRE(current_token.error.empty());
+    REQUIRE(current_token.progress);
+    REQUIRE(decode<declare_mining_job>(current_token.declaration).request_id == 2);
+    REQUIRE(state.pending());
+    REQUIRE(state.work());
+    REQUIRE_FALSE(state.work()->upstream_accepted);
+    auto const generation = state.work()->generation;
+
+    // The old token can also arrive once this declaration is already declaring.
+    auto const late_token_again = process(state, jd_peer::declaration, allocation(1));
+    REQUIRE(late_token_again.error.empty());
+    REQUIRE(late_token_again.declaration.empty());
+    REQUIRE(late_token_again.mining.empty());
+    REQUIRE_FALSE(late_token_again.progress);
+    REQUIRE(state.pending());
+    REQUIRE(state.work()->generation == generation);
+    REQUIRE_FALSE(state.can_push_solution());
+
+    auto const late_declare = process(state, jd_peer::declaration,
+        declare_mining_job_success{1, {9, 8}});
+    REQUIRE(late_declare.error.empty());
+    REQUIRE(late_declare.declaration.empty());
+    REQUIRE(late_declare.mining.empty());
+    REQUIRE_FALSE(late_declare.progress);
+    REQUIRE(state.pending());
+    REQUIRE_FALSE(state.can_push_solution());
+    REQUIRE(state.work()->generation == generation);
+
+    auto const late_error = process(state, jd_peer::declaration,
+        declare_mining_job_error{1, "stale", {}});
+    REQUIRE(late_error.error.empty());
+    REQUIRE(late_error.declaration.empty());
+    REQUIRE(state.pending());
+    REQUIRE(state.work()->generation == generation);
+
+    auto const late_missing = process(state, jd_peer::declaration,
+        provide_missing_transactions{1, {0}});
+    REQUIRE(late_missing.error.empty());
+    REQUIRE(late_missing.declaration.empty());
+    REQUIRE(late_missing.mining.empty());
+    REQUIRE_FALSE(late_missing.progress);
+    REQUIRE(state.pending());
+    REQUIRE(state.work()->generation == generation);
+
+    auto const late_custom = process(state, jd_peer::mining,
+        set_custom_mining_job_success{7, 1, 123});
+    REQUIRE(late_custom.error.empty());
+    REQUIRE_FALSE(late_custom.accepted);
+    REQUIRE(late_custom.mining.empty());
+    REQUIRE(state.pending());
+    REQUIRE_FALSE(state.work()->upstream_accepted);
+
+    auto const installed = process(state, jd_peer::declaration,
+        declare_mining_job_success{2, {9, 8}});
+    REQUIRE(installed.error.empty());
+    REQUIRE(installed.progress);
+    REQUIRE_FALSE(installed.mining.empty());
+    REQUIRE(state.can_push_solution());
+    REQUIRE(state.work()->generation == generation);
+    REQUIRE_FALSE(state.work()->upstream_accepted);
+}
+
+TEST_CASE("sv2 JD still rejects a request id that is neither current nor retired", "[sv2 jd]") {
+    auto allocating_state = allocating();
+    allocating_state.supersede();
+    REQUIRE(allocating_state.start(mining_template(), channel()).error.empty());
+    require_failure(allocating_state, process(allocating_state, jd_peer::declaration, allocation(99)));
+
+    auto declaring_state = declaring();
+    declaring_state.supersede();
+    REQUIRE(declaring_state.start(mining_template(), channel()).error.empty());
+    REQUIRE(process(declaring_state, jd_peer::declaration, allocation(2)).error.empty());
+    require_failure(declaring_state, process(declaring_state, jd_peer::declaration,
+        declare_mining_job_success{99, {9}}));
+}
+
+TEST_CASE("sv2 JD full-template sends a missing-transaction response above 1 MiB and under the frame maximum", "[sv2 jd]") {
+    auto tmpl = template_with_script(jd_message_max_payload);
+    auto const raw = transaction_bytes(tmpl.selection.txs.front());
+    constexpr size_t response_overhead = 4 + 2 + 3;
+    REQUIRE(raw.size() > jd_message_max_payload);
+    REQUIRE(response_overhead + raw.size() > jd_message_max_payload);
+    REQUIRE(response_overhead + raw.size() <= jd_frame_max_payload);
+    REQUIRE(raw.size() <= tmpl.size_limit);
+
+    jd_declaration state("worker", true);
+    auto const started = state.start(std::move(tmpl), channel());
+    REQUIRE(started.error.empty());
+    REQUIRE(started.progress);
+    auto const declared = process(state, jd_peer::declaration, allocation());
+    REQUIRE(declared.error.empty());
+    REQUIRE(declared.progress);
+    auto const job = decode<declare_mining_job>(declared.declaration);
+    REQUIRE(job.request_id == 1);
+    REQUIRE(job.wtxid_list.size() == 1);
+    REQUIRE(job.serialized_size() <= jd_frame_max_payload);
+
+    auto const missing = process(state, jd_peer::declaration, provide_missing_transactions{1, {0}});
+    REQUIRE(missing.error.empty());
+    REQUIRE(missing.mining.empty());
+    REQUIRE_FALSE(missing.progress);
+    REQUIRE(state.pending());
+    REQUIRE(state.work());
+    REQUIRE(missing.declaration.size() > message_header::size + jd_message_max_payload);
+    auto const response = decode<provide_missing_transactions_success>(missing.declaration);
+    REQUIRE(response.request_id == 1);
+    REQUIRE(response.serialized_size() > jd_message_max_payload);
+    REQUIRE(response.serialized_size() <= jd_frame_max_payload);
+    REQUIRE(response.transaction_list == std::vector<data_chunk>{raw});
+
+    auto const installed = process(state, jd_peer::declaration, declare_mining_job_success{1, {9}});
+    REQUIRE(installed.error.empty());
+    REQUIRE(installed.progress);
+    REQUIRE(state.can_push_solution());
+}
+
+TEST_CASE("sv2 JD full-template declines a list above SEQ0_64K and a reply above the frame maximum", "[sv2 jd]") {
+    auto too_many = mining_template();
+    too_many.selection.txs.resize(65536, too_many.selection.txs.front());
+    jd_declaration counted("worker", true);
+    auto const counted_result = counted.start(std::move(too_many), channel());
+    require_failure(counted, counted_result);
+    REQUIRE(counted_result.error.find("SEQ0_64K limit of 65535") != std::string::npos);
+
+    // Payload is the request id, the count, a B0_16M length, and the
+    // transaction (9 bytes plus the transaction). A script of (U24 max - 8)
+    // already makes that payload exceed one frame. The template still fits
+    // its own consensus size limit, so the refusal happens when the reply is
+    // built: the U24 frame is the protocol's ceiling, which ABLA can outgrow.
+    auto tmpl = template_with_script(jd_frame_max_payload - 8);
+    auto const raw = transaction_bytes(tmpl.selection.txs.front());
+    constexpr size_t response_overhead = 4 + 2 + 3;
+    REQUIRE(response_overhead + raw.size() > jd_frame_max_payload);
+    REQUIRE(raw.size() <= tmpl.size_limit);
+
+    jd_declaration state("worker", true);
+    REQUIRE(state.start(std::move(tmpl), channel()).error.empty());
+    auto const declared = process(state, jd_peer::declaration, allocation());
+    REQUIRE(declared.error.empty());
+    REQUIRE(declared.progress);
+    auto const missing = process(state, jd_peer::declaration, provide_missing_transactions{1, {0}});
+    require_failure(state, missing);
+    REQUIRE(missing.error.find("ProvideMissingTransactions.Success exceeds the SV2 frame maximum")
+        != std::string::npos);
+    REQUIRE(state.has_template());
 }

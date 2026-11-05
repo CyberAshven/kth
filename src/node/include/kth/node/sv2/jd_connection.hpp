@@ -20,6 +20,7 @@
 
 #include <kth/infrastructure/hash_define.hpp>
 #include <kth/infrastructure/utility/data.hpp>
+#include <kth/node/sv2/framing.hpp>
 
 namespace kth::node::sv2 {
 
@@ -27,7 +28,11 @@ namespace kth::node::sv2 {
 // complete plaintext frames and consumes them on this connection's strand.
 // It must join run() before destroying the connection or its handlers.
 struct jd_connection {
+    // Received frames are small JD replies and setup messages.
     static constexpr uint32_t max_payload_size = 1024 * 1024;
+    // Sent frames may fill the whole SV2 frame: ProvideMissingTransactions.Success
+    // carries raw transactions, and a frame's msg_length is a U24 (sv2-spec 3.2).
+    static constexpr uint32_t max_send_payload_size = u24_max;
     static constexpr size_t max_queued_frames = 8;
 
     jd_connection(::asio::any_io_executor executor, std::string host,

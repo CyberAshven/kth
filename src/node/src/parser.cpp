@@ -338,7 +338,7 @@ void add_settings(CLI::App& app, configuration& cfg) {
     app.add_option("--sv2.jd.user_identity", cfg.sv2.jd.user_identity,
         "Pool account identity (1 to 255 UTF-8 bytes).");
     app.add_option("--sv2.jd.mode", cfg.sv2.jd.mode,
-        "Job Declaration mode: full-template or coinbase-only (required when enabled).");
+        "Job Declaration mode: coinbase-only or full-template (default coinbase-only).");
     app.add_option("--sv2.jd.response_timeout_seconds", cfg.sv2.jd.response_timeout_seconds,
         "Upstream response deadline in seconds, from 1 to 600 (default 10).");
     app.add_option("--sv2.jd.upstream", cfg.sv2.jd.upstreams,

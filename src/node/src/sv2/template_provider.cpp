@@ -475,10 +475,11 @@ template_provider::template_provider(sv2_settings const& settings,
         out.solution = std::move(produced.solution);
         return out;
     };
-    // Pool-notice generation already bound into this session. open() reads
-    // that binding when it builds a prefix, so a live pool coinbase is
-    // applied before the open, and a later message does not apply it again.
-    uint64_t bound_pool_generation = 0;
+    // Last publication generation applied on this connection. A second apply
+    // of that notice, pool or solo, assigns new job ids and clears share
+    // history while its template is still installed. A cleared template still
+    // takes the notice. The open path records the generation it binds.
+    uint64_t applied_generation = 0;
     auto refresh_mining = [&]() -> ::asio::awaitable<template_provider_session::result> {
         if ( ! miner->ready()) co_return template_provider_session::result{};
         // A pool or fallback notice for this tip replaces the coinbase without
@@ -487,17 +488,14 @@ template_provider::template_provider(sv2_settings const& settings,
         if (upstream) {
             auto const notice = upstream->notice();
             auto const view = chain_.chain_view();
-            // The open path binds this generation while that template is still
-            // installed. Applying it again would replace every channel's job.
-            // A cleared template still takes the notice.
-            bool const installed = notice && notice->pool
-                && notice->generation == bound_pool_generation
+            bool const installed = notice
+                && notice->generation == applied_generation
                 && ! miner->needs_template();
             if (notice && notice->generation > 0 && view && notice->previous == view->tip_hash
                 && ! installed) {
                 auto produced = notice->pool ? miner->apply_pool(notice->pooled)
                                               : miner->apply(notice->solo);
-                if (notice->pool && ! produced.close) bound_pool_generation = notice->generation;
+                if ( ! produced.close) applied_generation = notice->generation;
                 co_return adopt(std::move(produced));
             }
         }
@@ -520,7 +518,7 @@ template_provider::template_provider(sv2_settings const& settings,
                 && notice->previous == value->previous_block_hash) {
                 auto produced = notice->pool ? miner->apply_pool(notice->pooled)
                                               : miner->apply(notice->solo);
-                if (notice->pool && ! produced.close) bound_pool_generation = notice->generation;
+                if ( ! produced.close) applied_generation = notice->generation;
                 co_return adopt(std::move(produced));
             }
         }
@@ -569,10 +567,10 @@ template_provider::template_provider(sv2_settings const& settings,
                     if (opening && miner->ready() && upstream) {
                         auto const notice = upstream->notice();
                         if (notice && notice->generation > 0 && notice->pool
-                            && notice->generation != bound_pool_generation
+                            && notice->generation != applied_generation
                             && view && notice->previous == view->tip_hash) {
                             auto bound = miner->apply_pool(notice->pooled);
-                            if ( ! bound.close) bound_pool_generation = notice->generation;
+                            if ( ! bound.close) applied_generation = notice->generation;
                             result.response = std::move(bound.response);
                             result.close = bound.close;
                             if (bound.solution) result.solution = std::move(bound.solution);

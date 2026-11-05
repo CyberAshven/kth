@@ -158,6 +158,17 @@ bool jd_session::matches_channel(uint32_t id) const {
 }
 
 jd_session::result jd_session::process_mining(message_header const& header, byte_span payload) {
+    // SetGroupChannel (type 0x25) has the channel bit clear. The check below
+    // would close a regrouping of this extended channel (sv2-spec 5.3.22).
+    if ( ! header.channel_msg() && header.msg_type == set_group_channel::message_type) {
+        auto const message = parse<set_group_channel>(payload);
+        if ( ! message) return fail("invalid upstream group channel");
+        if (std::find(message->channel_ids.begin(), message->channel_ids.end(),
+                channel_->channel_id) != message->channel_ids.end()) {
+            channel_->group_channel_id = message->group_channel_id;
+        }
+        return {{}, false, true, {}};
+    }
     if ( ! header.channel_msg()) return fail("invalid upstream mining frame");
     switch (header.msg_type) {
         case set_target::message_type: {

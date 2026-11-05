@@ -453,8 +453,12 @@ TEST_CASE("sv2 JD upstream refuses malformed output and bounded queue overflow",
             bytes.push_back(0);
             CHECK_FALSE(fixture.client->send(std::move(bytes)));
         } else if (invalid == 2) {
+            // Outgoing frames may exceed the 1 MiB receive cap, up to the U24 frame.
+            auto large = to_data_chunk(message_header{0, 1, jd_connection::max_payload_size + 1});
+            large.resize(message_header::size + jd_connection::max_payload_size + 1);
+            CHECK(fixture.client->send(std::move(large)));
             CHECK_FALSE(fixture.client->send(data_chunk(message_header::size
-                + jd_connection::max_payload_size + 1)));
+                + jd_connection::max_send_payload_size + 1)));
         } else {
             for (size_t i = 0; i < jd_connection::max_queued_frames; ++i) {
                 CHECK(fixture.client->send(frame(setup())));

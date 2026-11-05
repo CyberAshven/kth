@@ -211,7 +211,10 @@ and Stratum V1 are separate features.
 Job Declaration is off by default (`sv2.jd.enabled=false`). Enabling it requires
 the listener, Mining Protocol and its valid solo payout address, and at least
 one configured upstream. Each upstream has Mining and JDS addresses, pinned
-Noise authority keys, a user identity and an explicit mode. Invalid enabled
+Noise authority keys, a user identity and a mode. The single-pool
+`sv2.jd.mode` defaults to `coinbase-only`, which sends the pool a merkle path
+instead of the transaction list, so no SV2 message limit bounds the template;
+each `sv2.jd.upstream` entry names its mode. Invalid enabled
 settings stop startup before the chain or listener starts.
 Dormant JD settings are ignored when JD is disabled. The solo fallback pays
 `sv2.mining.address`.
@@ -388,8 +391,13 @@ and each declaration step use `sv2.jd.response_timeout_seconds`. With JD
 enabled, both settings must be from 1 to 600 seconds. A healthy idle
 connection has no outstanding response deadline. OS DNS resolution
 cancellation still needs validation on Linux; numeric IP addresses avoid the
-resolver's OS lookup. Each direction accepts payloads of at most 1 MiB and the
-output queue holds at most eight frames. Shares that arrive before the custom
+resolver's OS lookup. Received payloads are at most 1 MiB. Sent messages may
+fill a whole SV2 frame, whose U24 length allows 2^24 - 1 bytes. In
+`full-template`, a template of more than 65,535 transactions (the SEQ0_64K
+list in `DeclareMiningJob`), or a `ProvideMissingTransactions.Success` larger
+than one frame, is not declared: that template is mined solo and the log says
+why. `coinbase-only` has neither limit. The output queue holds at most eight
+frames. Shares that arrive before the custom
 job id is known are retained up to 32 and then dropped. An output queue that
 refuses a declaration or a share ends the attempt and advances failover while
 solo work continues. Switching pools changes the payout and upstream share

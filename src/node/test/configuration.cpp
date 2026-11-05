@@ -175,6 +175,11 @@ TEST_CASE("sv2 JD settings survive network selection config copying and command 
     CHECK(overridden.configured.sv2.jd.user_identity == "selected-worker");
     CHECK(overridden.configured.sv2.jd.mining_address == "pool.example:4444");
     CHECK(overridden.configured.sv2.jd.response_timeout_seconds == 19u);
+
+    node::parser defaulted(domain::config::network::mainnet);
+    char const* enabled_only[]{"kth", "--network", "regtest", "--sv2.jd.enabled=true"};
+    REQUIRE(defaulted.parse(4, enabled_only, error));
+    CHECK(defaulted.configured.sv2.jd.mode == "coinbase-only");
 }
 
 TEST_CASE("sv2 JD parser refuses malformed enable and deadline values", "[configuration tests][parser][sv2 jd]") {

@@ -106,6 +106,17 @@ TEST_CASE("sv2 JD validation keeps dormant settings inert and accepts both expli
     CHECK(validate_jd_settings(settings, error));
 }
 
+TEST_CASE("sv2 JD defaults to coinbase-only mode", "[sv2 jd]") {
+    // Coinbase-only sends a merkle path instead of the transaction list, so
+    // no SV2 sequence or frame limit bounds the template the node mines.
+    REQUIRE(node::sv2_settings{}.jd.mode == "coinbase-only");
+    auto settings = configured_jd();
+    settings.jd.mode = node::sv2_settings{}.jd.mode;
+    std::string error;
+    CHECK(validate_jd_settings(settings, error));
+    CHECK(error.empty());
+}
+
 TEST_CASE("sv2 JD validation refuses missing prerequisites and malformed upstream settings", "[sv2 jd]") {
     auto const valid = configured_jd();
     std::string error;
@@ -305,4 +316,17 @@ TEST_CASE("sv2 JD failover thresholds are bounded and cross checked", "[sv2 jd]"
     settings.jd.authority_hold_seconds = 60;
     CHECK_FALSE(validate_jd_settings(settings, error));
     CHECK(error.find("authority_hold_seconds") != std::string::npos);
+}
+
+TEST_CASE("sv2 JD upstream lists accept the default single-pool mode and refuse a chosen one", "[sv2 jd]") {
+    // sv2.jd.mode defaults to coinbase-only, so leaving it alone is not a
+    // single-pool setting. Choosing a mode next to the list still is.
+    auto settings = configured_list();
+    REQUIRE(settings.jd.mode == "coinbase-only");
+    std::string error;
+    CHECK(validate_jd_settings(settings, error));
+    CHECK(error.empty());
+    settings.jd.mode = "full-template";
+    CHECK_FALSE(validate_jd_settings(settings, error));
+    CHECK(error.find("legacy single-pool settings") != std::string::npos);
 }

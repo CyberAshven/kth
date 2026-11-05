@@ -411,3 +411,22 @@ TEST_CASE("sv2 jd extensions are discarded only within the frame length bound", 
     auto undefined = ready();
     require_closed(undefined, process(undefined, message_header::channel_msg_flag, 0xff, {}));
 }
+
+TEST_CASE("sv2 jd SetGroupChannel regroups this extended channel and ignores the rest", "[sv2 jd]") {
+    auto session = ready();
+    require_silent(process(session, set_group_channel{42, {1, 7}}));
+    REQUIRE(session.ready());
+    REQUIRE(session.channel()->channel_id == 7);
+    REQUIRE(session.channel()->group_channel_id == 42);
+    REQUIRE(session.channel()->extranonce_prefix == data_chunk{1, 2});
+
+    require_silent(process(session, set_group_channel{99, {1, 2, 8}}));
+    REQUIRE(session.channel()->group_channel_id == 42);
+    require_silent(process(session, set_group_channel{100, {}}));
+    REQUIRE(session.channel()->group_channel_id == 42);
+
+    refuse_incomplete(set_group_channel{42, {7}}, ready);
+    auto flagged = ready();
+    require_closed(flagged, process(flagged, message_header::channel_msg_flag,
+        set_group_channel::message_type, to_data_chunk(set_group_channel{42, {7}})));
+}
