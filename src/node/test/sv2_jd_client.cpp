@@ -1002,6 +1002,19 @@ data_chunk truncated_share_success() {
     return bytes;
 }
 
+// SubmitShares.Error is two U32s and a U8 string, at least 9 bytes. Four bytes
+// is a complete frame whose body still fails from_data, so the close comes
+// from the parser rather than from the noise layer waiting for bytes that
+// were never declared.
+data_chunk truncated_share_error() {
+    data_chunk payload(4, 0);
+    payload[0] = 7;
+    auto bytes = to_data_chunk(message_header{message_header::channel_msg_flag,
+        submit_shares_error::message_type, static_cast<uint32_t>(payload.size())});
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
 void require_solo_again(miner_link& miner, downstream_work const& pooled,
     domain::chain::script const& solo) {
     // The selection stays. The scriptSig does not: solo work puts the channel
@@ -2721,13 +2734,18 @@ TEST_CASE("sv2 JD falls back when the pool rejects a share on the accepted decla
 }
 
 TEST_CASE("sv2 JD closes on a malformed or misaddressed share reply", "[sv2 jd]") {
-    enum class fault { truncated, success_channel, error_channel };
+    enum class fault { truncated, truncated_error, success_channel, error_channel };
     auto which = fault::truncated;
     SECTION("truncated SubmitShares.Success") {}
+    SECTION("truncated SubmitShares.Error") { which = fault::truncated_error; }
     SECTION("SubmitShares.Success for the group channel") { which = fault::success_channel; }
     SECTION("SubmitShares.Error for the group channel") { which = fault::error_channel; }
     char const* tag = "sv2_jd_bad_success";
     char const* phrase = "malformed share success";
+    if (which == fault::truncated_error) {
+        tag = "sv2_jd_truncated_share_error";
+        phrase = "malformed share error";
+    }
     if (which == fault::success_channel) {
         tag = "sv2_jd_bad_channel";
         phrase = "share success for another channel";
@@ -2758,6 +2776,7 @@ TEST_CASE("sv2 JD closes on a malformed or misaddressed share reply", "[sv2 jd]"
     // upstream channel, even though mining updates accept either.
     captured_log log;
     if (which == fault::truncated) fixture.pool.send_plain(truncated_share_success());
+    else if (which == fault::truncated_error) fixture.pool.send_plain(truncated_share_error());
     else if (which == fault::success_channel) fixture.pool.send(submit_shares_success{8, 0, 1, 1});
     else fixture.pool.send(submit_shares_error{8, 0, "other-channel"});
     require_solo_again(miner, declared.pooled, payout->script);
