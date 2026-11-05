@@ -314,10 +314,12 @@ std::optional<declared_work> make_declared_work(blockchain::mining_template cons
     domain::chain::output::list const& outputs, uint32_t generation,
     data_chunk const& upstream_prefix, uint16_t upstream_extranonce_size) {
     auto const target = domain::chain::compact::from_compact(tmpl.bits);
+    // Coinbase prefix and suffix are B0_64K. The transaction list is not:
+    // this builder sends the merkle path. DeclareMiningJob's SEQ0_64K txid
+    // list is checked where that list is serialized.
     if ( ! target || target->big() == 0 || tmpl.current_time < tmpl.min_time
         || upstream_extranonce_size < jd_min_extranonce_size || upstream_extranonce_size > 32
-        || upstream_prefix.size() > 32 - size_t{upstream_extranonce_size}
-        || tmpl.selection.txs.size() > 65535) {
+        || upstream_prefix.size() > 32 - size_t{upstream_extranonce_size}) {
         return std::nullopt;
     }
     if (outputs.empty() || ! outputs_pay(outputs, tmpl.coinbase_value)

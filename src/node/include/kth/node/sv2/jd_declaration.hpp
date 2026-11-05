@@ -5,7 +5,9 @@
 #ifndef KTH_NODE_SV2_JD_DECLARATION_HPP
 #define KTH_NODE_SV2_JD_DECLARATION_HPP
 
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <optional>
 #include <string>
 
@@ -46,8 +48,9 @@ struct jd_declaration {
     // Coinbase-only never sends PushSolution. Callers use this so they do not
     // hold a block they are not going to push.
     [[nodiscard]] bool full_template() const;
-    // Drop an in-flight declaration whose tip is no longer current. A late
-    // reply is ignored instead of failing the upstream.
+    // Drop an in-flight declaration whose tip is no longer current. Its
+    // request id stays recognized, so a late reply is ignored after the next
+    // declaration has started.
     void supersede();
     void note_target(hash_digest const& target);
 
@@ -64,15 +67,20 @@ private:
     [[nodiscard]] result process_payout(jd_peer peer, message_header const& header, byte_span payload);
     [[nodiscard]] result accept_payout(request_payout_outputs_success const& success);
     [[nodiscard]] result refuse_payout(request_payout_outputs_error const& error);
+    [[nodiscard]] bool retired(uint32_t id) const;
+
+    // One id per replaced declaration. A handful of tip changes can outrun a
+    // reply; an id older than this is treated as one this client never sent.
+    static constexpr size_t max_retired_request_ids = 8;
 
     std::string identity_;
     bool full_template_;
     bool has_template_ = false;
-    bool superseded_ = false;
     bool payout_outputs_ = false;
     bool restart_ = false;
     state state_ = state::idle;
     uint32_t request_id_ = 0;
+    std::deque<uint32_t> retired_request_ids_;
     uint32_t notice_epoch_ = 0;
     uint32_t token_epoch_ = 0;
     uint32_t unexplained_stale_ = 0;

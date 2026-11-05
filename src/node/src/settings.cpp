@@ -50,7 +50,7 @@ sv2_settings::jd_settings::jd_settings()
     , jds_address()
     , jds_authority_public_key()
     , user_identity()
-    , mode()
+    , mode("coinbase-only")
     , response_timeout_seconds(10)
 {}
 
