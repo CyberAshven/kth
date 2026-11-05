@@ -128,7 +128,7 @@ void finish_extensions(jd_session& session, bool grant, bool full_template = tru
     REQUIRE_FALSE(session.channel());
 }
 
-jd_session awaiting_extensions(bool full_template = true) {
+jd_session awaiting_extensions_in(bool full_template) {
     auto session = waiting(jd_peer::declaration, full_template);
     auto const asked = process(session, setup_connection_success{2, 0});
     REQUIRE_FALSE(asked.close);
@@ -142,6 +142,11 @@ jd_session awaiting_extensions(bool full_template = true) {
         : std::vector<uint16_t>{requested_payout_outputs_extension};
     REQUIRE(request.requested_extensions == expected);
     return session;
+}
+
+// No parameter, so refuse_incomplete can take it as a factory.
+jd_session awaiting_extensions() {
+    return awaiting_extensions_in(true);
 }
 
 template <typename Message, typename Factory>
@@ -557,7 +562,7 @@ TEST_CASE("sv2 jd declaration negotiates BCH large templates in full-template on
 
     // Coinbase-only does not ask, and a pool that lists it anyway does not
     // turn it on.
-    auto coinbase_only = awaiting_extensions(false);
+    auto coinbase_only = awaiting_extensions_in(false);
     require_silent(process(coinbase_only, request_extensions_success{1, {large_templates_extension}}));
     REQUIRE(coinbase_only.ready());
     REQUIRE_FALSE(coinbase_only.large_templates());
