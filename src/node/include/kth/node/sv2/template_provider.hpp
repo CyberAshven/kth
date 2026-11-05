@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <optional>
 #include <system_error>
 
@@ -128,6 +129,7 @@ private:
     blockchain::block_chain& chain_;
     std::optional<domain::chain::script> payout_;
     uint64_t next_salt_ = 1;
+    std::shared_ptr<uint64_t> pool_allocations_ = std::make_shared<uint64_t>(0);
     ::asio::strand<::asio::any_io_executor> owner_;
     ::asio::experimental::concurrent_channel<void(std::error_code, int)> stop_requests_;
     ::asio::experimental::concurrent_channel<void(std::error_code, uint16_t)> listening_;

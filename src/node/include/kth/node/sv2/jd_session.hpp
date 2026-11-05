@@ -10,6 +10,7 @@
 #include <string>
 
 #include <kth/infrastructure/utility/data.hpp>
+#include <kth/node/mining/work.hpp>
 #include <kth/node/sv2/framing.hpp>
 #include <kth/node/sv2/mining_messages.hpp>
 
@@ -21,9 +22,7 @@ enum class jd_peer { mining, declaration };
 // with the connection; this state only consumes complete authenticated frames.
 struct jd_session {
     static constexpr uint32_t max_payload_size = 1024 * 1024;
-    // Leave twelve bytes for local channel allocation and twelve for miners.
-    // PushSolution carries the complete extranonce in at most 32 bytes.
-    static constexpr uint16_t min_extranonce_size = 24;
+    static constexpr uint16_t min_extranonce_size = mining::jd_min_extranonce_size;
 
     struct result {
         data_chunk response;

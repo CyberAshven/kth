@@ -331,6 +331,42 @@ TEST_CASE("sv2 JD refuses unusable token outputs before any declaration or custo
     refuse_incomplete(allocation(), jd_peer::declaration, [] { return allocating(); });
 }
 
+TEST_CASE("sv2 JD declarations preserve every grant from the requested minimum to 32 bytes", "[sv2 jd]") {
+    for (bool const full : {false, true}) {
+        for (uint16_t size = 8; size <= 32; ++size) {
+            CAPTURE(full, size);
+            auto upstream = channel();
+            upstream.extranonce_size = size;
+            upstream.extranonce_prefix.assign(std::min<size_t>(4, 32 - size), 0x42);
+            jd_declaration state("worker", full);
+            auto result = state.start(mining_template(), upstream);
+            REQUIRE(result.error.empty());
+            REQUIRE(result.progress);
+            result = process(state, jd_peer::declaration, allocation());
+            REQUIRE(result.error.empty());
+            REQUIRE(state.work());
+            REQUIRE(state.work()->upstream_extranonce_size == size);
+            REQUIRE(state.work()->upstream_extranonce_prefix == upstream.extranonce_prefix);
+            if (full) {
+                auto const declaration = decode<declare_mining_job>(result.declaration);
+                REQUIRE(declaration.coinbase_tx_prefix == state.work()->coinbase_tx_prefix);
+                REQUIRE(declaration.coinbase_tx_suffix == state.work()->coinbase_tx_suffix);
+                result = process(state, jd_peer::declaration, declare_mining_job_success{1, {9}});
+                REQUIRE(result.error.empty());
+            }
+            auto const custom = decode<set_custom_mining_job>(result.mining);
+            REQUIRE(custom.coinbase_prefix == state.work()->coinbase_prefix);
+            REQUIRE(custom.coinbase_tx_outputs == state.work()->coinbase_tx_outputs);
+            auto const accepted = process(state, jd_peer::mining,
+                set_custom_mining_job_success{upstream.channel_id, custom.request_id, 123});
+            REQUIRE(accepted.error.empty());
+            REQUIRE(accepted.accepted);
+            REQUIRE(state.work()->upstream_extranonce_size == size);
+            REQUIRE(state.work()->upstream_extranonce_prefix == upstream.extranonce_prefix);
+        }
+    }
+}
+
 TEST_CASE("sv2 JD bounds local input and refuses replacing an outstanding declaration", "[sv2 jd]") {
     for (auto const& identity : {std::string{}, std::string(256, 'x')}) {
         jd_declaration state(identity, true);
@@ -341,7 +377,7 @@ TEST_CASE("sv2 JD bounds local input and refuses replacing an outstanding declar
         auto upstream = channel();
         if (variant == 0) upstream.group_channel_id = upstream.channel_id;
         if (variant == 1) --upstream.extranonce_size;
-        if (variant == 2) upstream.extranonce_prefix.resize(9);
+        if (variant == 2) upstream.extranonce_prefix.resize(33 - upstream.extranonce_size);
         if (variant == 3) upstream.target.fill(0);
         jd_declaration state("worker", true);
         require_failure(state, state.start(mining_template(), upstream));
