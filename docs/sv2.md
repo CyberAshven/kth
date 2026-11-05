@@ -256,10 +256,10 @@ not negotiate extensions. After `SetupConnection.Success` on the Job Declaration
 connection, and before any other Job Declaration message, the node sends
 `RequestExtensions` (extension 0x0001) asking for Requested Payout Outputs
 and, in `full-template`, BCH large templates.
-The identifier is `requested_payout_outputs_extension` (`0x5052`). sv2-spec
-PR #249 assigns this extension `0x0004`; the pool that serves it still uses
-the experimental identifier `0x5052` until that pull request is merged, so
-changing the constant is the whole switch.
+The identifier is `requested_payout_outputs_extension` (`0x5052`), an
+experimental identifier that is not in the SV2 extension registry. sv2-spec
+PR #249 proposed the extension as `0x0004` and was closed; changing the
+constant is the whole switch if it is ever registered.
 
 BCH large templates (`large_templates_extension`, `0x4C54`) lift the two
 transaction-list limits standard Job Declaration has. Those limits fit Bitcoin
