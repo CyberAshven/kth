@@ -4,6 +4,7 @@
 
 #include <kth/node/sv2/jd_client.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <deque>
 #include <exception>
@@ -66,8 +67,32 @@ std::optional<Message> parse(byte_span payload) {
     return std::move(*message);
 }
 
+// jd_session.cpp keeps the same helper in an anonymous namespace, so this
+// translation unit cannot call it. Upstream text stays on one ASCII line.
+std::string printable_error_code(std::string const& code) {
+    auto text = code.substr(0, 64);
+    for (auto& character : text) {
+        auto const byte = static_cast<unsigned char>(character);
+        if (byte < 0x20 || byte > 0x7e) character = '?';
+    }
+    return text;
+}
+
+// Shares found before the pool names the custom job. Past this, drop rather
+// than let a slow Success pin every downstream proof.
 constexpr size_t max_cached_shares = 32;
 constexpr size_t max_pending_shares = 1024;
+
+// Shares are forwarded continuously, not only in the cached burst, so the
+// record has to outlast a pool whose replies lag. Otherwise a refusal of
+// current work would age out and escape sv2-spec 6.2. The engine's share
+// history bound is reused. A reply for an older sequence is ignored, the same
+// as a sequence this client never sent.
+constexpr size_t max_tracked_shares = mining::max_remembered_shares;
+
+// One declaration is accepted or replaced before a run of blocks. Two covers
+// a pair found on the same coinbase before DeclareMiningJob.Success.
+constexpr size_t max_pending_solutions = 2;
 
 } // namespace
 
@@ -103,6 +128,9 @@ struct jd_client::attempt {
 
     void stop() {
         stopped = true;
+        // A DeclareMiningJob.Success already queued must not push a block
+        // after this attempt has failed or the client has stopped.
+        pending_solutions.clear();
         wake_declarations();
         mining.stop();
         declaration.stop();
@@ -120,6 +148,23 @@ struct jd_client::attempt {
     std::optional<std::chrono::steady_clock::time_point> job_deadline;
     std::vector<mining::pool_proof> cached;
     std::deque<submitted_share> submitted;
+    // sequence and declared_work::generation of each share this attempt sent.
+    // The deque is capped so a slow pool cannot pin every share. previous and
+    // sent stay with the sequence: a current-tip refusal still needs the
+    // share's parent, and the health window still needs the send time.
+    // Success does not drop an entry. The reply can arrive after the ack that
+    // removed it from `submitted`, and after a later declaration replaced it.
+    struct tracked_share {
+        uint32_t sequence = 0;
+        uint32_t generation = 0;
+        hash_digest previous{};
+        std::chrono::steady_clock::time_point sent{};
+    };
+    std::deque<tracked_share> tracked;
+    // Full-template blocks found before DeclareMiningJob.Success. Pushed once
+    // can_push_solution() is true for that generation. Two covers a pair on
+    // the same coinbase; a later one is dropped rather than queued forever.
+    std::vector<mining::pool_proof> pending_solutions;
     uint32_t sequence = 0;
     uint64_t work_id = 0;
     bool ready = false;
@@ -212,6 +257,9 @@ void jd_client::mark_ready(attempt& value) {
         if ( ! header) return false;
         auto const payload = source.read_bytes(source.remaining_size());
         if ( ! payload) return false;
+        // Share replies name one submission. Success is health-sampled.
+        // An error is attributed in share_response; a stale or unknown
+        // sequence must not end this attempt (sv2-spec 6.2).
         if (session.ready() && peer == jd_peer::mining && header->channel_msg()
             && header->extension() == 0
             && (header->msg_type == submit_shares_success::message_type
@@ -479,6 +527,9 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
             value.jobs.work()->upstream_job_id);
         flush_cached(value);
     }
+    // installing is the first state where PushSolution is defined. Full-template
+    // enters it at DeclareMiningJob.Success, before SetCustomMiningJob.Success.
+    if (value.jobs.can_push_solution() && ! flush_pending_solutions(value)) return false;
     return true;
 }
 
@@ -501,6 +552,9 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
                 value.jobs.supersede();
                 value.job_sent.reset();
                 value.job_deadline.reset();
+                // That coinbase will not be accepted. Shares and early blocks
+                // mined on it must not be sent for the declaration that replaces it.
+                retire_cached(value);
             }
         }
         if (chain_ && value.ready && ! value.jobs.pending()) {
@@ -511,11 +565,17 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
                 auto tmpl = co_await chain_->fetch_mining_template(248 + uint64_t{0xffff}, 0);
                 if (stopped_ || value.stopped) co_return;
                 auto const latest = chain_->chain_view();
+                // The tip can move while the template is built. Do not declare
+                // a parent the chain has already left, and do not start a
+                // second declaration over one that completed during the fetch.
                 if (tmpl && latest && latest->tip_hash == tmpl->previous_block_hash
                     && ! value.jobs.pending() && value.mining_session.channel()) {
                     previous = tmpl->previous_block_hash;
                     value.work_id = 0;
-                    value.cached.clear();
+                    // start() drops the previous declared coinbase before its
+                    // token exists. A cached share or early block from that
+                    // coinbase must not be flushed under the next job.
+                    retire_cached(value);
                     if ( ! dispatch(value, value.jobs.start(std::move(*tmpl), *value.mining_session.channel()))) co_return;
                 }
             }
@@ -533,21 +593,38 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
 }
 
 bool jd_client::share_response(attempt& value, message_header const& header, byte_span payload) {
+    auto const acknowledgement = header.msg_type == submit_shares_success::message_type;
+    auto const kind = acknowledgement ? "acknowledgement" : "refusal";
+    auto refuse = [&](char const* detail) {
+        fail(value, jd_failure::transient,
+            std::string("invalid upstream share ") + kind + ": " + detail);
+        return false;
+    };
+    // The noise frame is one SV2 message. A length that does not match the
+    // header was not parsed, whatever from_data would have done with the bytes.
+    if (header.msg_length != payload.size()) return refuse("invalid share reply length");
+    auto const upstream = value.mining_session.channel()
+        ? std::optional<uint32_t>{value.mining_session.channel()->channel_id} : std::nullopt;
     auto const now = std::chrono::steady_clock::now();
-    if (header.msg_type == submit_shares_success::message_type) {
+    if (acknowledgement) {
         auto const message = parse<submit_shares_success>(payload);
-        auto last = value.submitted.end();
-        if (message) last = std::find_if(value.submitted.begin(), value.submitted.end(),
+        if ( ! message) return refuse("malformed share success");
+        if ( ! upstream || message->channel_id != *upstream) {
+            return refuse("share success for another channel");
+        }
+        auto const last = std::find_if(value.submitted.begin(), value.submitted.end(),
             [&](auto const& share) { return share.sequence == message->last_sequence_number; });
-        if ( ! message || message->channel_id != value.mining_session.channel()->channel_id
-            || last == value.submitted.end()
-            || message->new_submits_accepted_count != static_cast<size_t>(last - value.submitted.begin()) + 1) {
-            fail(value, jd_failure::transient, "invalid upstream share acknowledgement");
-            return false;
+        // The count has to name the same prefix the health window is about to
+        // sample. A gap would score the wrong shares, or none.
+        if (last == value.submitted.end()
+            || message->new_submits_accepted_count
+                != static_cast<size_t>(last - value.submitted.begin()) + 1) {
+            return refuse("share success does not match the outstanding submits");
         }
         auto const count = message->new_submits_accepted_count;
         for (uint32_t i = 0; i < count; ++i) {
-            auto const latency = std::chrono::duration_cast<std::chrono::milliseconds>(now - value.submitted.front().sent);
+            auto const latency = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - value.submitted.front().sent);
             if (auto const reason = value.health.sample(false, false, latency)) {
                 fail(value, jd_failure::transient, *reason);
                 return false;
@@ -557,28 +634,60 @@ bool jd_client::share_response(attempt& value, message_header const& header, byt
         value.wake_declarations();
         return true;
     }
+    if (header.msg_type != submit_shares_error::message_type) return refuse("unexpected share reply");
     auto const message = parse<submit_shares_error>(payload);
-    auto found = value.submitted.end();
-    if (message) found = std::find_if(value.submitted.begin(), value.submitted.end(),
+    if ( ! message) return refuse("malformed share error");
+    if ( ! upstream || message->channel_id != *upstream) return refuse("share error for another channel");
+    auto const code = printable_error_code(message->error_code);
+    auto const found = std::find_if(value.tracked.begin(), value.tracked.end(),
+        [&](attempt::tracked_share const& share) {
+            return share.sequence == message->sequence_number;
+        });
+    // Never sent, or already pushed out of the bounded record.
+    if (found == value.tracked.end()) {
+        spdlog::debug("[sv2 jd] ignoring share error for unknown sequence {}",
+            message->sequence_number);
+        return true;
+    }
+    auto const generation = found->generation;
+    auto const previous = found->previous;
+    auto const sent = found->sent;
+    auto const outstanding = std::find_if(value.submitted.begin(), value.submitted.end(),
         [&](auto const& share) { return share.sequence == message->sequence_number; });
-    if ( ! message || message->channel_id != value.mining_session.channel()->channel_id
-        || found == value.submitted.end()) {
-        fail(value, jd_failure::transient, "invalid upstream share refusal");
-        return false;
+    auto consume = [&] {
+        value.tracked.erase(found);
+        if (outstanding != value.submitted.end()) value.submitted.erase(outstanding);
+        value.wake_declarations();
+    };
+    auto const& work = value.jobs.work();
+    // The declaration this share was mined on has been replaced, or it is not
+    // the one the pool acknowledged. An honest race, not a refusal of current work.
+    if ( ! work || ! work->upstream_accepted || generation != work->generation) {
+        spdlog::debug("[sv2 jd] stale share error {} for sequence {} on a replaced declaration",
+            code, message->sequence_number);
+        // The gap includes the replacement, so it is not the pool's response
+        // time for the job it is paying now.
+        if (auto const reason = value.health.sample(true, true, std::chrono::milliseconds::zero())) {
+            fail(value, jd_failure::transient, *reason);
+            return false;
+        }
+        consume();
+        return true;
     }
     auto const view = chain_ ? chain_->chain_view() : nullptr;
-    if ( ! view || view->tip_hash == found->previous) {
-        fail(value, jd_failure::dishonest, "pool refused a valid share on an accepted job: " + message->error_code);
+    if ( ! view || view->tip_hash == previous) {
+        fail(value, jd_failure::dishonest,
+            "pool refused a valid share on an accepted job (" + code + ")");
         return false;
     }
-    bool const stale = message->error_code == "stale-share" || message->error_code == "invalid-job-id";
-    auto const latency = std::chrono::duration_cast<std::chrono::milliseconds>(now - found->sent);
-    value.submitted.erase(found);
-    value.wake_declarations();
+    bool const stale = message->error_code == "stale-share"
+        || message->error_code == "invalid-job-id";
+    auto const latency = std::chrono::duration_cast<std::chrono::milliseconds>(now - sent);
     if (auto const reason = value.health.sample(stale, true, latency)) {
         fail(value, jd_failure::transient, *reason);
         return false;
     }
+    consume();
     return true;
 }
 
@@ -589,6 +698,15 @@ bool jd_client::share_response(attempt& value, message_header const& header, byt
 
 void jd_client::stop() {
     stopped_ = true;
+    // Early blocks are flushed only on this strand. Drop them before a
+    // DeclareMiningJob.Success already in hand can push one after stop.
+    // The schedule still ends the tip wait; this is not a second cancel hook.
+    auto drop_blocks = [this] {
+        if (active_) active_->pending_solutions.clear();
+        if (probe_) probe_->pending_solutions.clear();
+    };
+    if (owner_.running_in_this_thread()) drop_blocks();
+    else ::asio::post(owner_, drop_blocks);
     (void)wake_.try_send(std::error_code{}, 1);
     (void)ready_.try_send(std::make_error_code(std::errc::operation_canceled), 0);
 }
@@ -656,22 +774,28 @@ void jd_client::note_share(attempt& value, mining::pool_proof const& proof) {
     // A proof already posted by a downstream connection can arrive after a
     // switch. Its publication id must still name this exact declared job.
     if (value.work_id == 0 || proof.work_id != value.work_id) return;
-    if (value.jobs.can_push_solution() && proof.block && proof.full_extranonce.size() <= 32) {
-        push_solution message;
-        message.extranonce = proof.full_extranonce;
-        message.prev_hash = proof.prev_hash;
-        message.nonce = proof.nonce;
-        message.ntime = proof.ntime;
-        message.nbits = proof.bits;
-        message.version = proof.version;
-        if ( ! value.declaration.send(frame(message))) {
-            fail(value, jd_failure::transient, "JDS output queue refused PushSolution");
-            return;
+    auto const& work = value.jobs.work();
+    // generation is the declared coinbase, not the downstream publication id.
+    // A share mined on another declaration must not be cached or submitted
+    // against the work installed now.
+    bool const current = work && proof.generation == work->generation;
+    // Spec 6.4.9: PushSolution is defined once the JDS has accepted the
+    // declaration (DeclareMiningJob.Success), which is full-template only.
+    // A block found earlier is held until that reply. Coinbase-only still
+    // connects the block locally and never pushes. The full extranonce is
+    // the pool prefix plus the nested miner bytes. BCH has no witness bytes.
+    if (proof.block && proof.full_extranonce.size() <= 32 && current) {
+        if (value.jobs.can_push_solution()) {
+            if ( ! push_block(value, proof)) return;
+        } else if (value.jobs.full_template()
+            && value.pending_solutions.size() < max_pending_solutions) {
+            // Only this coinbase can become the job the JDS accepts.
+            value.pending_solutions.push_back(proof);
         }
     }
-    auto const& work = value.jobs.work();
-    if ( ! work || to_uint256(proof.header_hash) > to_uint256(work->upstream_target)) return;
-    if (work->upstream_job_id == 0) {
+    if ( ! current || to_uint256(proof.header_hash) > to_uint256(work->upstream_target)) return;
+    // SetCustomMiningJob.Success may assign job id zero. That is still accepted.
+    if ( ! work->upstream_accepted) {
         if (value.cached.size() < max_cached_shares) value.cached.push_back(proof);
         return;
     }
@@ -680,8 +804,11 @@ void jd_client::note_share(attempt& value, mining::pool_proof const& proof) {
 
 void jd_client::forward_share(attempt& value, mining::pool_proof const& proof) {
     auto const& work = value.jobs.work();
-    if ( ! work || work->upstream_job_id == 0 || proof.work_id != value.work_id
-        || proof.upstream_extranonce.size() != work->upstream_extranonce_size) return;
+    if ( ! work || ! work->upstream_accepted || proof.generation != work->generation
+        || proof.work_id != value.work_id
+        || proof.upstream_extranonce.size() != work->upstream_extranonce_size) {
+        return;
+    }
     if (value.submitted.size() == max_pending_shares) {
         fail(value, jd_failure::transient, "upstream share acknowledgement history exhausted");
         return;
@@ -698,19 +825,67 @@ void jd_client::forward_share(attempt& value, mining::pool_proof const& proof) {
         fail(value, jd_failure::transient, "pool output queue refused a share");
         return;
     }
-    value.submitted.push_back({message.sequence_number, proof.prev_hash, std::chrono::steady_clock::now()});
+    auto const sent = std::chrono::steady_clock::now();
+    value.submitted.push_back({message.sequence_number, proof.prev_hash, sent});
+    remember_submitted(value, message.sequence_number, proof.generation, proof.prev_hash, sent);
     value.wake_declarations();
+}
+
+void jd_client::remember_submitted(attempt& value, uint32_t sequence, uint32_t generation,
+    hash_digest const& previous, std::chrono::steady_clock::time_point sent) {
+    if (value.tracked.size() >= max_tracked_shares) value.tracked.pop_front();
+    value.tracked.push_back(attempt::tracked_share{sequence, generation, previous, sent});
+}
+
+bool jd_client::push_block(attempt& value, mining::pool_proof const& proof) {
+    if (stopped_ || value.stopped) return false;
+    push_solution message;
+    message.extranonce = proof.full_extranonce;
+    message.prev_hash = proof.prev_hash;
+    message.nonce = proof.nonce;
+    message.ntime = proof.ntime;
+    message.nbits = proof.bits;
+    message.version = proof.version;
+    if ( ! value.declaration.send(frame(message))) {
+        fail(value, jd_failure::transient, "JDS output queue refused PushSolution");
+        return false;
+    }
+    return true;
+}
+
+bool jd_client::flush_pending_solutions(attempt& value) {
+    if ( ! value.jobs.can_push_solution()) return true;
+    auto const& work = value.jobs.work();
+    std::vector<mining::pool_proof> pending;
+    pending.swap(value.pending_solutions);
+    if ( ! work) return true;
+    for (auto const& proof : pending) {
+        // Replaced while the proof sat here: not the job the JDS just accepted.
+        if (proof.generation != work->generation) continue;
+        if ( ! push_block(value, proof)) return false;
+    }
+    return true;
 }
 
 void jd_client::flush_cached(attempt& value) {
     auto const& work = value.jobs.work();
-    if ( ! work || work->upstream_job_id == 0) return;
+    if ( ! work || ! work->upstream_accepted) return;
     std::vector<mining::pool_proof> pending;
     pending.swap(value.cached);
     for (auto const& proof : pending) {
         if (value.stopped) break;
-        if (to_uint256(proof.header_hash) <= to_uint256(work->upstream_target)) forward_share(value, proof);
+        // Replacement also drops the cache. This still refuses a proof that
+        // was queued for an older coinbase and noted after the new work existed.
+        if (proof.generation != work->generation) continue;
+        if (to_uint256(proof.header_hash) <= to_uint256(work->upstream_target)) {
+            forward_share(value, proof);
+        }
     }
+}
+
+void jd_client::retire_cached(attempt& value) {
+    value.cached.clear();
+    value.pending_solutions.clear();
 }
 
 ::asio::awaitable<void> jd_client::wait_until_ready() {

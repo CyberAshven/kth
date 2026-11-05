@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -96,7 +97,14 @@ private:
     void publish_solo(attempt const& value);
     void note_share(attempt& value, mining::pool_proof const& proof);
     void forward_share(attempt& value, mining::pool_proof const& proof);
+    void remember_submitted(attempt& value, uint32_t sequence, uint32_t generation,
+        hash_digest const& previous, std::chrono::steady_clock::time_point sent);
+    // False when the JDS queue refuses the frame and this attempt is stopping.
+    [[nodiscard]] bool push_block(attempt& value, mining::pool_proof const& proof);
+    [[nodiscard]] bool flush_pending_solutions(attempt& value);
     void flush_cached(attempt& value);
+    // Drop shares and unpushed block proofs from a declaration being replaced.
+    void retire_cached(attempt& value);
 
     ::asio::strand<::asio::any_io_executor> owner_;
     sv2_settings const settings_;
