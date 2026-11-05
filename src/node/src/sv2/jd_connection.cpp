@@ -68,7 +68,7 @@ bool jd_connection::send(data_chunk frame) {
         return false;
     };
     if (frame.size() < message_header::size
-        || frame.size() > message_header::size + max_payload_size) return refuse();
+        || frame.size() > message_header::size + max_send_payload_size) return refuse();
     byte_reader source(byte_span(frame).first(message_header::size));
     auto const header = message_header::from_data(source);
     if ( ! header || header->msg_length != frame.size() - message_header::size) return refuse();
