@@ -677,7 +677,8 @@ TEST_CASE("sv2 JD payout request carries the token, template and coinbase prefix
 
 TEST_CASE("sv2 JD exact payout outputs are the declared coinbase, in order", "[sv2 jd]") {
     auto const paid = paid_outputs();
-    auto const prefix = node::mining::payout_coinbase_prefix(101, 1, 2, 24);
+    auto const prefix = node::mining::payout_coinbase_prefix(101, 1, 2,
+        jd_session::min_extranonce_size);
     REQUIRE(prefix);
     for (bool const full : {false, true}) {
         CAPTURE(full);
