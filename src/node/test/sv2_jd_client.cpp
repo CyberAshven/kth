@@ -729,7 +729,7 @@ declared_template declare_local_template(client_fixture& fixture, miner_link& mi
         REQUIRE(declaration.wtxid_list.empty());
         if ( ! finish) {
             auto const pooled = miner.next();
-            REQUIRE(pooled.prefix.size() == 20);
+            REQUIRE(pooled.prefix.size() == 8 + node::mining::jd_allocation_size);
             REQUIRE(pooled.job.coinbase_tx_prefix == declaration.coinbase_tx_prefix);
             REQUIRE(pooled.job.coinbase_tx_suffix == declaration.coinbase_tx_suffix);
             REQUIRE(pays(coinbase_from(pooled), pool_script(), 2));
@@ -763,7 +763,7 @@ declared_template declare_local_template(client_fixture& fixture, miner_link& mi
     REQUIRE(paid.front().script() == pool_script());
     REQUIRE(paid.back().value() == 0);
     auto const pooled = miner.next();
-    REQUIRE(pooled.prefix.size() == 20);
+    REQUIRE(pooled.prefix.size() == 8 + node::mining::jd_allocation_size);
     REQUIRE(std::equal(pooled.prefix.begin(), pooled.prefix.begin() + 8,
         data_chunk(8, 0x12).begin()));
     REQUIRE(pooled.job.version == custom.version);
