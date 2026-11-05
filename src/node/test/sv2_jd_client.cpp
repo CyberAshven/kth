@@ -806,6 +806,18 @@ uint32_t find_nonce(downstream_work const& work, data_chunk const& extranonce, b
     return 0;
 }
 
+// A one-byte read that must not complete. Cancel it afterwards so the next
+// read on this socket starts at a frame boundary. Used when a share must
+// still be cached rather than forwarded.
+void expect_idle(io_driver& driver, ::asio::ip::tcp::socket& socket) {
+    auto quiet = driver.begin_read(socket, 1);
+    REQUIRE_FALSE(driver.wait_until([&] { return quiet->done; }, 300ms));
+    std::error_code error;
+    socket.cancel(error);
+    REQUIRE_FALSE(error);
+    REQUIRE(driver.wait_until([&] { return quiet->done; }));
+}
+
 void require_no_reconnect(client_fixture& fixture) {
     ::asio::ip::tcp::socket retry(fixture.io);
     auto accepted = std::make_shared<operation>();
@@ -1430,4 +1442,141 @@ TEST_CASE("sv2 JD fallback pays the solo address on the next downstream job", "[
     fixture.eof(fixture.pool.socket);
     fixture.eof(fixture.jds.socket);
     require_no_reconnect(fixture);
+}
+
+TEST_CASE("sv2 JD forwards a share for an upstream job id of zero without falling back", "[sv2 jd]") {
+    auto chain = started_chain("sv2_jd_zero_job");
+    client_fixture fixture;
+    auto const configuration = settings(fixture.pool, fixture.jds);
+    provider_run provider(fixture, configuration, chain);
+    handshake_upstreams(fixture, true);
+    miner_link miner(fixture, provider.port);
+    auto const declared = declare_local_template(fixture, miner, true);
+    // sv2-spec 5.3.19: SetCustomMiningJob.Success.job_id is a U32. Zero is in range.
+    fixture.pool.send(set_custom_mining_job_success{declared.custom.channel_id,
+        declared.custom.request_id, 0});
+    data_chunk const extranonce(miner.opened.extranonce_size, 0x5a);
+    auto const nonce = find_nonce(declared.pooled, extranonce, false);
+    fixture.write(miner.socket, frame(submit_shares_extended{miner.opened.channel_id, 1,
+        declared.pooled.job.job_id, nonce, declared.pooled.prev.ntime_start,
+        declared.pooled.job.version, extranonce}));
+    auto const local = receive_plain<submit_shares_success>(fixture, miner.socket);
+    REQUIRE(local.channel_id == miner.opened.channel_id);
+    REQUIRE(local.last_sequence_number == 1);
+    auto const forwarded = fixture.pool.receive<submit_shares_extended>();
+    REQUIRE(forwarded.channel_id == 7);
+    REQUIRE(forwarded.sequence_number == 0);
+    REQUIRE(forwarded.job_id == 0);
+    REQUIRE(forwarded.nonce == nonce);
+    REQUIRE(forwarded.ntime == declared.pooled.prev.ntime_start);
+    REQUIRE(forwarded.version == declared.pooled.job.version);
+    data_chunk full = declared.pooled.prefix;
+    full.insert(full.end(), extranonce.begin(), extranonce.end());
+    REQUIRE(forwarded.extranonce == data_chunk(full.begin() + 8, full.end()));
+    fixture.pool.send(submit_shares_success{forwarded.channel_id,
+        forwarded.sequence_number, 1, 1});
+    // Job id zero is not a refusal. The pool stays up and the miner is not
+    // moved back to the solo coinbase. accept() gave this channel the maximum
+    // target, so the share meets it.
+    auto pool_quiet = fixture.begin_read(fixture.pool.socket, 1);
+    auto miner_quiet = fixture.begin_read(miner.socket, 1);
+    CHECK_FALSE(fixture.wait_until([&] {
+        return pool_quiet->done || miner_quiet->done;
+    }, 300ms));
+}
+
+TEST_CASE("sv2 JD does not submit a cached share under a replaced declaration", "[sv2 jd]") {
+    auto chain = started_chain("sv2_jd_replaced_share");
+    client_fixture fixture;
+    auto configuration = settings(fixture.pool, fixture.jds);
+    // The in-flight declaration has to survive connect_bodies, which is what
+    // publishes the tip that replaces it. This test does not wait the deadline out.
+    configuration.jd.response_timeout_seconds = 30;
+    provider_run provider(fixture, configuration, chain);
+    handshake_upstreams(fixture, true);
+    miner_link miner(fixture, provider.port);
+    auto const first = declare_local_template(fixture, miner, true);
+
+    data_chunk const cached_extranonce(miner.opened.extranonce_size, 0x5a);
+    auto const cached_nonce = find_nonce(first.pooled, cached_extranonce, false);
+    fixture.write(miner.socket, frame(submit_shares_extended{miner.opened.channel_id, 1,
+        first.pooled.job.job_id, cached_nonce, first.pooled.prev.ntime_start,
+        first.pooled.job.version, cached_extranonce}));
+    auto const cached_ack = receive_plain<submit_shares_success>(fixture, miner.socket);
+    REQUIRE(cached_ack.channel_id == miner.opened.channel_id);
+    REQUIRE(cached_ack.last_sequence_number == 1);
+    // Accepted downstream, withheld upstream until SetCustomMiningJob.Success.
+    expect_idle(fixture, fixture.pool.socket);
+
+    auto const block = test::mine_block(first.pooled.prev.prev_hash, 2,
+        uint32_t(zulu_time()), 0, {}, 0);
+    std::vector<domain::chain::block> const blocks{block};
+    REQUIRE(chain->organizer().add_headers(test::headers_of(blocks)).headers_added == 1);
+    test::persist_headers(*chain, blocks, 2);
+    test::connect_bodies(*chain, blocks, 2);
+    auto const view = chain->chain().chain_view();
+    REQUIRE(view);
+    REQUIRE(view->tip_hash == block.hash());
+
+    auto const allocation = fixture.jds.receive<allocate_mining_job_token>();
+    REQUIRE(allocation.request_id != 0);
+    REQUIRE(allocation.request_id != first.custom.request_id);
+    fixture.jds.send(allocate_mining_job_token_success{allocation.request_id,
+        {1, 2, 3}, output_bytes(pool_output_list())});
+    auto const declaration = fixture.jds.receive<declare_mining_job>();
+    REQUIRE(declaration.request_id == allocation.request_id);
+    fixture.jds.send(provide_missing_transactions{declaration.request_id, {}});
+    auto const supplied = fixture.jds.receive<provide_missing_transactions_success>();
+    REQUIRE(supplied.request_id == declaration.request_id);
+    REQUIRE(supplied.transaction_list.empty());
+    fixture.jds.send(declare_mining_job_success{declaration.request_id, {9, 8, 7}});
+    auto const custom = fixture.pool.receive<set_custom_mining_job>();
+    REQUIRE(custom.channel_id == 7);
+    REQUIRE(custom.request_id == allocation.request_id);
+    REQUIRE(custom.prev_hash == block.hash());
+
+    // The tip can publish a solo job before the new pool coinbase. Take the
+    // job that pays the pool on this block.
+    std::optional<downstream_work> accepted_work;
+    for (int attempt = 0; attempt < 3 && ! accepted_work; ++attempt) {
+        auto const job = miner.next();
+        if (pays(coinbase_from(job), pool_script(), 2) && job.prev.prev_hash == block.hash()) {
+            accepted_work = job;
+        }
+    }
+    REQUIRE(accepted_work);
+
+    data_chunk const extranonce(miner.opened.extranonce_size, 0x5b);
+    auto const nonce = find_nonce(*accepted_work, extranonce, false);
+    fixture.write(miner.socket, frame(submit_shares_extended{miner.opened.channel_id, 2,
+        accepted_work->job.job_id, nonce, accepted_work->prev.ntime_start,
+        accepted_work->job.version, extranonce}));
+    auto const local = receive_plain<submit_shares_success>(fixture, miner.socket);
+    REQUIRE(local.channel_id == miner.opened.channel_id);
+    REQUIRE(local.last_sequence_number == 2);
+    expect_idle(fixture, fixture.pool.socket);
+
+    constexpr uint32_t accepted_job_id = 91;
+    fixture.pool.send(set_custom_mining_job_success{custom.channel_id,
+        custom.request_id, accepted_job_id});
+    auto const forwarded = fixture.pool.receive<submit_shares_extended>();
+    REQUIRE(forwarded.channel_id == 7);
+    REQUIRE(forwarded.sequence_number == 0);
+    REQUIRE(forwarded.job_id == accepted_job_id);
+    REQUIRE(forwarded.nonce == nonce);
+    REQUIRE(forwarded.ntime == accepted_work->prev.ntime_start);
+    REQUIRE(forwarded.version == accepted_work->job.version);
+    data_chunk full = accepted_work->prefix;
+    full.insert(full.end(), extranonce.begin(), extranonce.end());
+    // Reconstructs the 0x5b roll from this declaration. The cached share rolled 0x5a.
+    REQUIRE(forwarded.extranonce == data_chunk(full.begin() + 8, full.end()));
+    // A second frame would be the share mined on the replaced coinbase.
+    REQUIRE(fixture.pool.frames.empty());
+    fixture.pool.send(submit_shares_success{forwarded.channel_id,
+        forwarded.sequence_number, 1, 1});
+    auto pool_quiet = fixture.begin_read(fixture.pool.socket, 1);
+    auto miner_quiet = fixture.begin_read(miner.socket, 1);
+    CHECK_FALSE(fixture.wait_until([&] {
+        return pool_quiet->done || miner_quiet->done;
+    }, 300ms));
 }

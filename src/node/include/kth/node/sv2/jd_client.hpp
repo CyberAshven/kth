@@ -88,6 +88,8 @@ private:
     void note_share(mining::pool_proof const& proof);
     void forward_share(mining::pool_proof const& proof);
     void flush_cached();
+    // Drop shares mined on a declaration that is being replaced.
+    void retire_cached();
 
     ::asio::strand<::asio::any_io_executor> owner_;
     jd_connection mining_;
@@ -107,6 +109,8 @@ private:
     ::asio::experimental::concurrent_channel<void(std::error_code, int)> ready_;
     boost::atomic_shared_ptr<jd_notice> notice_;
     broadcaster<int> publications_;
+    // Proofs found before SetCustomMiningJob.Success. Each proof's generation
+    // is the declaration it was mined on; a replacement drops the vector.
     std::vector<mining::pool_proof> cached_;
     uint32_t share_sequence_ = 0;
     std::atomic_bool stopped_{false};

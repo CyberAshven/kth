@@ -607,6 +607,9 @@ std::optional<work_job> work_engine::build(channel& slot,
     created.pool = pooled;
     created.pool_prefix_length = pooled ? slot.pool_prefix_length : 0;
     created.pool_extranonce_size = pooled ? slot.pool_extranonce_size : 0;
+    // The value split_coinbase wrote. A later pool_.generation must not
+    // relabel a share mined on this coinbase.
+    created.generation = generation;
     created.txs = current_txs_;
     slot.jobs.push_back(std::move(created));
     auto const& stored = slot.jobs.back();
@@ -773,6 +776,7 @@ share_outcome work_engine::submit(share_request const& share) {
             proof.ntime = share.ntime;
             proof.nonce = share.nonce;
             proof.bits = job->bits;
+            proof.generation = job->generation;
             outcome.pool = std::move(proof);
         } else {
             spdlog::warn("[mining] Channel {} pool extranonce does not match the declared width",

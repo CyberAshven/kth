@@ -291,6 +291,9 @@ bool jd_client::dispatch(jd_declaration::result result) {
                 && view->tip_hash != jobs_.template_value().previous_block_hash) {
                 jobs_.supersede();
                 job_deadline_.reset();
+                // That coinbase will not be accepted. Shares mined on it must
+                // not stay cached for the declaration that replaces it.
+                retire_cached();
             }
         }
         if (chain_ && mining_session_.ready() && declaration_session_.ready() && ! jobs_.pending()) {
@@ -308,6 +311,10 @@ bool jd_client::dispatch(jd_declaration::result result) {
                 if (value && latest && latest->tip_hash == value->previous_block_hash
                     && ! jobs_.pending() && mining_session_.channel()) {
                     previous = value->previous_block_hash;
+                    // start() drops the previous declared coinbase before its
+                    // token exists. A cached share from that coinbase must not
+                    // be flushed under the next job id.
+                    retire_cached();
                     if ( ! dispatch(jobs_.start(std::move(*value), *mining_session_.channel()))) co_return;
                 }
             }
@@ -435,8 +442,12 @@ void jd_client::note_share(mining::pool_proof const& proof) {
         }
     }
     auto const& work = jobs_.work();
-    if ( ! work || to_uint256(proof.header_hash) > to_uint256(work->upstream_target)) return;
-    if (work->upstream_job_id == 0) {
+    // A share mined on another declaration's coinbase must not be cached or
+    // submitted against the work installed now. generation is the declared
+    // coinbase, not the downstream job id.
+    if ( ! work || proof.generation != work->generation
+        || to_uint256(proof.header_hash) > to_uint256(work->upstream_target)) return;
+    if ( ! work->upstream_accepted) {
         if (cached_.size() < max_cached_shares) cached_.push_back(proof);
         return;
     }
@@ -445,7 +456,7 @@ void jd_client::note_share(mining::pool_proof const& proof) {
 
 void jd_client::forward_share(mining::pool_proof const& proof) {
     auto const& work = jobs_.work();
-    if ( ! work || work->upstream_job_id == 0
+    if ( ! work || ! work->upstream_accepted || proof.generation != work->generation
         || proof.upstream_extranonce.size() != work->upstream_extranonce_size) {
         return;
     }
@@ -465,14 +476,21 @@ void jd_client::forward_share(mining::pool_proof const& proof) {
 
 void jd_client::flush_cached() {
     auto const& work = jobs_.work();
-    if ( ! work || work->upstream_job_id == 0) return;
+    if ( ! work || ! work->upstream_accepted) return;
     std::vector<mining::pool_proof> pending;
     pending.swap(cached_);
     for (auto const& proof : pending) {
+        // Replacement also drops the cache. This still refuses a proof that
+        // was queued for an older coinbase and noted after the new work existed.
+        if (proof.generation != work->generation) continue;
         if (to_uint256(proof.header_hash) <= to_uint256(work->upstream_target)) {
             forward_share(proof);
         }
     }
+}
+
+void jd_client::retire_cached() {
+    cached_.clear();
 }
 
 ::asio::awaitable<void> jd_client::wait_until_ready() {
