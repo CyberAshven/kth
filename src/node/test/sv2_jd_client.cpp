@@ -1126,8 +1126,10 @@ TEST_CASE("sv2 JD publications wake every subscriber and coalesce to the latest 
 
 TEST_CASE("sv2 JD client ends both upstreams when chain notifications stop", "[sv2 jd]") {
     bool before_run = false;
+    bool queued_tip = false;
     SECTION("subscription is already stopped") { before_run = true; }
     SECTION("waiting for a tip") {}
+    SECTION("tip queued at shutdown") { queued_tip = true; }
     auto chain = started_chain("sv2_jd_chain_stop");
     client_fixture fixture;
     if (before_run) REQUIRE(chain->chain().stop());
@@ -1144,11 +1146,66 @@ TEST_CASE("sv2 JD client ends both upstreams when chain notifications stop", "[s
     REQUIRE_NOTHROW(fixture.ready.get());
     auto const allocation = fixture.jds.receive<allocate_mining_job_token>();
     REQUIRE(allocation.request_id != 0);
+    if (queued_tip) {
+        REQUIRE(chain->chain().begin_transition());
+        chain->chain().end_transition();
+    }
     REQUIRE(chain->chain().stop());
-    fixture.await(fixture.result);
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.result.wait_for(0s) == std::future_status::ready;
+    }, 1s));
     REQUIRE_NOTHROW(fixture.result.get());
     fixture.eof(fixture.pool.socket);
     fixture.eof(fixture.jds.socket);
+}
+
+TEST_CASE("sv2 JD fallback finishes before a later tip and chain shutdown", "[sv2 jd]") {
+    auto chain = started_chain("sv2_jd_fallback_tip_stop");
+    client_fixture fixture;
+    fixture.start(settings(fixture.pool, fixture.jds), &chain->chain());
+    handshake_upstreams(fixture, true);
+    fixture.await(fixture.ready);
+    REQUIRE_NOTHROW(fixture.ready.get());
+    auto const allocation = fixture.jds.receive<allocate_mining_job_token>();
+    fixture.jds.send(allocate_mining_job_token_success{allocation.request_id,
+        {1, 2, 3}, output_bytes(pool_output_list())});
+    auto const declaration = fixture.jds.receive<declare_mining_job>();
+    auto const pooled = fixture.client->notice();
+    REQUIRE(pooled);
+    REQUIRE(pooled->pool);
+
+    fixture.jds.send(declare_mining_job_error{declaration.request_id, "policy-refused", {}});
+    fixture.jds.finish_writing();
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.result.wait_for(0s) == std::future_status::ready;
+    }, 1s));
+    REQUIRE_NOTHROW(fixture.result.get());
+    auto const solo = fixture.client->notice();
+    REQUIRE(solo);
+    REQUIRE_FALSE(solo->pool);
+    REQUIRE(solo->generation > pooled->generation);
+    fixture.eof(fixture.pool.socket);
+    fixture.eof(fixture.jds.socket);
+
+    // Connecting a successor publishes a real tip after the JD attempt ended.
+    // It must not revive declarations or replace the terminal solo notice.
+    auto const block = test::mine_block(solo->previous, 2, uint32_t(zulu_time()), 0, {}, 0);
+    std::vector<domain::chain::block> const blocks{block};
+    REQUIRE(chain->organizer().add_headers(test::headers_of(blocks)).headers_added == 1);
+    test::persist_headers(*chain, blocks, 2);
+    test::connect_bodies(*chain, blocks, 2);
+    auto const view = chain->chain().chain_view();
+    REQUIRE(view);
+    REQUIRE(view->tip_hash == block.hash());
+    CHECK_FALSE(fixture.wait_until([&] { return fixture.client->notice() != solo; }, 50ms));
+
+    // run() has joined its receiver, so chain shutdown can outlive the client.
+    std::weak_ptr<jd_client> const ended = fixture.client;
+    fixture.client.reset();
+    REQUIRE(ended.expired());
+    REQUIRE(chain->chain().stop());
+    fixture.io.restart();
+    fixture.io.run_for(50ms);
 }
 
 TEST_CASE("sv2 JD invalid configuration refuses full node startup before opening the chain", "[sv2 jd]") {
