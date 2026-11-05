@@ -9,7 +9,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -99,8 +98,9 @@ private:
     std::chrono::seconds const response_timeout_;
     std::optional<std::chrono::steady_clock::time_point> job_deadline_;
     ::asio::steady_timer declaration_wake_;
-    // Installed and cleared by run_owned(), and invoked only on owner_.
-    std::function<void()> cancel_tips_;
+    // Tip watcher wait. Lives on owner_, not on the chain subscription: chain
+    // stop closes that channel without cancelling a parked receive.
+    ::asio::steady_timer tip_watch_;
     ::asio::experimental::concurrent_channel<void(std::error_code, int)> ready_;
     boost::atomic_shared_ptr<jd_notice> notice_;
     broadcaster<int> publications_;

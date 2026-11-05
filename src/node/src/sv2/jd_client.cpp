@@ -11,12 +11,9 @@
 #include <utility>
 
 #include <asio/as_tuple.hpp>
-#include <asio/bind_immediate_executor.hpp>
 #include <asio/co_spawn.hpp>
-#include <asio/execution/blocking.hpp>
 #include <asio/experimental/awaitable_operators.hpp>
 #include <asio/post.hpp>
-#include <asio/require.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/use_awaitable.hpp>
 
@@ -62,6 +59,11 @@ data_chunk frame(Message const& message) {
 // than let a slow Success pin every downstream proof.
 constexpr size_t max_cached_shares = 32;
 
+// Upper bound on noticing a buffered tip or a stopped chain. The subscription
+// receive cannot be the wait: block_chain::stop() closes it without cancel,
+// on an executor it then stops, and this client's later cancel does not resume.
+constexpr auto tip_watch_interval = std::chrono::milliseconds(100);
+
 } // namespace
 
 jd_client::jd_client(sv2_settings const& settings, ::asio::any_io_executor executor,
@@ -85,6 +87,7 @@ jd_client::jd_client(sv2_settings const& settings, ::asio::any_io_executor execu
     , chain_(chain)
     , response_timeout_(settings.jd.response_timeout_seconds)
     , declaration_wake_(owner_)
+    , tip_watch_(owner_)
     , ready_(owner_, 1)
     , publications_(owner_, 1)
 {}
@@ -197,7 +200,7 @@ jd_client::jd_client(sv2_settings const& settings, ::asio::any_io_executor execu
     // Subscribe before the first snapshot so a completed transition cannot
     // leave the declaration loop asleep on an older tip.
     auto tips = chain_ ? chain_->subscribe_blockchain() : nullptr;
-    auto const end_tips = [tips] {
+    auto const end_tips = [&] {
         if (tips) {
             tips->cancel();
             tips->close();
@@ -205,29 +208,42 @@ jd_client::jd_client(sv2_settings const& settings, ::asio::any_io_executor execu
     };
     detail::scope_action cleanup([&] {
         end_tips();
-        cancel_tips_ = {};
         if (chain_) chain_->unsubscribe_blockchain(tips);
     }, true);
-    cancel_tips_ = end_tips;
     if (chain_ && ! tips) {
         stop();
         co_return;
     }
     auto receive_tips = [&]() -> ::asio::awaitable<void> {
         if ( ! tips) co_return;
-        while ( ! stopped_) {
-            // Buffered receives otherwise post through the chain executor,
-            // which chain stop can abandon. Never inline under the channel lock.
-            auto completion = co_await tips->async_receive(::asio::bind_immediate_executor(
-                ::asio::require(owner_, ::asio::execution::blocking.never),
-                ::asio::as_tuple(::asio::use_awaitable)));
-            auto const& [error, height, incoming, outgoing] = completion;
+        for (;;) {
+            // stop() cancels tip_watch_ after setting this, including fallback
+            // once the chain executor is already gone.
             if (stopped_) co_return;
-            if (error || chain_->stopped()) {
+            if (chain_->stopped() || ! tips->is_open()) {
                 stop();
                 co_return;
             }
-            wake_declarations();
+            bool tip = false;
+            bool failed = false;
+            for (;;) {
+                auto const pending = tips->try_receive(
+                    [&](std::error_code ec, size_t, auto, auto) {
+                        if (ec) failed = true;
+                        else tip = true;
+                    });
+                if ( ! pending || failed) break;
+            }
+            if (failed) {
+                stop();
+                co_return;
+            }
+            if (tip) wake_declarations();
+            if (stopped_) co_return;
+            tip_watch_.expires_after(tip_watch_interval);
+            auto [error] = co_await tip_watch_.async_wait(
+                ::asio::as_tuple(::asio::use_awaitable));
+            if (error == ::asio::error::operation_aborted) co_return;
         }
     };
     auto declarations = [&]() -> ::asio::awaitable<void> {
@@ -337,12 +353,12 @@ void jd_client::stop() {
         // before run() can return and destroy the client.
         if (owner_.running_in_this_thread()) {
             wake_declarations();
-            if (cancel_tips_) cancel_tips_();
+            tip_watch_.cancel();
             if (pool_live_) publish_solo();
         } else {
             ::asio::post(owner_, [this] {
                 wake_declarations();
-                if (cancel_tips_) cancel_tips_();
+                tip_watch_.cancel();
                 if (pool_live_) publish_solo();
             });
         }
