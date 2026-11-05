@@ -362,7 +362,7 @@ std::optional<declared_work> make_payout_work(blockchain::mining_template const&
     uint32_t locktime) {
     auto const target = domain::chain::compact::from_compact(tmpl.bits);
     if ( ! target || target->big() == 0 || tmpl.current_time < tmpl.min_time
-        || upstream_extranonce_size < 24 || upstream_extranonce_size > 32
+        || upstream_extranonce_size < jd_min_extranonce_size || upstream_extranonce_size > 32
         || upstream_prefix.size() > 32 - size_t{upstream_extranonce_size}
         || tmpl.selection.txs.size() > 65535) {
         return std::nullopt;
