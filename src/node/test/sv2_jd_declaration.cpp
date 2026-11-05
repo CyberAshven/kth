@@ -539,8 +539,19 @@ TEST_CASE("sv2 JD bounds local input and refuses replacing an outstanding declar
     REQUIRE(installed.declaration.empty());
     REQUIRE_FALSE(installed.mining.empty());
 
+    // A limit below the retained transactions is refused before allocation:
+    // the template could never be answered within its own consensus limit.
+    auto tiny = mining_template();
+    tiny.size_limit = 1;
+    jd_declaration refused("worker", true);
+    auto const refused_start = refused.start(tiny, channel());
+    require_failure(refused, refused_start);
+    REQUIRE(refused_start.error.find("consensus block size limit") != std::string::npos);
+
+    // A limit that holds the transactions but not the coinbase as well is
+    // refused when the coinbase is built from the allocation.
     auto small = mining_template();
-    small.size_limit = 1;
+    small.size_limit = small.selection.total_size;
     jd_declaration state("worker", true);
     REQUIRE(state.start(small, channel()).error.empty());
     require_failure(state, process(state, jd_peer::declaration, allocation()));
@@ -1313,4 +1324,100 @@ TEST_CASE("sv2 JD keeps BCH large template frames inert until negotiated", "[sv2
     REQUIRE(late.error.empty());
     REQUIRE(late.declaration.empty());
     REQUIRE(replaced.pending());
+}
+
+TEST_CASE("sv2 JD exact payout outputs refuse a coinbase version outside 1..2", "[sv2 jd]") {
+    for (uint32_t const version : {0u, 3u}) {
+        CAPTURE(version);
+        auto state = requesting();
+        auto success = payout_success(1, paid_outputs(), true);
+        success.coinbase_tx_version = version;
+        auto const result = process(state, jd_peer::declaration, success);
+        require_failure(state, result);
+        REQUIRE(result.error.find("coinbase_tx_version") != std::string::npos);
+        REQUIRE(state.has_template());
+    }
+}
+
+TEST_CASE("sv2 JD exact payout outputs refuse a coinbase that is not final", "[sv2 jd]") {
+    auto const height = static_cast<uint32_t>(mining_template().height);
+    REQUIRE(height > 0);
+
+    auto refused = requesting();
+    auto not_final = payout_success(1, paid_outputs(), true);
+    not_final.coinbase_tx_locktime = height;
+    not_final.coinbase_tx_input_sequence = 0xfffffffeu;
+    auto const result = process(refused, jd_peer::declaration, not_final);
+    require_failure(refused, result);
+    REQUIRE(result.error.find("coinbase_tx_locktime") != std::string::npos);
+    REQUIRE(result.error.find("not final") != std::string::npos);
+    REQUIRE(refused.has_template());
+
+    auto finalized = requesting();
+    auto max_sequence = payout_success(1, paid_outputs(), true);
+    max_sequence.coinbase_tx_locktime = height;
+    max_sequence.coinbase_tx_input_sequence = 0xffffffffu;
+    auto const accepted = process(finalized, jd_peer::declaration, max_sequence);
+    REQUIRE(accepted.error.empty());
+    REQUIRE(accepted.progress);
+    auto const job = decode<declare_mining_job>(accepted.declaration);
+    auto const tx = declared_coinbase(job.coinbase_tx_prefix, job.coinbase_tx_suffix);
+    REQUIRE(tx.version() == 2);
+    REQUIRE(tx.locktime() == height);
+    REQUIRE(tx.inputs().size() == 1);
+    REQUIRE(tx.inputs().front().sequence() == 0xffffffffu);
+    REQUIRE(finalized.work());
+    REQUIRE(finalized.work()->coinbase_locktime == height);
+    REQUIRE(finalized.work()->coinbase_input_sequence == 0xffffffffu);
+
+    // height - 1 is the lock time the pool sends (below the block height).
+    auto below = requesting();
+    auto earlier = payout_success(1, paid_outputs(), true);
+    earlier.coinbase_tx_locktime = height - 1;
+    earlier.coinbase_tx_input_sequence = 0xfffffffeu;
+    auto const pool = process(below, jd_peer::declaration, earlier);
+    REQUIRE(pool.error.empty());
+    REQUIRE(pool.progress);
+    auto const declared = decode<declare_mining_job>(pool.declaration);
+    auto const coinbase = declared_coinbase(declared.coinbase_tx_prefix, declared.coinbase_tx_suffix);
+    REQUIRE(coinbase.locktime() == height - 1);
+    REQUIRE(coinbase.inputs().front().sequence() == 0xfffffffeu);
+    REQUIRE(below.work()->coinbase_locktime == height - 1);
+    REQUIRE(below.work()->coinbase_input_sequence == 0xfffffffeu);
+}
+
+TEST_CASE("sv2 JD supplies missing transactions after a stale notice, then allocates again", "[sv2 jd]") {
+    auto state = requesting();
+    auto const declared = process(state, jd_peer::declaration, payout_success(1, paid_outputs(), true));
+    REQUIRE(declared.error.empty());
+    REQUIRE(decode<declare_mining_job>(declared.declaration).request_id == 1);
+    REQUIRE(state.pending());
+
+    auto const notice = process(state, jd_peer::declaration, payout_outputs_stale{});
+    REQUIRE(notice.error.empty());
+    REQUIRE(notice.declaration.empty());
+    REQUIRE(notice.mining.empty());
+    REQUIRE(state.pending());
+
+    auto const expected = std::vector<data_chunk>{
+        transaction_bytes(state.template_value().selection.txs[2]),
+        transaction_bytes(state.template_value().selection.txs[0])};
+    auto const missing = process(state, jd_peer::declaration, provide_missing_transactions{1, {2, 0}});
+    REQUIRE(missing.error.empty());
+    REQUIRE(missing.mining.empty());
+    REQUIRE_FALSE(missing.progress);
+    auto const response = decode<provide_missing_transactions_success>(missing.declaration);
+    REQUIRE(response.request_id == 1);
+    REQUIRE(response.transaction_list == expected);
+
+    auto const success = process(state, jd_peer::declaration, declare_mining_job_success{1, {9, 8}});
+    REQUIRE(success.error.empty());
+    REQUIRE(success.progress);
+    REQUIRE(success.mining.empty());
+    REQUIRE_FALSE(success.accepted);
+    auto const again = decode<allocate_mining_job_token>(success.declaration);
+    REQUIRE(again.request_id == 2);
+    REQUIRE(again.user_identifier == "account.worker");
+    REQUIRE(state.pending());
+    REQUIRE_FALSE(state.work());
 }
