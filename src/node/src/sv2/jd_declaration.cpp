@@ -112,6 +112,10 @@ bool jd_declaration::can_push_solution() const {
     return full_template_ && (state_ == state::installing || state_ == state::accepted);
 }
 
+bool jd_declaration::full_template() const {
+    return full_template_;
+}
+
 void jd_declaration::supersede() {
     if ( ! pending()) return;
     state_ = state::idle;
@@ -440,6 +444,7 @@ jd_declaration::result jd_declaration::process(jd_peer peer,
             }
             if (restart_) return retry_allocation();
             work_->upstream_job_id = message->job_id;
+            work_->upstream_accepted = true;
             state_ = state::accepted;
             transactions_.clear();
             result out;
