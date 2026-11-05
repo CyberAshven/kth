@@ -264,9 +264,11 @@ uses plaintext. A different signing authority, a certificate outside its
 validity window or an unauthenticated frame ends that attempt.
 
 The Mining connection requests work selection and version rolling, then opens
-one extended channel with the configured identity. The channel must leave at
-least 24 extranonce bytes for local channel allocation and miners, and its
-prefix plus extranonce must fit 32 bytes. A fixed-version upstream is refused.
+one extended channel with the configured identity. It requests eight extranonce
+bytes: four for local channel allocation and four reserved for downstream
+miners to roll. Grants of eight bytes, including behind a four-byte pool prefix,
+and larger grants are accepted when the prefix plus extranonce fits 32 bytes.
+A fixed-version upstream is refused.
 The node retains its own transaction selection; jobs supplied by the pool do
 not replace local work.
 
@@ -292,13 +294,17 @@ empty because there is no witness reserved value to carry.
 
 Downstream miners keep mining that same template through the Mining Protocol
 server. Until a pool coinbase is ready, and again after fallback, they are
-paid `sv2.mining.address`. When the pool coinbase is installed, a channel whose
-rollable extranonce still leaves at least four bytes inside the upstream
-extranonce nests its channel id there and receives `SetExtranoncePrefix` before
-the next job. A channel that cannot nest keeps the solo payout so one miner
-cannot drop the others. The scriptSig generation and the extranonce prefix
-return to the solo channel's own values on fallback; the template's
-transactions do not change.
+paid `sv2.mining.address`. With JD enabled, extended channels open with a fixed
+four-byte rollable reserve. When the pool coinbase is installed, each accepted
+channel nests inside the upstream extranonce and receives `SetExtranoncePrefix`
+before the next job. A downstream request for more than four rollable bytes is
+refused with `min-extranonce-size-too-large`, even before the upstream channel
+exists. Standard channels need no rollable bytes and also receive pool jobs.
+Any upstream space beyond the downstream roll is used for local allocation,
+so every accepted channel fits the grant. With JD disabled, the Mining Protocol
+sizes described above are unchanged. The scriptSig generation and the
+extranonce prefix return to the solo channel's own values on fallback; the
+template's transactions do not change.
 
 Pool and solo payout changes wake connected miners when they are published.
 The listener does not poll for those changes, and stopping it joins every
@@ -306,7 +312,8 @@ connection even while the upstreams are quiet or Job Declaration is disabled.
 
 A share that meets the upstream channel's target is forwarded as
 `SubmitSharesExtended` with the custom job id and the extranonce bytes after
-the pool's prefix. A share that does not meet that target is not forwarded.
+the pool's prefix, using exactly the granted extranonce size. A share that does
+not meet that target is not forwarded.
 The target is the one the custom job was sent with; a later `SetTarget` does
 not retarget it. A share that meets the network target is submitted locally
 through the same block-connection path as solo mining. In `full-template`,
@@ -367,7 +374,9 @@ the configured list: connecting, probing, ready, recovered or demoted, with
 the last error and retry hold on failure. Authentication holds,
 disabled-until-restart entries and dishonest pools are distinguished. Payout
 fallback and an all-unavailable list are logged as solo. No new RPC method is
-required for this status.
+required for this status. Setup and extended-channel refusals include the
+upstream's error code in that log, bounded in length and restricted to
+printable ASCII.
 
 Both connections run independently of the listener, the template build and
 downstream miners. A slow or silent upstream cannot hold those up: solo jobs

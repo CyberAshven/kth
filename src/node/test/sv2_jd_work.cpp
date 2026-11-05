@@ -18,9 +18,13 @@
 #include <kth/infrastructure/utility/endian.hpp>
 #include <kth/node/mining/block_submit.hpp>
 #include <kth/node/mining/work.hpp>
+#include <kth/node/sv2/connection.hpp>
+#include <kth/node/sv2/mining_messages.hpp>
+#include <kth/node/sv2/mining_session.hpp>
 
 using namespace kth;
 using namespace kth::node::mining;
+namespace sv2 = kth::node::sv2;
 
 namespace {
 
@@ -55,6 +59,72 @@ domain::chain::transaction coinbase(declared_work const& work, data_chunk const&
     REQUIRE(tx.has_value());
     REQUIRE(source.is_exhausted());
     return std::move(*tx);
+}
+
+hash_digest maximum_target() {
+    hash_digest value;
+    value.fill(0xff);
+    return value;
+}
+
+open_request channel_request(uint32_t id, channel_kind kind, uint16_t minimum = 0) {
+    open_request value;
+    value.request_id = id;
+    value.kind = kind;
+    value.max_target = maximum_target();
+    value.min_extranonce_size = minimum;
+    return value;
+}
+
+share_request channel_share(work_job const& job, uint16_t rollable) {
+    share_request value;
+    value.extended = job.extended;
+    value.channel_id = job.channel_id;
+    value.job_id = job.job_id;
+    value.ntime = job.ntime_start;
+    value.version = job.version;
+    value.extranonce.assign(rollable, 0x44);
+    return value;
+}
+
+sv2::mining_session::result mining_process(sv2::mining_session& session,
+    uint16_t extension, uint8_t type, data_chunk const& payload) {
+    return session.process({extension, type, static_cast<uint32_t>(payload.size())}, payload);
+}
+
+template <typename Message>
+sv2::mining_session::result mining_process(sv2::mining_session& session, Message const& message) {
+    uint16_t extension = 0;
+    if constexpr (requires { Message::channel_message; }) {
+        if (Message::channel_message) extension = sv2::message_header::channel_msg_flag;
+    }
+    return mining_process(session, extension, Message::message_type, to_data_chunk(message));
+}
+
+sv2::mining_session mining_ready(std::shared_ptr<uint64_t> allocations) {
+    sv2::mining_session session(1, domain::chain::script(data_chunk{0x51}, false),
+        std::move(allocations));
+    sv2::setup_connection setup;
+    setup.protocol = sv2::setup_connection::protocol_mining;
+    setup.min_version = 2;
+    setup.max_version = 2;
+    REQUIRE_FALSE(mining_process(session, setup).close);
+    return session;
+}
+
+template <typename Message>
+Message first_message(data_chunk const& bytes) {
+    byte_reader source(bytes);
+    auto const header = sv2::message_header::from_data(source);
+    REQUIRE(header);
+    REQUIRE(header->msg_type == Message::message_type);
+    auto const payload = source.read_bytes(header->msg_length);
+    REQUIRE(payload);
+    byte_reader message_source(*payload);
+    auto const message = Message::from_data(message_source);
+    REQUIRE(message);
+    REQUIRE(message_source.is_exhausted());
+    return *message;
 }
 
 } // namespace
@@ -134,7 +204,7 @@ TEST_CASE("JD coinbase generations and extranonce bounds preserve declared field
     REQUIRE(coinbase(*first, data_chunk(32, 0x42)).hash()
         != coinbase(*second, data_chunk(32, 0x42)).hash());
     REQUIRE(make_declared_work(tmpl, pool_outputs, 1, data_chunk(8, 0x42), 24));
-    for (auto const size : {uint16_t{0}, uint16_t{23}, uint16_t{33}, uint16_t{65535}}) {
+    for (auto const size : {uint16_t{0}, uint16_t{jd_min_extranonce_size - 1}, uint16_t{33}, uint16_t{65535}}) {
         REQUIRE_FALSE(make_declared_work(tmpl, pool_outputs, 1, {}, size));
     }
     REQUIRE_FALSE(make_declared_work(tmpl, pool_outputs, 1, {0x42}, 32));
@@ -354,4 +424,191 @@ TEST_CASE("sv2 JD pool work nests in the upstream extranonce and solo work resto
     restored_share.version = restored_nested.version;
     restored_share.extranonce.assign(nested_open.extranonce_size, 0x45);
     REQUIRE_FALSE(engine.submit(restored_share).pool);
+}
+
+TEST_CASE("sv2 JD downstream reserve fits an eight-byte pool grant", "[sv2 jd]") {
+    // Four pool-prefix bytes plus an eight-byte grant, as P2Pool sends, leave
+    // four bytes of shared allocation and four bytes for the miner to roll.
+    // A standard channel rolls nothing and still fits in that grant.
+    auto const counter = std::make_shared<uint64_t>(0);
+    work_engine engine(0x0102030405060708ull, counter);
+    auto const standard = engine.open(channel_request(1, channel_kind::standard));
+    auto const extended = engine.open(channel_request(2, channel_kind::extended, 0));
+    REQUIRE(standard.status == open_status::opened);
+    REQUIRE(extended.status == open_status::opened);
+    REQUIRE(extended.extranonce_size == 4);
+
+    auto const tmpl = mining_template();
+    auto const pool_outputs = outputs(tmpl.coinbase_value);
+    short_hash solo_hash{};
+    solo_hash.fill(0x43);
+    domain::chain::output::list const solo_outputs{{tmpl.coinbase_value,
+        domain::chain::script(domain::chain::script::to_pay_public_key_hash_pattern(solo_hash)),
+        std::nullopt}};
+    data_chunk const pool_prefix(4, 0x12);
+    pool_binding const binding{pool_prefix, 8, 7};
+    auto const jobs = engine.on_pool_template(tmpl, pool_outputs, solo_outputs, binding);
+    REQUIRE(jobs);
+    REQUIRE(jobs->size() == 2);
+    auto const& standard_job = jobs->front().channel_id == standard.channel_id
+        ? jobs->front() : jobs->back();
+    auto const& extended_job = jobs->front().channel_id == extended.channel_id
+        ? jobs->front() : jobs->back();
+    REQUIRE(standard_job.extranonce_prefix_update);
+    REQUIRE(extended_job.extranonce_prefix_update);
+    REQUIRE(standard_job.extranonce_prefix_update->size() >= pool_prefix.size());
+    REQUIRE(extended_job.extranonce_prefix_update->size() == pool_prefix.size() + jd_allocation_size);
+    REQUIRE(std::equal(pool_prefix.begin(), pool_prefix.end(),
+        standard_job.extranonce_prefix_update->begin()));
+    REQUIRE(std::equal(pool_prefix.begin(), pool_prefix.end(),
+        extended_job.extranonce_prefix_update->begin()));
+    auto const declared = make_declared_work(tmpl, pool_outputs, binding.generation,
+        pool_prefix, binding.extranonce_size);
+    REQUIRE(declared);
+    REQUIRE(standard_job.coinbase_tx_prefix == declared->coinbase_tx_prefix);
+    REQUIRE(standard_job.coinbase_tx_suffix == declared->coinbase_tx_suffix);
+    REQUIRE(extended_job.coinbase_tx_prefix == declared->coinbase_tx_prefix);
+    REQUIRE(extended_job.coinbase_tx_suffix == declared->coinbase_tx_suffix);
+
+    auto const outcome = engine.submit(channel_share(extended_job, extended.extranonce_size));
+    REQUIRE(outcome.status != share_status::rejected);
+    REQUIRE(outcome.pool);
+    REQUIRE(outcome.pool->upstream_extranonce.size() == 8);
+}
+
+TEST_CASE("sv2 JD downstream reserve works for every grant from 8 to 32 bytes", "[sv2 jd]") {
+    // The miner's roll stays four bytes. Bytes beyond that, up to the 32-byte
+    // extranonce cap, are the local allocation. An empty pool prefix keeps
+    // prefix plus grant inside that cap for every size in this range.
+    auto const counter = std::make_shared<uint64_t>(0);
+    work_engine engine(0x0102030405060708ull, counter);
+    auto const extended = engine.open(channel_request(1, channel_kind::extended, 0));
+    REQUIRE(extended.status == open_status::opened);
+    REQUIRE(extended.extranonce_size == 4);
+
+    auto const tmpl = mining_template();
+    auto const pool_outputs = outputs(tmpl.coinbase_value);
+    short_hash solo_hash{};
+    solo_hash.fill(0x43);
+    domain::chain::output::list const solo_outputs{{tmpl.coinbase_value,
+        domain::chain::script(domain::chain::script::to_pay_public_key_hash_pattern(solo_hash)),
+        std::nullopt}};
+    for (uint16_t size = 8; size <= 32; ++size) {
+        CAPTURE(size);
+        REQUIRE(extended.extranonce_size == 4);
+        data_chunk const pool_prefix;
+        REQUIRE(pool_prefix.size() + size <= 32);
+        pool_binding const binding{pool_prefix, size, 7};
+        auto const jobs = engine.on_pool_template(tmpl, pool_outputs, solo_outputs, binding);
+        REQUIRE(jobs);
+        REQUIRE(jobs->size() == 1);
+        auto const& job = jobs->front();
+        REQUIRE(job.channel_id == extended.channel_id);
+        REQUIRE(job.extranonce_prefix_update);
+        REQUIRE(job.extranonce_prefix_update->size() + extended.extranonce_size == size);
+        auto const declared = make_declared_work(tmpl, pool_outputs, binding.generation,
+            binding.prefix, binding.extranonce_size);
+        REQUIRE(declared);
+        REQUIRE(job.coinbase_tx_prefix == declared->coinbase_tx_prefix);
+        REQUIRE(job.coinbase_tx_suffix == declared->coinbase_tx_suffix);
+        auto const outcome = engine.submit(channel_share(job, extended.extranonce_size));
+        REQUIRE(outcome.status != share_status::rejected);
+        REQUIRE(outcome.pool);
+        REQUIRE(outcome.pool->upstream_extranonce.size() == size);
+    }
+}
+
+TEST_CASE("sv2 JD refuses a downstream request above the reserve", "[sv2 jd]") {
+    // The four-byte roll is fixed before any upstream channel exists. Asking
+    // for five is min-extranonce-size-too-large; asking for four opens.
+    // A refusal still records the request id, so the accepted open uses another.
+    auto const counter = std::make_shared<uint64_t>(0);
+    work_engine engine(1, counter);
+    auto const refused = engine.open(channel_request(1, channel_kind::extended, 5));
+    REQUIRE(refused.status == open_status::rejected);
+    REQUIRE(refused.error_code == error_extranonce_too_large);
+    auto const opened = engine.open(channel_request(2, channel_kind::extended, 4));
+    REQUIRE(opened.status == open_status::opened);
+    REQUIRE(opened.extranonce_size == 4);
+}
+
+TEST_CASE("sv2 JD connections sharing the counter get distinct allocations", "[sv2 jd]") {
+    // Channel ids restart on every connection. The shared counter is what
+    // puts a different four bytes after the same pool prefix.
+    auto const counter = std::make_shared<uint64_t>(0);
+    work_engine left(0x0102030405060708ull, counter);
+    work_engine right(0x1112131415161718ull, counter);
+    auto const left_open = left.open(channel_request(1, channel_kind::extended, 0));
+    auto const right_open = right.open(channel_request(1, channel_kind::extended, 0));
+    REQUIRE(left_open.status == open_status::opened);
+    REQUIRE(right_open.status == open_status::opened);
+
+    auto const tmpl = mining_template();
+    auto const pool_outputs = outputs(tmpl.coinbase_value);
+    short_hash solo_hash{};
+    solo_hash.fill(0x43);
+    domain::chain::output::list const solo_outputs{{tmpl.coinbase_value,
+        domain::chain::script(domain::chain::script::to_pay_public_key_hash_pattern(solo_hash)),
+        std::nullopt}};
+    pool_binding const binding{data_chunk(4, 0x12), 8, 7};
+    auto const left_jobs = left.on_pool_template(tmpl, pool_outputs, solo_outputs, binding);
+    auto const right_jobs = right.on_pool_template(tmpl, pool_outputs, solo_outputs, binding);
+    REQUIRE(left_jobs);
+    REQUIRE(right_jobs);
+    REQUIRE(left_jobs->size() == 1);
+    REQUIRE(right_jobs->size() == 1);
+    REQUIRE(left_jobs->front().channel_id == left_open.channel_id);
+    REQUIRE(right_jobs->front().channel_id == right_open.channel_id);
+    auto const& left_prefix = left_jobs->front().extranonce_prefix_update;
+    auto const& right_prefix = right_jobs->front().extranonce_prefix_update;
+    REQUIRE(left_prefix);
+    REQUIRE(right_prefix);
+    REQUIRE(left_prefix->size() == binding.prefix.size() + jd_allocation_size);
+    REQUIRE(right_prefix->size() == binding.prefix.size() + jd_allocation_size);
+    REQUIRE(*left_prefix != *right_prefix);
+    REQUIRE(std::equal(binding.prefix.begin(), binding.prefix.end(), left_prefix->begin()));
+    REQUIRE(std::equal(binding.prefix.begin(), binding.prefix.end(), right_prefix->begin()));
+    auto const first_allocation = to_little_endian(uint32_t{0});
+    auto const second_allocation = to_little_endian(uint32_t{1});
+    REQUIRE(std::equal(first_allocation.begin(), first_allocation.end(),
+        left_prefix->begin() + static_cast<std::ptrdiff_t>(binding.prefix.size())));
+    REQUIRE(std::equal(second_allocation.begin(), second_allocation.end(),
+        right_prefix->begin() + static_cast<std::ptrdiff_t>(binding.prefix.size())));
+    REQUIRE(*counter == 2);
+}
+
+TEST_CASE("sv2 JD reserve leaves solo sizing unchanged when JD is disabled", "[sv2 jd]") {
+    // No allocation counter means JD is off. An extended channel that asks
+    // for no minimum still receives the solo twelve-byte roll.
+    work_engine engine(1, nullptr);
+    auto const opened = engine.open(channel_request(1, channel_kind::extended, 0));
+    REQUIRE(opened.status == open_status::opened);
+    REQUIRE(opened.extranonce_size == extranonce_prefix_size);
+}
+
+TEST_CASE("sv2 JD mining session serves the four-byte downstream reserve", "[sv2 jd]") {
+    // Open*Success is held until a template is current, and then it is the
+    // first frame of the open reply. Five rollable bytes is an error frame
+    // instead, with the same code the engine returns.
+    auto const counter = std::make_shared<uint64_t>(0);
+    auto session = mining_ready(counter);
+    REQUIRE_FALSE(session.apply(mining_template()).close);
+    sv2::open_extended_mining_channel request;
+    request.request_id = 1;
+    request.user_identity = "miner";
+    request.max_target = maximum_target();
+    request.min_extranonce_size = 0;
+    auto const opened = mining_process(session, request);
+    REQUIRE_FALSE(opened.close);
+    auto const success = first_message<sv2::open_extended_mining_channel_success>(opened.response);
+    REQUIRE(success.request_id == request.request_id);
+    REQUIRE(success.extranonce_size == 4);
+
+    request.request_id = 2;
+    request.min_extranonce_size = 5;
+    auto const refused = mining_process(session, request);
+    REQUIRE_FALSE(refused.close);
+    auto const error = first_message<sv2::open_mining_channel_error>(refused.response);
+    REQUIRE(error.request_id == request.request_id);
+    REQUIRE(error.error_code == error_extranonce_too_large);
 }

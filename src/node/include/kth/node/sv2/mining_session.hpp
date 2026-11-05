@@ -6,6 +6,7 @@
 #define KTH_NODE_SV2_MINING_SESSION_HPP
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -31,7 +32,8 @@ struct mining_session {
         std::optional<mining::pool_proof> pool;
     };
 
-    mining_session(uint64_t connection_salt, domain::chain::script payout);
+    mining_session(uint64_t connection_salt, domain::chain::script payout,
+        std::shared_ptr<uint64_t> pool_allocations = {});
 
     [[nodiscard]]
     result process(message_header const& header, byte_span payload);
@@ -40,9 +42,8 @@ struct mining_session {
     [[nodiscard]]
     result apply(blockchain::mining_template value);
 
-    // Pool coinbase for channels that fit in the declared extranonce. A channel
-    // that cannot nest keeps `sv2.mining.address`. The template selection is
-    // the same one solo work uses.
+    // With JD's downstream reserve every channel fits the declared extranonce.
+    // The template selection is the same one solo work uses.
     [[nodiscard]]
     result apply_pool(mining::declared_work const& work);
 

@@ -322,9 +322,16 @@ void jd_client::start_attempt(size_t index, bool probe) {
     using namespace ::asio::experimental::awaitable_operators;
 
     // Subscribe before the first snapshot so a completed transition cannot
-    // leave the declaration loop asleep on an older tip.
-    auto tips = chain_ ? chain_->subscribe_blockchain() : nullptr;
-    auto const end_tips = [&] {
+    // leave the declaration loop asleep on an older tip. The channel's
+    // executor is this strand: a completion, including the close notice, is
+    // posted there. Chain stop closes subscribers and then stops the chain
+    // executor, so a receive posted on that executor never resumes.
+    auto tips = chain_
+        ? chain_->subscribe_blockchain(::asio::any_io_executor(owner_))
+        : nullptr;
+    // Invoked only on owner_: by the schedule's exit, which stop() wakes,
+    // and by the cleanup.
+    auto const end_tips = [tips] {
         if (tips) {
             tips->cancel();
             tips->close();
@@ -340,10 +347,11 @@ void jd_client::start_attempt(size_t index, bool probe) {
     }
     auto receive_tips = [&]() -> ::asio::awaitable<void> {
         if ( ! tips) co_return;
-        for (;;) {
+        while ( ! stopped_) {
             auto [error, height, incoming, outgoing] = co_await tips->async_receive(
                 ::asio::as_tuple(::asio::use_awaitable));
-            if (error) {
+            if (stopped_) co_return;
+            if (error || chain_->stopped()) {
                 stop();
                 co_return;
             }
