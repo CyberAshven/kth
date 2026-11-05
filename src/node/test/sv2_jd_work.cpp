@@ -282,6 +282,28 @@ TEST_CASE("JD coinbase refuses invalid templates and respects exact block size",
     REQUIRE_FALSE(make_declared_work(tmpl, pool_outputs, 1, {}, 24));
 }
 
+TEST_CASE("sv2 JD coinbase-only declared work accepts more than 65535 transactions", "[sv2 jd]") {
+    // DeclareMiningJob's txid list is SEQ0_64K. This builder sends the merkle
+    // path, so a template the node can mine is not rejected for that count.
+    auto tmpl = mining_template();
+    constexpr uint32_t tx_count = 65536;
+    tmpl.selection.txs.reserve(tx_count);
+    for (uint32_t i = 0; i < tx_count; ++i) {
+        tmpl.selection.txs.push_back(std::make_shared<domain::message::transaction>(
+            domain::chain::transaction{1, i, {}, {}}));
+    }
+    auto const pool_outputs = outputs(tmpl.coinbase_value);
+    auto const work = make_declared_work(tmpl, pool_outputs, 1, {}, 24);
+    REQUIRE(work.has_value());
+    auto const tx = coinbase(*work, data_chunk(24, 0));
+    auto root = tx.hash();
+    for (auto const& sibling : work->merkle_path) {
+        root = bitcoin_hash(build_chunk({root, sibling}));
+    }
+    auto const block = assemble_block(domain::chain::header{}, tx, tmpl.selection.txs);
+    REQUIRE(root == block.generate_merkle_root());
+}
+
 TEST_CASE("sv2 JD pool work nests in the upstream extranonce and solo work restores it", "[sv2 jd]") {
     // The pool reconstructs P || N. A downstream channel keeps the rollable
     // width from its Open*Success and puts its id in the bytes between P and
