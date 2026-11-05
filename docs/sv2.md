@@ -210,8 +210,10 @@ failover and Stratum V1 are separate features.
 
 Job Declaration is off by default (`sv2.jd.enabled=false`). Enabling it requires
 the listener, Mining Protocol and its valid solo payout address, both upstream
-addresses and pinned Noise authority keys, a user identity and an explicit
-mode. Invalid enabled settings stop startup before the chain or listener starts.
+addresses and pinned Noise authority keys and a user identity. `sv2.jd.mode`
+defaults to `coinbase-only`, which sends the pool a merkle path instead of the
+transaction list, so no SV2 message limit bounds the template. Invalid enabled
+settings stop startup before the chain or listener starts.
 Dormant JD settings are ignored when JD is disabled. The solo fallback pays
 `sv2.mining.address`.
 
