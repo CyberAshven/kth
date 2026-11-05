@@ -1338,7 +1338,8 @@ TEST_CASE("sv2 JD forwards a share that meets the upstream target and connects a
     REQUIRE(forwarded.version == declared.pooled.job.version);
     data_chunk full = declared.pooled.prefix;
     full.insert(full.end(), extranonce.begin(), extranonce.end());
-    REQUIRE(full.size() == 32);
+    // The pool's 8-byte prefix and its whole grant.
+    REQUIRE(full.size() == 8 + jd_session::min_extranonce_size);
     REQUIRE(forwarded.extranonce == data_chunk(full.begin() + 8, full.end()));
     if (pushed) {
         REQUIRE(pushed->extranonce == full);
