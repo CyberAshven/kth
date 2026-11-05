@@ -306,6 +306,8 @@ public:
 
     /// Get the channel that receives peer lifecycle events (CSP pattern)
     /// Use this to subscribe to peer connection/disconnection events.
+    /// Connected / disconnected peers, a select_channel: the consumer waits
+    /// on it with stop_token() (no timer race), producers use try_send.
     [[nodiscard]]
     select_channel<peer_notification>& peer_events();
 

@@ -542,12 +542,9 @@ struct remote_peer {
 ::asio::awaitable<void> route_messages(network::peer_session& peer, std::atomic<size_t>& pings_seen) {
     auto ex = co_await ::asio::this_coro::executor;
     while (true) {
-        auto completion = co_await ::asio::experimental::make_select(
-            ::asio::experimental::receive(peer.messages())
-        ).async_wait(ex, {}, std::stop_token{}, ::asio::as_tuple(::asio::deferred));
-        auto& [ec, selected] = completion;
-        if (ec) co_return;
-        auto raw = std::move(*selected.value<0>());
+        auto received = co_await peer.receive();
+        if (!received) co_return;
+        auto raw = std::move(*received);
         if (raw.heading.command() == domain::message::block::command) {
             auto handed = co_await ::asio::experimental::make_select(
                 ::asio::experimental::send(peer.block_responses(), std::move(raw))

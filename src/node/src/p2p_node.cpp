@@ -788,6 +788,12 @@ select_channel<peer_notification>& p2p_node::peer_events() {
         // Run the seeding protocol using structured concurrency:
         // peer->run() && seeding_protocol()
         // This eliminates the need for detached coroutines!
+        //
+        // On the session's strand, not the pool: run() itself races its
+        // loops with operator||, and a parallel group's cancellation is
+        // emitted from the first completion handler without synchronisation,
+        // so everything in the group has to complete on one strand.
+        co_await ::asio::co_spawn(peer->get_executor(), [&]() -> ::asio::awaitable<void> {
         co_await (
             peer->run() &&
             [&]() -> ::asio::awaitable<void> {
@@ -825,11 +831,13 @@ select_channel<peer_notification>& p2p_node::peer_events() {
                 constexpr size_t minimum_useful_addresses = 10;
 
                 while (!peer->stopped()) {
-                    auto msg_result = co_await wait_for_any_message(*peer, deadline);
-                    if ( ! msg_result) {
+                    // The next message or the deadline (one selection); the
+                    // session closing the channel ends the loop as well.
+                    auto received = co_await peer->receive(deadline);
+                    if (!received) {
                         break;
                     }
-                    auto& raw = *msg_result;
+                    auto& raw = *received;
 
                     auto const& command = raw.heading.command();
                     if (command == domain::message::address::command ||
@@ -887,6 +895,7 @@ select_channel<peer_notification>& p2p_node::peer_events() {
                 peer->stop();
             }()
         );
+        }, ::asio::use_awaitable);
     } catch (std::exception const& e) {
         spdlog::debug("[p2p_node] Seed {} exception: {}", seed_host, e.what());
     }
@@ -971,20 +980,24 @@ select_channel<peer_notification>& p2p_node::peer_events() {
     auto last_ping = std::chrono::steady_clock::now();
 
     while (!peer->stopped() && !stopped()) {
-        // Use short check_interval for responsive shutdown, but track ping timing separately
-        // Wait for message or check deadline: one selection, so a deadline
-        // that fires with a message ready leaves it for the next iteration.
-        auto result = co_await wait_for_any_message(*peer,
-            std::chrono::steady_clock::now() + check_interval);
+        // The next message or a short deadline (one selection): the short
+        // interval keeps the stopped flags checked promptly, ping timing is
+        // tracked separately. A deadline that fires with a message ready
+        // leaves it for the next iteration.
+        auto received = co_await peer->receive(std::chrono::steady_clock::now() + check_interval);
 
         if (peer->stopped() || stopped()) {
             spdlog::debug("[p2p_node:protocols] [{}] Breaking due to stopped flag", peer->authority());
             break;
         }
 
-        if ( ! result && result.error() == error::channel_timeout) {
-            // Timer expired - check if we need to send ping
-            // Check if it's time to send a ping
+        if (!received && received.error() != error::channel_timeout) {
+            spdlog::debug("[p2p_node:protocols] [{}] Message receive error: {}", peer->authority(), received.error().message());
+            break;
+        }
+
+        if (!received) {
+            // Deadline - check if we need to send a ping
             auto now = std::chrono::steady_clock::now();
             if (now - last_ping >= ping_interval) {
                 auto const nonce = generate_ping_nonce();
@@ -1003,11 +1016,7 @@ select_channel<peer_notification>& p2p_node::peer_events() {
         }
 
         // Message received
-        if ( ! result) {
-            spdlog::debug("[p2p_node:protocols] [{}] Message receive error: {}", peer->authority(), result.error().message());
-            break;
-        }
-        auto& raw = *result;
+        auto& raw = *received;
 
         auto const& command = raw.heading.command();
 
@@ -1403,7 +1412,12 @@ void p2p_node::wake_status_task() noexcept {
         auto task_name = fmt::format("peer_{}_{}:{}",
             direction == peer_direction::inbound ? "in" : "out",
             peer->authority(), peer_task_counter_.fetch_add(1));
-        peer_tasks.spawn(task_name, [this, peer, direction, response_channel]() -> ::asio::awaitable<void> {
+        // On the session's strand, not the pool: run() races its loops with
+        // operator||, and a parallel group's cancellation is emitted from the
+        // first completion handler without synchronisation, so everything in
+        // the group has to complete on one strand. The channel waits of the
+        // handshake and the protocols are selections and need no strand.
+        peer_tasks.spawn(task_name, ::asio::co_spawn(peer->get_executor(), [this, peer, direction, response_channel]() -> ::asio::awaitable<void> {
             try {
                 co_await (
                     [&]() -> ::asio::awaitable<void> {
@@ -1535,7 +1549,7 @@ void p2p_node::wake_status_task() noexcept {
             }
 
             spdlog::debug("[p2p_node] Peer [{}] full lifecycle completed", peer->authority());
-        });
+        }, ::asio::use_awaitable));
     }
 
     spdlog::debug("[p2p_node] peer_supervisor stopping {} spawned peers before join",

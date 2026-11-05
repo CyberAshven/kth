@@ -119,12 +119,13 @@ awaitable_expected<Message> wait_for_message(
     peer_session& peer,
     std::chrono::seconds timeout)
 {
-    auto result = co_await wait_for_any_message(peer, timeout);
-    if ( ! result) {
-        co_return std::unexpected(result.error());
+    // One selection: the message, or the deadline (channel_timeout), or the
+    // session closing the channel (channel_stopped).
+    auto received = co_await peer.receive(std::chrono::steady_clock::now() + timeout);
+    if (!received) {
+        co_return std::unexpected(received.error());
     }
-
-    auto const& raw = *result;
+    auto& raw = *received;
 
     // Check command matches expected type
     if (raw.heading.command() != Message::command) {

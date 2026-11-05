@@ -36,7 +36,8 @@ awaitable_expected<raw_message> wait_for_any_message(
     // `receive || timer`, which lost that message, and whose cancellation of
     // the loser raced the loser's completion on the network's thread pool
     // (#772). A selection owns its timer and serializes its own steps, and a
-    // stop request may come from any thread.
+    // stop request may come from any thread. peer.receive() is the same
+    // selection without a caller stop token.
     auto executor = co_await ::asio::this_coro::executor;
     auto completion = co_await ::asio::experimental::make_select(
         ::asio::experimental::receive(peer.messages()),
@@ -58,7 +59,7 @@ awaitable_expected<raw_message> wait_for_any_message(
     peer_session& peer,
     std::chrono::seconds timeout)
 {
-    co_return co_await wait_for_any_message(peer, std::chrono::steady_clock::now() + timeout);
+    co_return co_await peer.receive(std::chrono::steady_clock::now() + timeout);
 }
 
 // =============================================================================
@@ -303,38 +304,22 @@ awaitable_expected<handshake_result> perform_handshake_direct_on_strand(
     domain::message::version::const_ptr peer_version;
 
     auto deadline = std::chrono::steady_clock::now() + config.timeout;
-    auto executor = co_await ::asio::this_coro::executor;
 
     while (!got_version || !got_verack) {
-        auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
-            deadline - std::chrono::steady_clock::now());
-
-        if (remaining <= 0s) {
+        if (std::chrono::steady_clock::now() >= deadline) {
             spdlog::debug("[protocol] Handshake timeout with [{}]", authority);
             co_return std::unexpected(error::channel_timeout);
         }
 
-        // Read message directly from socket with timeout
-        // Use racing pattern with timer
-        ::asio::steady_timer timer(executor, remaining);
-
-        auto result = co_await (
-            peer.read_message_direct() ||
-            timer.async_wait(::asio::as_tuple(::asio::use_awaitable))
-        );
-
-        // Check which completed first
-        if (result.index() == 1) {
-            // Timer won - timeout
-            spdlog::debug("[protocol] Handshake timeout with [{}]", authority);
-            co_return std::unexpected(error::channel_timeout);
-        }
-
-        // Message received
-        auto& msg_result = std::get<0>(result);
+        // Read directly from the socket; the reads are cancelled at the deadline.
+        auto msg_result = co_await peer.read_message_direct(deadline);
         if (!msg_result) {
-            spdlog::debug("[protocol] Failed to receive message from [{}]: {}",
-                authority, msg_result.error().message());
+            if (msg_result.error() == error::channel_timeout) {
+                spdlog::debug("[protocol] Handshake timeout with [{}]", authority);
+            } else {
+                spdlog::debug("[protocol] Failed to receive message from [{}]: {}",
+                    authority, msg_result.error().message());
+            }
             co_return std::unexpected(msg_result.error());
         }
 
@@ -404,13 +389,11 @@ awaitable_expected<handshake_result> perform_handshake_direct(
     peer_session& peer,
     handshake_config const& config)
 {
-    // #772: each read races a timer with ||, whose winner cancels the loser.
-    // On the caller's executor (a thread pool) that cancellation could run on
-    // one thread while the loser completed on another. A socket read has no
-    // channel to select on, so the whole handshake runs on the peer's strand
-    // instead: the reads, the timers and the races between them. run() has
-    // not started yet, so nothing else is on that strand.
-    co_return co_await ::asio::co_spawn(peer.executor(),
+    // #772: a socket read has no channel to select on. The reads are cancelled
+    // at the deadline (cancel_at inside read_message_direct) and the whole
+    // handshake runs on the peer's strand: run() has not started, and the
+    // caller may be the thread pool.
+    co_return co_await ::asio::co_spawn(peer.get_executor(),
         perform_handshake_direct_on_strand(peer, config), ::asio::use_awaitable);
 }
 
@@ -444,33 +427,20 @@ handshake_config make_handshake_config(
     spdlog::trace("[protocol] Starting ping/pong loop for [{}] with interval {}s",
         peer.authority(), ping_interval.count());
 
-    // One selector for the life of the loop: a receive and the ping deadline,
-    // re-armed below on every iteration. Not `receive || timer`: see
-    // wait_for_any_message.
-    auto executor = co_await ::asio::this_coro::executor;
-    auto selector = ::asio::experimental::make_selector(executor, {}, std::stop_token{},
-        ::asio::experimental::receive(peer.messages()),
-        ::asio::experimental::after(std::chrono::steady_clock::time_point::max()));
-
     uint64_t last_ping_nonce = 0;
 
     while (!peer.stopped()) {
-        // Wait for either:
-        // 1. Ping interval expires -> send ping
-        // 2. Message received -> check if it's ping/pong
-        selector.case_at<1>().time = std::chrono::steady_clock::now() + ping_interval;
-        auto completion = co_await selector.wait(::asio::as_tuple(::asio::deferred));
-        auto const& [wait_ec, selected] = completion;
+        // The next message, or the ping interval: one selection.
+        auto received = co_await peer.receive(std::chrono::steady_clock::now() + ping_interval);
 
         if (peer.stopped()) {
             break;
         }
-        if (wait_ec) {
-            co_return error::channel_stopped;
-        }
-
-        if (selected == 1) {
-            // Timer expired - send ping
+        if (!received) {
+            if (received.error() != error::channel_timeout) {
+                co_return error::channel_stopped;
+            }
+            // Interval expired - send ping
             last_ping_nonce = pseudo_random::generate<uint64_t>();
             domain::message::ping ping_msg(last_ping_nonce);
 
@@ -484,7 +454,7 @@ handshake_config make_handshake_config(
         }
         else {
             // Message received
-            auto const& raw = *selector.value<0>();
+            auto& raw = *received;
 
             auto const& command = raw.heading.command();
 
@@ -994,21 +964,16 @@ template awaitable_expected<std::vector<block_result<sync_mode::slow>>> request_
     peer_session& peer,
     message_handler handler)
 {
-    // The inbound channel is a select_channel, which has no async_receive: a
-    // selector with its one receive case, kept for the life of the loop.
-    auto executor = co_await ::asio::this_coro::executor;
-    auto selector = ::asio::experimental::make_selector(executor, {}, std::stop_token{},
-        ::asio::experimental::receive(peer.messages()));
+    // No deadline: the loop runs until the session closes the channel.
+    // peer.receive() is one selection (message or channel closed).
     while (!peer.stopped()) {
-        // Wait for next message (no timeout - runs until stopped)
-        auto completion = co_await selector.wait(::asio::as_tuple(::asio::deferred));
-        auto const& ec = std::get<0>(completion);
-        if (ec) {
+        auto received = co_await peer.receive();
+        if (!received) {
             co_return error::channel_stopped;
         }
+        auto& raw = *received;
 
         // Dispatch to handler
-        auto const& raw = *selector.value<0>();
         bool continue_loop = co_await handler(raw);
         if (!continue_loop) {
             break;

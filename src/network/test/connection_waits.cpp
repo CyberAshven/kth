@@ -139,7 +139,7 @@ TEST_CASE("closing a full inbound channel releases the session reader",
         REQUIRE(peer->messages().try_send(raw_message{}));
     }
     auto running = ::asio::co_spawn(fixture.pool, peer->run(), ::asio::use_future);
-    auto sent = ::asio::co_spawn(remote->executor(), send_direct_ping(remote), ::asio::use_future);
+    auto sent = ::asio::co_spawn(remote->get_executor(), send_direct_ping(remote), ::asio::use_future);
     REQUIRE(sent.wait_for(5s) == std::future_status::ready);
     REQUIRE(sent.get() == error::success);
 

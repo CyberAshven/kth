@@ -607,25 +607,28 @@ static
     // network's stop token.
     peer_provider_input_channel peer_provider_input(100);
 
-    // Bridge task: forwards from network.peer_events() to unified channel
+    // Bridge task: forwards from network.peer_events() to unified channel.
+    // One selection on the (select_channel) event channel, ended by the
+    // network's stop token or by the channel closing: no timer. stop()
+    // requests that token, so the bridge does not re-read stopped() on a
+    // deadline. A stop that lands while an event is ready commits neither
+    // case, and the event stays queued (see detail::wait_for_peer_event,
+    // which is the same selection when the caller also has a deadline).
     all_tasks.spawn("peer_bridge", [&]() -> ::asio::awaitable<void> {
         spdlog::info("[peer_bridge] Started, forwarding peer events to peer_provider");
+        auto exec = co_await ::asio::this_coro::executor;
 
         try {
             while (!network.stopped()) {
-                // An event, or the 500 ms re-check of network.stopped(), or the
-                // network's stop. A deadline that wins leaves an event ready at
-                // the same instant queued (see detail::wait_for_peer_event).
-                auto event = co_await detail::wait_for_peer_event(network,
-                    std::chrono::steady_clock::now() + std::chrono::milliseconds(500));
-                if ( ! event && event.error() == error::channel_timeout) {
-                    continue;
-                }
-                if ( ! event) {
-                    spdlog::debug("[peer_bridge] Network channel closed: {}", event.error().message());
+                auto completion = co_await ::asio::experimental::make_select(
+                    ::asio::experimental::receive(network.peer_events())
+                ).async_wait(exec, {}, network.stop_token(), ::asio::as_tuple(::asio::deferred));
+                auto& [ec, selected] = completion;
+                if (ec) {
+                    spdlog::debug("[peer_bridge] Network channel closed: {}", ec.message());
                     break;
                 }
-                auto& notification = *event;
+                auto notification = std::move(*selected.value<0>());
 
                 // Demultiplex based on event type
                 if (notification.event == kth::node::peer_event_type::connected) {
