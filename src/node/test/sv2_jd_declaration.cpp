@@ -1375,6 +1375,62 @@ TEST_CASE("sv2 JD keeps BCH large template frames inert until negotiated", "[sv2
     REQUIRE(replaced.pending());
 }
 
+TEST_CASE("sv2 JD refuses negotiated large template positions that are not the in-flight supply", "[sv2 jd]") {
+    // 0x4C54 has to be set before start: use_large_templates is ignored once
+    // the declaration is pending. allocation() then leaves it declaring, which
+    // is the only state that supplies missing transactions.
+    auto const negotiated_declaring = [] {
+        jd_declaration state("worker", true);
+        state.use_large_templates(true);
+        auto const started = state.start(mining_template(), channel());
+        REQUIRE(started.error.empty());
+        // The token id is the one in flight. The positions frame for id 2 names another.
+        REQUIRE(decode<allocate_mining_job_token>(started.declaration).request_id == 1);
+        auto const allocated = process(state, jd_peer::declaration, allocation());
+        REQUIRE(allocated.error.empty());
+        REQUIRE(allocated.progress);
+        REQUIRE_FALSE(allocated.declaration.empty());
+        return state;
+    };
+
+    // start() issues request id 1. Id 2 was never issued, and supersede() was
+    // not called, so that id is not retired. The frame fails the request check.
+    auto wrong_id = negotiated_declaring();
+    auto const mismatch = process(wrong_id, jd_peer::declaration,
+        provide_missing_transactions_positions{2, {0}});
+    require_failure(wrong_id, mismatch);
+    REQUIRE(mismatch.error.find("invalid missing transaction request") != std::string::npos);
+
+    // The id is the one in flight. refuse_incomplete sends every proper prefix
+    // and then one trailing byte, each on a new negotiated declaring state.
+    // A body that does not parse fails the request.
+    refuse_incomplete(provide_missing_transactions_positions{1, {0}},
+        jd_peer::declaration, negotiated_declaring);
+
+    // The channel bit shares the extension field with the id. The positions
+    // message keeps 0x4C54 in the low 15 bits and sets the high bit. The body
+    // names transaction 0 of the id in flight, so the flag is what makes the
+    // frame the wrong direction.
+    auto const positions = to_data_chunk(provide_missing_transactions_positions{1, {0}});
+    auto channel_state = negotiated_declaring();
+    auto const channel_frame = process(channel_state, jd_peer::declaration,
+        static_cast<uint16_t>(large_templates_extension | message_header::channel_msg_flag),
+        provide_missing_transactions_positions::message_type, positions);
+    require_failure(channel_state, channel_frame);
+    REQUIRE(channel_frame.error.find("unexpected large template message or direction")
+        != std::string::npos);
+
+    // 0x03 is not ProvideMissingTransactions.Positions. The body is a
+    // positions payload for the id in flight, so the type is what makes the
+    // frame unexpected.
+    auto other_state = negotiated_declaring();
+    auto const other_frame = process(other_state, jd_peer::declaration,
+        large_templates_extension, 0x03, positions);
+    require_failure(other_state, other_frame);
+    REQUIRE(other_frame.error.find("unexpected large template message or direction")
+        != std::string::npos);
+}
+
 TEST_CASE("sv2 JD exact payout outputs refuse a coinbase version outside 1..2", "[sv2 jd]") {
     for (uint32_t const version : {0u, 3u}) {
         CAPTURE(version);
