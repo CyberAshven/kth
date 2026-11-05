@@ -566,21 +566,27 @@ uint64_t block::claim() const {
 }
 
 // Overflow returns max_uint64.
-uint64_t block::reward(size_t height) const {
+// `retarget` selects the halving interval. False is regtest's 150-block
+// schedule; true is the 210,000-block schedule. Passing a constant true
+// paid the longer subsidy on every network.
+uint64_t block::reward(size_t height, bool retarget) const {
     ////static_assert(max_money() < max_uint64, "overflow sentinel invalid");
-    return ceiling_add(fees(), subsidy(height, true));
+    return ceiling_add(fees(), subsidy(height, retarget));
 }
 
-uint64_t block::reward(block_ticks const& ticks, size_t height) const {
-    return ceiling_add(fees(), subsidy(ticks, height, true));
+// Same sum. On the uniform 600-tick schedule the 600-tick chunk equals the
+// height, so this matches `reward(height, retarget)` before faster blocks.
+uint64_t block::reward(block_ticks const& ticks, size_t height, bool retarget) const {
+    return ceiling_add(fees(), subsidy(ticks, height, retarget));
 }
 
-bool block::is_valid_coinbase_claim(size_t height) const {
-    return claim() <= reward(height);
+// The cap is `reward`, which carries the same interval flag.
+bool block::is_valid_coinbase_claim(size_t height, bool retarget) const {
+    return claim() <= reward(height, retarget);
 }
 
-bool block::is_valid_coinbase_claim(block_ticks const& ticks, size_t height) const {
-    return claim() <= reward(ticks, height);
+bool block::is_valid_coinbase_claim(block_ticks const& ticks, size_t height, bool retarget) const {
+    return claim() <= reward(ticks, height, retarget);
 }
 
 bool block::has_forbidden_coinbase_shape() const {

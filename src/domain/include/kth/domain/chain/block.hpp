@@ -135,11 +135,17 @@ struct KD_API block {
     [[nodiscard]]
     uint64_t claim() const;
 
+    /// Coinbase cap at `height`: fees plus the subsidy. `retarget` picks the
+    /// halving interval, `subsidy_interval(retarget)`: the network's own when
+    /// true, regtest's 150 blocks when false. There is no default, so every
+    /// caller names the schedule its chain uses.
     [[nodiscard]]
-    uint64_t reward(size_t height) const;
+    uint64_t reward(size_t height, bool retarget) const;
 
+    /// Same cap on a CHIP-2025-03 schedule. The halving count is the one
+    /// `subsidy(ticks, height, retarget)` computes.
     [[nodiscard]]
-    uint64_t reward(block_ticks const& ticks, size_t height) const;
+    uint64_t reward(block_ticks const& ticks, size_t height, bool retarget) const;
 
     [[nodiscard]]
     uint256_t proof() const;
@@ -165,11 +171,13 @@ struct KD_API block {
     [[nodiscard]]
     bool is_distinct_transaction_set() const;
 
+    /// True when `claim()` is within `reward(height, retarget)`.
     [[nodiscard]]
-    bool is_valid_coinbase_claim(size_t height) const;
+    bool is_valid_coinbase_claim(size_t height, bool retarget) const;
 
+    /// True when `claim()` is within `reward(ticks, height, retarget)`.
     [[nodiscard]]
-    bool is_valid_coinbase_claim(block_ticks const& ticks, size_t height) const;
+    bool is_valid_coinbase_claim(block_ticks const& ticks, size_t height, bool retarget) const;
 
     /// CHIP-2025-03: the coinbase shape version 1, locktime 0 and outputs of at
     /// least 25 BCH, which is invalid from the block built on H_a onward. The

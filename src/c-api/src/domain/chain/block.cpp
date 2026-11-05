@@ -228,10 +228,11 @@ kth_bool_t kth_domain_chain_block_is_distinct_transaction_set(kth_block_const_t 
     return kth::bool_to_int(kth::cpp_ref<cpp_t>(self).is_distinct_transaction_set());
 }
 
-kth_bool_t kth_domain_chain_block_is_valid_coinbase_claim(kth_block_const_t self, kth_size_t height) {
+kth_bool_t kth_domain_chain_block_is_valid_coinbase_claim(kth_block_const_t self, kth_size_t height, kth_bool_t retarget) {
     KTH_PRECONDITION(self != nullptr);
     auto const height_cpp = kth::sz(height);
-    return kth::bool_to_int(kth::cpp_ref<cpp_t>(self).is_valid_coinbase_claim(height_cpp));
+    auto const retarget_cpp = kth::int_to_bool(retarget);
+    return kth::bool_to_int(kth::cpp_ref<cpp_t>(self).is_valid_coinbase_claim(height_cpp, retarget_cpp));
 }
 
 kth_bool_t kth_domain_chain_block_is_valid_coinbase_script(kth_block_const_t self, kth_size_t height) {
@@ -263,10 +264,11 @@ kth_bool_t kth_domain_chain_block_is_valid_merkle_root(kth_block_const_t self) {
 
 // Operations
 
-uint64_t kth_domain_chain_block_reward(kth_block_const_t self, kth_size_t height) {
+uint64_t kth_domain_chain_block_reward(kth_block_const_t self, kth_size_t height, kth_bool_t retarget) {
     KTH_PRECONDITION(self != nullptr);
     auto const height_cpp = kth::sz(height);
-    return kth::cpp_ref<cpp_t>(self).reward(height_cpp);
+    auto const retarget_cpp = kth::int_to_bool(retarget);
+    return kth::cpp_ref<cpp_t>(self).reward(height_cpp, retarget_cpp);
 }
 
 kth_size_t kth_domain_chain_block_signature_operations(kth_block_const_t self, kth_bool_t bip16, kth_bool_t bip141) {

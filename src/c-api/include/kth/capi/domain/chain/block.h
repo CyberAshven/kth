@@ -147,8 +147,9 @@ kth_bool_t kth_domain_chain_block_is_final(kth_block_const_t self, kth_size_t he
 KTH_EXPORT
 kth_bool_t kth_domain_chain_block_is_distinct_transaction_set(kth_block_const_t self);
 
+/** True when the coinbase outputs are within the block reward. `retarget` is forwarded (0 is the 150-block halving). */
 KTH_EXPORT
-kth_bool_t kth_domain_chain_block_is_valid_coinbase_claim(kth_block_const_t self, kth_size_t height);
+kth_bool_t kth_domain_chain_block_is_valid_coinbase_claim(kth_block_const_t self, kth_size_t height, kth_bool_t retarget);
 
 KTH_EXPORT
 kth_bool_t kth_domain_chain_block_is_valid_coinbase_script(kth_block_const_t self, kth_size_t height);
@@ -168,8 +169,9 @@ kth_bool_t kth_domain_chain_block_is_valid_merkle_root(kth_block_const_t self);
 
 // Operations
 
+/** Fees plus the subsidy at `height`. `retarget` selects the halving interval. */
 KTH_EXPORT
-uint64_t kth_domain_chain_block_reward(kth_block_const_t self, kth_size_t height);
+uint64_t kth_domain_chain_block_reward(kth_block_const_t self, kth_size_t height, kth_bool_t retarget);
 
 KTH_EXPORT
 kth_size_t kth_domain_chain_block_signature_operations(kth_block_const_t self, kth_bool_t bip16, kth_bool_t bip141);

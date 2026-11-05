@@ -36,6 +36,13 @@ chain::block make_block(chain::transaction::list txs = {chain::transaction(1, 0,
         chain::header{1u, null_hash, null_hash, 0u, 0u, 0u}, std::move(txs));
 }
 
+// One coinbase output of `satoshis` and no inputs. Nothing is cached in a
+// prevout, so `fees()` is 0 and `claim()` is that output.
+chain::block block_claiming(uint64_t satoshis) {
+    return make_block({chain::transaction(
+        1, 0, {}, {chain::output(satoshis, chain::script{}, chain::token_data_opt{})})});
+}
+
 } // anonymous namespace
 
 // Start Test Suite: chain block tests
@@ -708,6 +715,54 @@ TEST_CASE("block subsidy halving 64 zero sat (post-final halving)", "[chain bloc
 TEST_CASE("block subsidy halving 128 zero sat", "[chain block subsidy]") {
     auto const interval = subsidy_interval(true);
     REQUIRE(chain::block::subsidy(interval * 128, true) == 0u);
+}
+
+// Coinbase reward uses the caller's halving interval.
+// -----------------------------------------------------------------------------
+// `retarget == false` halves every 150 blocks (regtest). Height 150 is the
+// first block of that second era, so the allowed subsidy is 25 coins.
+// `retarget == true` is still in the initial era there. The blocks below
+// have no cached prevouts, so fees are 0 and the cap is the subsidy.
+
+TEST_CASE("block reward regtest height 149 pays the initial subsidy", "[chain block reward]") {
+    auto const block = block_claiming(initial_block_subsidy_satoshi());
+    REQUIRE(block.fees() == 0u);
+    REQUIRE(block.claim() == initial_block_subsidy_satoshi());
+    REQUIRE(block.reward(149, false) == initial_block_subsidy_satoshi());
+    REQUIRE(block.is_valid_coinbase_claim(149, false));
+}
+
+TEST_CASE("block reward regtest height 150 pays half and rejects a 50 coin claim", "[chain block reward]") {
+    auto const block = block_claiming(initial_block_subsidy_satoshi());
+    auto const half = initial_block_subsidy_satoshi() / 2u;
+    REQUIRE(subsidy_interval(false) == 150u);
+    REQUIRE(chain::block::subsidy(150, false) == half);
+    REQUIRE(block.reward(150, false) == chain::block::subsidy(150, false) + block.fees());
+    REQUIRE(block.reward(150, false) == half);
+    REQUIRE( ! block.is_valid_coinbase_claim(150, false));
+    REQUIRE(block.is_valid_coinbase_claim(150, true));
+
+    auto const allowed = block_claiming(half);
+    REQUIRE(allowed.is_valid_coinbase_claim(150, false));
+}
+
+TEST_CASE("block reward mainnet height 150 still pays the initial subsidy", "[chain block reward]") {
+    auto const block = block_claiming(initial_block_subsidy_satoshi());
+    REQUIRE(subsidy_interval(true) > 150u);
+    REQUIRE(block.reward(150, true) == initial_block_subsidy_satoshi());
+    REQUIRE(block.is_valid_coinbase_claim(150, true));
+}
+
+TEST_CASE("block reward ticks overload follows retarget on the uniform schedule", "[chain block reward]") {
+    // Default-constructed block_ticks is the uniform 600-tick schedule,
+    // every pre-activation branch. On that schedule the 600-tick chunk
+    // equals the height, so this overload matches the height form.
+    auto const block = block_claiming(initial_block_subsidy_satoshi());
+    auto const uniform = chain::block_ticks{};
+    REQUIRE(block.reward(uniform, 150, false) == chain::block::subsidy(uniform, 150, false) + block.fees());
+    REQUIRE(block.reward(uniform, 150, false) == block.reward(150, false));
+    REQUIRE( ! block.is_valid_coinbase_claim(uniform, 150, false));
+    REQUIRE(block.is_valid_coinbase_claim(uniform, 150, true));
 }
 
 // End Test Suite
