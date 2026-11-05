@@ -300,8 +300,8 @@ struct payout_outputs_stale {
     [[nodiscard]] static expect<payout_outputs_stale> from_data(byte_reader& source);
 };
 
-// BCH large templates, the experimental identifier 0x4C54 ("LT") that the BCH
-// P2Pool node serves. Standard Job Declaration bounds the declared list at
+// BCH large templates, experimental identifier 0x4C54 ("LT"), not yet in the
+// SV2 extension registry. Standard Job Declaration bounds the declared list at
 // SEQ0_64K and names missing transactions by U16 position, sizes that fit
 // Bitcoin blocks. Bitcoin Cash's adaptive block size limit (ABLA) admits more
 // transactions than that, so this extension pages the list, names positions
