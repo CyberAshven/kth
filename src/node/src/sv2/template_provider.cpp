@@ -43,6 +43,7 @@
 #include <kth/node/sv2/connection.hpp>
 #include <kth/node/sv2/jd_client.hpp>
 #include <kth/node/sv2/jd_settings.hpp>
+#include <kth/node/sv2/mining_messages.hpp>
 #include <kth/node/sv2/mining_session.hpp>
 
 namespace kth::node::sv2 {
@@ -474,6 +475,10 @@ template_provider::template_provider(sv2_settings const& settings,
         out.solution = std::move(produced.solution);
         return out;
     };
+    // Pool-notice generation already bound into this session. open() reads
+    // that binding when it builds a prefix, so a live pool coinbase is
+    // applied before the open, and a later message does not apply it again.
+    uint64_t bound_pool_generation = 0;
     auto refresh_mining = [&]() -> ::asio::awaitable<template_provider_session::result> {
         if ( ! miner->ready()) co_return template_provider_session::result{};
         // A pool or fallback notice for this tip replaces the coinbase without
@@ -482,9 +487,17 @@ template_provider::template_provider(sv2_settings const& settings,
         if (upstream) {
             auto const notice = upstream->notice();
             auto const view = chain_.chain_view();
-            if (notice && notice->generation > 0 && view && notice->previous == view->tip_hash) {
+            // The open path binds this generation while that template is still
+            // installed. Applying it again would replace every channel's job.
+            // A cleared template still takes the notice.
+            bool const installed = notice && notice->pool
+                && notice->generation == bound_pool_generation
+                && ! miner->needs_template();
+            if (notice && notice->generation > 0 && view && notice->previous == view->tip_hash
+                && ! installed) {
                 auto produced = notice->pool ? miner->apply_pool(notice->pooled)
                                               : miner->apply(notice->solo);
+                if (notice->pool && ! produced.close) bound_pool_generation = notice->generation;
                 co_return adopt(std::move(produced));
             }
         }
@@ -507,6 +520,7 @@ template_provider::template_provider(sv2_settings const& settings,
                 && notice->previous == value->previous_block_hash) {
                 auto produced = notice->pool ? miner->apply_pool(notice->pooled)
                                               : miner->apply(notice->solo);
+                if (notice->pool && ! produced.close) bound_pool_generation = notice->generation;
                 co_return adopt(std::move(produced));
             }
         }
@@ -545,19 +559,41 @@ template_provider::template_provider(sv2_settings const& settings,
                 }
                 decided = true;
                 if (miner) {
-                    auto produced = miner->process(input.header, input.payload);
-                    // The pool send is queued on the declaration strand. organize()
-                    // below does not wait for the JDS or the pool to answer.
-                    if (produced.pool && upstream) upstream->observe_share(std::move(*produced.pool));
-                    result.response = std::move(produced.response);
-                    result.close = produced.close;
-                    result.solution = produced.solution;
-                    if (produced.wants_template) {
-                        auto const jobs = co_await refresh_mining();
+                    // Bind the live pool coinbase before open() allocates the
+                    // channel prefix, so Open*Success carries that prefix and
+                    // the first job is not preceded by SetExtranoncePrefix.
+                    // Channels already open are updated by the frames this
+                    // apply returns, ahead of the Open reply.
+                    bool const opening = input.header.msg_type == open_standard_mining_channel::message_type
+                        || input.header.msg_type == open_extended_mining_channel::message_type;
+                    if (opening && miner->ready() && upstream) {
+                        auto const notice = upstream->notice();
+                        if (notice && notice->generation > 0 && notice->pool
+                            && notice->generation != bound_pool_generation
+                            && view && notice->previous == view->tip_hash) {
+                            auto bound = miner->apply_pool(notice->pooled);
+                            if ( ! bound.close) bound_pool_generation = notice->generation;
+                            result.response = std::move(bound.response);
+                            result.close = bound.close;
+                            if (bound.solution) result.solution = std::move(bound.solution);
+                        }
+                    }
+                    if ( ! result.close) {
+                        auto produced = miner->process(input.header, input.payload);
+                        // The pool send is queued on the declaration strand. organize()
+                        // below does not wait for the JDS or the pool to answer.
+                        if (produced.pool && upstream) upstream->observe_share(std::move(*produced.pool));
                         result.response.insert(result.response.end(),
-                            jobs.response.begin(), jobs.response.end());
-                        result.close = result.close || jobs.close;
-                        if (jobs.solution) result.solution = jobs.solution;
+                            produced.response.begin(), produced.response.end());
+                        result.close = produced.close;
+                        if (produced.solution) result.solution = std::move(produced.solution);
+                        if (produced.wants_template) {
+                            auto const jobs = co_await refresh_mining();
+                            result.response.insert(result.response.end(),
+                                jobs.response.begin(), jobs.response.end());
+                            result.close = result.close || jobs.close;
+                            if (jobs.solution) result.solution = jobs.solution;
+                        }
                     }
                 } else {
                     result = session.process(input.header, input.payload);
