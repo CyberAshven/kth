@@ -2077,6 +2077,104 @@ TEST_CASE("sv2 JD flags valid share refusals and demotes invalid acknowledgement
     REQUIRE_NOTHROW(fixture.result.get());
 }
 
+TEST_CASE("sv2 JD accepts a batched share success that counts fewer than the submits it covers", "[sv2 jd]") {
+    auto chain = started_chain("sv2_jd_batched_share_success");
+    client_fixture fixture;
+    fake_upstream backup_pool(fixture, 6);
+    fake_upstream backup_jds(fixture, 7);
+    auto const configuration = settings(fixture.pool, fixture.jds, backup_pool, backup_jds, "coinbase-only");
+    fixture.start(configuration, &chain->chain());
+    handshake_upstreams(fixture, false);
+    (void)accept_coinbase_template(fixture.pool, fixture.jds);
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.client->status()->entries[0].health == jd_health::healthy;
+    }));
+    auto const notice = fixture.client->notice();
+    REQUIRE(notice);
+    auto proof = proof_for(*notice);
+    fixture.client->observe_share(proof);
+    auto const first = fixture.pool.receive<submit_shares_extended>();
+    ++proof.nonce;
+    fixture.client->observe_share(proof);
+    auto const second = fixture.pool.receive<submit_shares_extended>();
+    ++proof.nonce;
+    fixture.client->observe_share(proof);
+    auto const third = fixture.pool.receive<submit_shares_extended>();
+    auto const channel = first.channel_id;
+    auto const s0 = first.sequence_number;
+    auto const s1 = second.sequence_number;
+    auto const s2 = third.sequence_number;
+    REQUIRE(second.channel_id == channel);
+    REQUIRE(third.channel_id == channel);
+    REQUIRE(s1 == s0 + 1);
+    REQUIRE(s2 == s1 + 1);
+    // sv2-spec 5.3.13: last_sequence_number is the newest correct submit.
+    // The accepted count may be smaller than that prefix. The sum is not checked.
+    captured_log log;
+    fixture.pool.send(submit_shares_success{channel, s2, 2, 2});
+    ++proof.nonce;
+    fixture.client->observe_share(proof);
+    auto const forwarded = fixture.pool.receive<submit_shares_extended>();
+    REQUIRE(forwarded.channel_id == channel);
+    REQUIRE(forwarded.sequence_number == s2 + 1);
+    REQUIRE(forwarded.nonce == proof.nonce);
+    CHECK_FALSE(fixture.wait_until([&] {
+        return fixture.client->status()->entries[0].health != jd_health::healthy;
+    }, 100ms));
+    auto const staying = fixture.client->status();
+    REQUIRE(staying->entries[0].health == jd_health::healthy);
+    REQUIRE(staying->active == std::optional<size_t>{0});
+    REQUIRE(log.count("invalid upstream share") == 0);
+    // The uncounted submit stays in the refusal record: a later SubmitShares.Error
+    // for it (5.3.14) is judged by the error path, as a current-tip refusal here.
+    REQUIRE(fixture.result.wait_for(0s) != std::future_status::ready);
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
+}
+
+TEST_CASE("sv2 JD still refuses a share success with a zero count or a count past its sequence", "[sv2 jd]") {
+    uint32_t count = 0;
+    SECTION("zero count") {}
+    SECTION("count past its sequence") { count = 2; }
+    auto chain = started_chain("sv2_jd_share_success_count");
+    client_fixture fixture;
+    fake_upstream backup_pool(fixture, 6);
+    fake_upstream backup_jds(fixture, 7);
+    auto const configuration = settings(fixture.pool, fixture.jds, backup_pool, backup_jds, "coinbase-only");
+    fixture.start(configuration, &chain->chain());
+    handshake_upstreams(fixture, false);
+    (void)accept_coinbase_template(fixture.pool, fixture.jds);
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.client->status()->entries[0].health == jd_health::healthy;
+    }));
+    auto const notice = fixture.client->notice();
+    REQUIRE(notice);
+    fixture.client->observe_share(proof_for(*notice));
+    auto const share = fixture.pool.receive<submit_shares_extended>();
+    // Built in share_response as "invalid upstream share " + kind + ": " + detail.
+    char const* const acknowledgement =
+        "invalid upstream share acknowledgement: share success does not match the outstanding submits";
+    captured_log log;
+    fixture.pool.send(submit_shares_success{share.channel_id, share.sequence_number, count, 1});
+    REQUIRE(fixture.wait_until([&] { return log.count(acknowledgement) >= 1; }));
+    fixture.eof(fixture.pool.socket);
+    fixture.eof(fixture.jds.socket);
+    handshake_upstreams(backup_pool, backup_jds, false);
+    (void)accept_coinbase_template(backup_pool, backup_jds, 88);
+    REQUIRE(fixture.wait_until([&] {
+        auto const status = fixture.client->status();
+        return status && status->active == std::optional<size_t>{1}
+            && status->entries[1].health == jd_health::healthy;
+    }));
+    auto const failed = fixture.client->status()->entries[0];
+    REQUIRE(failed.health == jd_health::backoff);
+    REQUIRE(failed.last_error == acknowledgement);
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
+}
+
 TEST_CASE("sv2 JD bounds unacknowledged shares and a cached flush cannot block failover", "[sv2 jd]") {
     enum class bound { history, cached, solutions };
     auto which = bound::history;
