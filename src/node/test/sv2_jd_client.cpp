@@ -386,7 +386,9 @@ void solo_job(io_driver& driver, uint16_t port, domain::chain::script const& pay
     hash_digest target;
     target.fill(0xff);
     auto request = frame(setup);
-    auto const channel = frame(open_extended_mining_channel{1, "miner", 0.f, target, 12});
+    // With JD enabled a downstream channel rolls JD's fixed reserve.
+    auto const channel = frame(open_extended_mining_channel{1, "miner", 0.f, target,
+        node::mining::jd_downstream_extranonce_size});
     request.insert(request.end(), channel.begin(), channel.end());
     driver.write(miner, std::move(request));
     std::error_code error;
@@ -563,10 +565,12 @@ struct miner_link {
         target.fill(0xff);
         driver.write(socket, frame(setup));
         REQUIRE(receive_plain<setup_connection_success>(driver, socket).used_version == 2);
-        driver.write(socket, frame(open_extended_mining_channel{1, "miner", 0.f, target, 12}));
+        // With JD enabled a downstream channel rolls JD's fixed reserve.
+        driver.write(socket, frame(open_extended_mining_channel{1, "miner", 0.f, target,
+            node::mining::jd_downstream_extranonce_size}));
         opened = receive_plain<open_extended_mining_channel_success>(driver, socket);
         REQUIRE(opened.request_id == 1);
-        REQUIRE(opened.extranonce_size == 12);
+        REQUIRE(opened.extranonce_size == node::mining::jd_downstream_extranonce_size);
         work = read_activated(driver, socket, opened.extranonce_prefix, opened);
     }
 
