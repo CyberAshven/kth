@@ -450,8 +450,19 @@ TEST_CASE("sv2 JD bounds local input and refuses replacing an outstanding declar
     REQUIRE(installed.declaration.empty());
     REQUIRE_FALSE(installed.mining.empty());
 
+    // A limit below the retained transactions is refused before allocation:
+    // the template could never be answered within its own consensus limit.
+    auto tiny = mining_template();
+    tiny.size_limit = 1;
+    jd_declaration refused("worker", true);
+    auto const refused_start = refused.start(tiny, channel());
+    require_failure(refused, refused_start);
+    REQUIRE(refused_start.error.find("consensus block size limit") != std::string::npos);
+
+    // A limit that holds the transactions but not the coinbase as well is
+    // refused when the coinbase is built from the allocation.
     auto small = mining_template();
-    small.size_limit = 1;
+    small.size_limit = small.selection.total_size;
     jd_declaration state("worker", true);
     REQUIRE(state.start(small, channel()).error.empty());
     require_failure(state, process(state, jd_peer::declaration, allocation()));
