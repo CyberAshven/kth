@@ -1609,13 +1609,13 @@ static
         // this loop must not wait on a slow peer. Parameters, not captures:
         // they live in the coroutine frame, and the closure is gone once the
         // spawn returns.
-        auto announce_connected = [&](block_const_ptr const& block) {
+        auto announce_connected = [&](block_const_ptr const& connected) {
             all_tasks.spawn("local_block_announcement",
                 [](kth::node::p2p_node& peers, block_const_ptr block) -> ::asio::awaitable<void> {
                     auto const sent = co_await peers.broadcast(*block);
                     spdlog::info("[sync_coordinator] Local block {} sent to {} peer(s)",
                         encode_hash(block->hash()), sent);
-                }(network, block));
+                }(network, connected));
         };
 
         // After the builder published: connected, at last.
