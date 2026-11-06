@@ -1601,6 +1601,23 @@ static
             }
         };
 
+        // A local block, once connected, is sent to every peer as a `block`
+        // message: peers cannot fetch blocks from this node yet, so they get
+        // the body itself, and a peer takes an unsolicited block that extends
+        // its tip. The node lists a peer only after its handshake. A task of
+        // its own: a send waits while a peer's outbound queue is full, and
+        // this loop must not wait on a slow peer. Parameters, not captures:
+        // they live in the coroutine frame, and the closure is gone once the
+        // spawn returns.
+        auto announce_connected = [&](block_const_ptr const& block) {
+            all_tasks.spawn("local_block_announcement",
+                [](kth::node::p2p_node& peers, block_const_ptr block) -> ::asio::awaitable<void> {
+                    auto const sent = co_await peers.broadcast(*block);
+                    spdlog::info("[sync_coordinator] Local block {} sent to {} peer(s)",
+                        encode_hash(block->hash()), sent);
+                }(network, block));
+        };
+
         // After the builder published: connected, at last.
         auto settle_connected = [&]() {
             auto const view = chain.chain_view();
@@ -1625,6 +1642,10 @@ static
                 if (pending.stage == local_admission::stage_t::connect &&
                     view->connected_tip_height >= pending.height &&
                     is_active(pending.hash, pending.height)) {
+                    // Connected on the active chain, and answered here, so
+                    // sent once. A block another one displaced at its height
+                    // is not active, and is never sent.
+                    announce_connected(pending.block);
                     resolve_local(i, error::success);
                 } else {
                     ++i;

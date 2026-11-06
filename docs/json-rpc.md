@@ -299,7 +299,8 @@ all transactions in wire format. An optional second argument (`"dummy"` or a
 parameters object) is ignored. No template job or cached transactions are needed.
 The node's admission owner submits it through the existing header, body and
 contextual-validation pipeline. The call returns `null` only after connected
-publication. A block that does not connect because its branch has insufficient
+publication, and the connected block is sent to every connected peer as a
+`block` message. A block that does not connect because its branch has insufficient
 work, or whose validation verdict is not available, returns `"inconclusive"`.
 Consensus failures return BCHN/BIP22 rejection reasons such as `"bad-cb-amount"`,
 `"high-hash"`, `"bad-txnmrklroot"`, and `"time-too-old"`. Where admission supplies
