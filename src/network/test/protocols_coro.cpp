@@ -7,6 +7,7 @@
 #include <thread>
 
 #include <test_helpers.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <kth/network.hpp>
 
@@ -103,6 +104,7 @@ TEST_CASE("make_handshake_config from settings", "[protocols_coro]") {
     REQUIRE(config.user_agent == "/KnuthTest:0.1.0/");
     REQUIRE(config.start_height == 100000);
     REQUIRE(config.nonce == 12345);
+    REQUIRE(config.relay == settings.relay_transactions);
     REQUIRE(config.timeout == 30s);
 }
 
@@ -267,6 +269,47 @@ TEST_CASE("perform_handshake timeout", "[protocols_coro]") {
 
     REQUIRE(!result.has_value());
     REQUIRE(result.error() == error::channel_timeout);
+}
+
+TEST_CASE("perform_handshake asks the peer for transactions only when the node relays them", "[protocols_coro]") {
+    auto const relay = GENERATE(true, false);
+    CAPTURE(relay);
+    ::asio::io_context ctx;
+    auto settings = make_test_settings_proto();
+    settings.relay_transactions = relay;
+    auto [client, server] = make_connected_sockets_proto(ctx);
+
+    auto peer = std::make_shared<peer_session>(std::move(server), settings);
+    auto config = make_handshake_config(settings, 100000, 12345);
+    config.timeout = 1s;
+
+    std::atomic<bool> done{false};
+    ::asio::co_spawn(ctx, peer->run(), ::asio::detached);
+    ::asio::co_spawn(ctx, [&]() -> ::asio::awaitable<void> {
+        (void)co_await perform_handshake(*peer, config);
+        done = true;
+    }, ::asio::detached);
+
+    // The version message the node sends first, read under a deadline: a node
+    // that sends nothing fails the test rather than hanging it.
+    std::array<uint8_t, 1024> recv_buf;
+    std::atomic<size_t> received{0};
+    client.async_read_some(::asio::buffer(recv_buf), [&](auto ec, size_t n) {
+        if ( ! ec) received = n;
+    });
+    run_until_proto(ctx, [&]{ return received.load() > 24; });
+    auto const n = received.load();
+    REQUIRE(n > 24);
+    byte_reader reader(byte_span{recv_buf.data() + 24, n - 24});
+    auto const sent = domain::message::version::from_data(reader, 70015);
+
+    run_until_proto(ctx, [&]{ return done.load(); }, 3000ms);
+    peer->stop();
+    kth::test::drain_context(ctx);
+
+    // A peer that reads relay false never announces a transaction to it.
+    REQUIRE(sent);
+    REQUIRE(sent->relay() == relay);
 }
 
 TEST_CASE("perform_handshake rejects low version peer", "[protocols_coro]") {
