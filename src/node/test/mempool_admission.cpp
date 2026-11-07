@@ -25,6 +25,8 @@
 
 #include "sync_harness.hpp"
 #include "child_process_harness.hpp"
+#include "tx_relay_harness.hpp"
+#include <kth/node/detail/tx_relay.hpp>
 #if defined(KTH_CURRENCY_BCH)
 #include "../../blockchain/test/transaction_size_fixture.hpp"
 #include <kth/blockchain/validate/batch_validate.hpp>
@@ -182,6 +184,60 @@ TEST_CASE("organizing a valid transaction admits it to the mempool", "[mempool][
     CHECK(ec == error::success);
     CHECK(chain.mempool_ref().size() == 1);
     CHECK(chain.mempool_ref().contains(tx->hash()));
+}
+
+// The relay's whole path against a real chain: a peer announces a transaction,
+// the relay asks that peer for it, and what the peer sends goes through
+// organize() into the mempool, as one sendrawtransaction would.
+TEST_CASE("a transaction a peer announces is asked for and reaches the mempool",
+          "[mempool][admission][tx_relay]") {
+    using namespace kth::node::detail;
+    admission_chain built("tx_relay_admission", trunk_len);
+    auto& chain = built.chain();
+    auto const tx = std::make_shared<domain::message::transaction const>(built.matured_spend(fee));
+
+    ::asio::io_context ioc;
+    auto const config = relay_settings();
+    tx_relay_channels channels;
+    tx_admission_channel admission{tx_admission_capacity};
+    auto peer = connect(ioc, config, 1);
+
+    // The chain is current, but the clock half of synchronized() reads this
+    // regtest trunk as stale; the gate itself is controlled in tx_relay.cpp.
+    tx_relay_view view{
+        .synchronized = [] { return true; },
+        .in_mempool = [&chain](hash_digest const& txid) { return chain.mempool_ref().contains(txid); },
+        .tip = [&chain] { return chain.chain_view()->tip_hash; },
+    };
+    auto owner = ::asio::co_spawn(ioc, tx_relay_task(channels, std::move(view), admission,
+        [&ioc](::asio::awaitable<void> task) { ::asio::co_spawn(ioc, std::move(task), ::asio::detached); }),
+        ::asio::use_future);
+    auto admitter = ::asio::co_spawn(ioc, tx_admission_task(admission,
+        [&chain](domain::message::transaction::const_ptr pooled) {
+            return ::asio::co_spawn(chain.executor(), chain.organize(std::move(pooled)), ::asio::use_awaitable);
+        }, channels), ::asio::use_future);
+
+    REQUIRE(channels.submit(tx_announced{peer.session, {tx->hash()}}));
+    CHECK(contains(read_requests(ioc, peer, 2s), tx->hash()));
+
+    REQUIRE(channels.submit(tx_received{1, tx}));
+    auto const deadline = std::chrono::steady_clock::now() + 10s;
+    while ( ! chain.mempool_ref().contains(tx->hash()) && std::chrono::steady_clock::now() < deadline) {
+        ioc.restart();
+        ioc.run_for(5ms);
+    }
+    CHECK(chain.mempool_ref().contains(tx->hash()));
+
+    // Shutdown: closing the channel ends the owner, and the owner the admission.
+    channels.close();
+    while ((owner.wait_for(0s) != std::future_status::ready
+            || admitter.wait_for(0s) != std::future_status::ready)
+           && std::chrono::steady_clock::now() < deadline + 10s) {
+        ioc.restart();
+        ioc.run_for(5ms);
+    }
+    CHECK(owner.wait_for(0s) == std::future_status::ready);
+    CHECK(admitter.wait_for(0s) == std::future_status::ready);
 }
 
 // Expiry counts from when the node first saw a transaction, as BCHN's does, so

@@ -204,6 +204,7 @@ struct peer_notification {
 
 namespace detail {
 struct header_ingest_channels;
+struct tx_relay_channels;
 } // namespace detail
 
 /// Woken when at least one block has been announced. Carries nothing: the
@@ -366,10 +367,27 @@ public:
     [[nodiscard]]
     bool observe_block_message(peer_session::ptr const& peer, raw_message const& raw);
 
+    /// What the read loop does next with `tx` and `notfound`: hands them to the
+    /// transaction relay when the node relays transactions, never waiting.
+    /// Answers whether the message was consumed: `tx` is, whatever becomes of
+    /// it; `notfound` carries on. Any other command is left alone. The
+    /// transaction entries of an `inv` go to the relay from
+    /// observe_block_message, which reads the `inv` once for both.
+    [[nodiscard]]
+    bool observe_transaction_message(peer_session::ptr const& peer, raw_message const& raw);
+
     /// The channels into the header ingest: what the read loops submit to, and
     /// what the sync layer's ingest task owns and drains. Closed by stop().
     [[nodiscard]]
     detail::header_ingest_channels& header_ingest();
+
+    /// The channel into the transaction relay: the transaction entries of each
+    /// `inv` and `notfound`, every `tx`, and the sessions that end, submitted
+    /// by the read loops when the node relays transactions
+    /// (network.relay_transactions). Owned and drained by the relay task.
+    /// Closed by stop().
+    [[nodiscard]]
+    detail::tx_relay_channels& tx_relay();
 
     /// What was announced since the last take. `overflowed` says the registry
     /// refused hashes for want of room, so the list is not the whole story and
@@ -657,13 +675,15 @@ private:
     std::unique_ptr<concurrent_channel<blocks_announced>> block_announcement_channel_;
 
     std::unique_ptr<detail::header_ingest_channels> header_ingest_;
+    std::unique_ptr<detail::tx_relay_channels> tx_relay_;
 
     /// Each form a header or an announcement arrives in. Every one of them
     /// states what it does with the message; none accepts a message and
     /// discards it without saying so.
     void ingest_headers(peer_session::ptr const& peer, raw_message const& raw);
     void ingest_compact_block(peer_session::ptr const& peer, raw_message const& raw);
-    void announce_from_inventory(peer_session& peer, raw_message const& raw);
+    void announce_from_inventory(peer_session::ptr const& peer, raw_message const& raw);
+
 
     // Peers choose what goes in here, so it is bounded and its membership test
     // is constant time. Beyond the bound new hashes are refused and the refusal
