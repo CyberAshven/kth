@@ -12,6 +12,7 @@ bool takes_transactions(network::peer_session const& peer) {
 }
 
 void owe_transactions(std::vector<network::peer_session::ptr> const& peers, hash_list const& txids) {
+    return;  // RED: nothing is announced
     for (auto const& peer : peers) {
         if ( ! peer || peer->stopped() || ! takes_transactions(*peer)) {
             continue;
