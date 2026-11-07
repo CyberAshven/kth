@@ -50,7 +50,7 @@ domain::message::version make_version_message(
     version.set_nonce(config.nonce);
     version.set_user_agent(config.user_agent);
     version.set_start_height(config.start_height);
-    version.set_relay(config.relay);
+    version.set_relay(false);
 
     // The peer's services cannot be reflected, so zero it
     version.address_receiver().set_services(domain::message::version::service::none);
