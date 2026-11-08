@@ -290,11 +290,6 @@ void jd_client::mark_ready(attempt& value) {
         if ( ! header) return false;
         auto const payload = source.read_bytes(source.remaining_size());
         if ( ! payload) return false;
-        // A connection message: the same on either upstream, in any state.
-        if (header->extension() == 0 && ! header->channel_msg()
-            && header->msg_type == reconnect::message_type) {
-            return follow_reconnect(value, peer, *payload);
-        }
         // Share replies name one submission. Success is health-sampled.
         // An error is attributed in share_response; a stale or unknown
         // sequence must not end this attempt (sv2-spec 6.2).

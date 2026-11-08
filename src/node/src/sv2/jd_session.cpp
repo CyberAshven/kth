@@ -250,16 +250,6 @@ jd_session::result jd_session::process_mining(message_header const& header, byte
             }
             return fail("upstream closed extended channel");
         }
-        case channel_endpoint_changed::message_type: {
-            // A proxy in front of the pool moved this channel. The Mining
-            // connection negotiates no extensions, so the channel has no
-            // extension state to reset and keeps its work.
-            auto const message = parse<channel_endpoint_changed>(payload);
-            if ( ! message || ! matches_channel(message->channel_id)) {
-                return fail("invalid upstream channel endpoint change");
-            }
-            break;
-        }
         case update_channel_error::message_type: {
             auto const message = parse<update_channel_error>(payload);
             // Only this channel id is ever updated. An error naming its group
