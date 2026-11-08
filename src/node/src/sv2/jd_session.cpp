@@ -12,6 +12,7 @@
 
 #include <kth/domain/version.hpp>
 #include <kth/node/sv2/connection.hpp>
+#include <kth/node/sv2/extensions.hpp>
 #include <kth/node/sv2/jd_messages.hpp>
 #include <kth/node/sv2/primitives.hpp>
 
@@ -65,12 +66,14 @@ std::string printable_error_code(std::string const& code) {
 } // namespace
 
 jd_session::jd_session(jd_peer peer, std::string host, uint16_t port,
-    std::string user_identity, bool full_template)
+    std::string user_identity, bool full_template, bool worker_names)
     : peer_(peer)
     , host_(std::move(host))
     , port_(port)
     , identity_(std::move(user_identity))
     , full_template_(full_template)
+    , worker_names_(peer == jd_peer::mining && worker_names)
+    , negotiate_extensions_(peer == jd_peer::declaration || worker_names_)
 {}
 
 data_chunk jd_session::start() {
@@ -111,22 +114,32 @@ bool jd_session::payout_outputs() const {
     return payout_outputs_;
 }
 
-bool jd_session::awaiting_extensions() const {
-    return state_ == state::awaiting_extensions;
-}
-
 bool jd_session::restart_without_extensions() {
     if (state_ != state::awaiting_extensions) return false;
     // Idle lets start() send SetupConnection again. Negotiation stays off, so
     // this session cannot sit in awaiting_extensions a second time.
     payout_outputs_ = false;
     negotiate_extensions_ = false;
+    extensions_pending_ = false;
+    worker_identities_ = false;
     state_ = state::idle;
     return true;
 }
 
 std::optional<open_extended_mining_channel_success> const& jd_session::channel() const {
     return channel_;
+}
+
+void jd_session::skip_extensions() {
+    negotiate_extensions_ = false;
+}
+
+bool jd_session::awaiting_extensions() const {
+    return state_ == state::awaiting_extensions;
+}
+
+bool jd_session::worker_identities() const {
+    return worker_identities_;
 }
 
 void jd_session::note_hash_rate(float value) {
@@ -139,11 +152,11 @@ std::optional<update_channel> jd_session::hash_rate_update() {
     return update_channel{channel_->channel_id, hash_rate_, open_max_target()};
 }
 
-jd_session::result jd_session::fail(std::string error) {
+jd_session::result jd_session::fail(std::string error, bool incompatible) {
     state_ = state::closed;
     channel_.reset();
     error_ = std::move(error);
-    return {{}, true, false, error_};
+    return {{}, true, false, error_, incompatible};
 }
 
 jd_session::result jd_session::process_setup(message_header const& header, byte_span payload) {
@@ -158,15 +171,16 @@ jd_session::result jd_session::process_setup(message_header const& header, byte_
             && (error->flags & jd_flag_declare_tx_data) != 0) {
             reason += "; this JDS requires full-template (sv2.jd.mode = full-template)";
         }
-        return fail(std::move(reason));
+        return fail(std::move(reason), true);
     }
     if (header.msg_type != setup_connection_success::message_type) {
         return fail("unexpected upstream setup message");
     }
     auto const success = parse<setup_connection_success>(payload);
-    if ( ! success || success->used_version != 2) return fail("invalid upstream setup version");
+    if ( ! success) return fail("malformed upstream setup success");
+    if (success->used_version != 2) return fail("invalid upstream setup version", true);
     uint32_t const allowed = peer_ == jd_peer::mining ? mining_flag_requires_extended_channels : 0;
-    if ((success->flags & ~allowed) != 0) return fail("unsupported upstream setup flags");
+    if ((success->flags & ~allowed) != 0) return fail("unsupported upstream setup flags", true);
     if (peer_ == jd_peer::declaration && ! negotiate_extensions_) {
         // The previous connection already sent RequestExtensions and was closed
         // when that response did not arrive. This one must not send it again.
@@ -185,6 +199,57 @@ jd_session::result jd_session::process_setup(message_header const& header, byte_
         payout_outputs_ = false;
         return {frame(request), false, false, {}};
     }
+    if ( ! negotiate_extensions_) return open_channel();
+    // Extension 0x0001, section 4: the answer has to arrive before the channel
+    // request. Silence is not a refusal; the caller replaces this connection
+    // with one that does not ask.
+    state_ = state::awaiting_extensions;
+    return {request_worker_identities(), false, false, {}};
+}
+
+data_chunk jd_session::request_worker_identities() {
+    request_extensions request;
+    request.request_id = ++extensions_request_;
+    request.requested_extensions.push_back(worker_hashrate_tracking_extension);
+    extensions_pending_ = true;
+    return frame(request);
+}
+
+jd_session::result jd_session::process_extensions(message_header const& header, byte_span payload) {
+    if (header.channel_msg()) return fail("invalid extension negotiation frame");
+    uint16_t answered = 0;
+    bool granted = false;
+    bool required = false;
+    if (header.msg_type == request_extensions_success::message_type) {
+        auto const success = parse<request_extensions_success>(payload);
+        if ( ! success) return fail("invalid extension negotiation success");
+        answered = success->request_id;
+        // Only what the pool lists may be used (extension 0x0001, section 1.1).
+        granted = std::find(success->supported_extensions.begin(), success->supported_extensions.end(),
+            worker_hashrate_tracking_extension) != success->supported_extensions.end();
+    } else if (header.msg_type == request_extensions_error::message_type) {
+        auto const error = parse<request_extensions_error>(payload);
+        if ( ! error) return fail("invalid extension negotiation error");
+        answered = error->request_id;
+        required = ! error->required_extensions.empty();
+    } else {
+        return fail("unexpected extension negotiation message");
+    }
+    if (answered != extensions_request_) {
+        // A later ChannelEndpointChanged asked again, so only that answer counts.
+        if (state_ == state::ready) return {{}, false, true, {}};
+        return fail("invalid extension negotiation reply");
+    }
+    // The pool requires an extension this node does not implement, and
+    // disconnects a client that goes on without it.
+    if (required) return fail("upstream requires an unsupported extension", true);
+    extensions_pending_ = false;
+    worker_identities_ = granted;
+    if (state_ == state::awaiting_extensions) return open_channel();
+    return {{}, false, true, {}};
+}
+
+jd_session::result jd_session::open_channel() {
     open_extended_mining_channel request;
     request.request_id = channel_request_id;
     request.user_identity = identity_;
@@ -197,7 +262,8 @@ jd_session::result jd_session::process_setup(message_header const& header, byte_
     return {frame(request), false, false, {}};
 }
 
-jd_session::result jd_session::process_extensions(message_header const& header, byte_span payload) {
+jd_session::result jd_session::process_declaration_extensions(message_header const& header,
+    byte_span payload) {
     if (header.extension() != extensions_negotiation_type) {
         // A base message before negotiation finishes is out of order. Any other
         // extension is not this request's answer and must not end the wait.
@@ -224,7 +290,10 @@ jd_session::result jd_session::process_extensions(message_header const& header, 
             return fail("invalid extension negotiation error");
         }
         // An extension this node does not implement, and the pool requires it.
-        if ( ! error->required_extensions.empty()) return fail("upstream requires an unsupported extension");
+        // A retry cannot supply it, as on the Mining connection.
+        if ( ! error->required_extensions.empty()) {
+            return fail("upstream requires an unsupported extension", true);
+        }
         payout_outputs_ = false;
         state_ = state::ready;
         return {{}, false, true, {}};
@@ -318,6 +387,19 @@ jd_session::result jd_session::process_mining(message_header const& header, byte
             }
             return fail("upstream closed extended channel");
         }
+        case channel_endpoint_changed::message_type: {
+            // A proxy in front of the pool moved this channel, which keeps its
+            // work. sv2-spec 3.6.4: extension state resets and negotiation
+            // begins again, so shares go without the worker until the new
+            // answer grants it. A connection that never asked has none.
+            auto const message = parse<channel_endpoint_changed>(payload);
+            if ( ! message || ! matches_channel(message->channel_id)) {
+                return fail("invalid upstream channel endpoint change");
+            }
+            if ( ! negotiate_extensions_) break;
+            worker_identities_ = false;
+            return {request_worker_identities(), false, true, {}};
+        }
         case update_channel_error::message_type: {
             auto const message = parse<update_channel_error>(payload);
             // Only this channel id is ever updated. An error naming its group
@@ -343,9 +425,29 @@ jd_session::result jd_session::process(message_header const& header, byte_span p
     if (header.msg_length != payload.size() || payload.size() > max_payload_size) {
         return fail("invalid upstream frame length");
     }
-    if (state_ == state::awaiting_extensions) return process_extensions(header, payload);
+    // The Job Declaration connection's answer to Requested Payout Outputs.
+    if (peer_ == jd_peer::declaration && state_ == state::awaiting_extensions) {
+        return process_declaration_extensions(header, payload);
+    }
+    if (peer_ == jd_peer::mining && header.extension() == extensions_negotiation_type) {
+        if (extensions_pending_) return process_extensions(header, payload);
+        // Nothing was asked, so this answers nothing. Extension 0x0001,
+        // section 4: a pool disconnects a client without the extensions it
+        // requires. An entry that is not the operator's own never sends worker
+        // names, so such a pool is incompatible with it.
+        if ( ! header.channel_msg() && header.msg_type == request_extensions_error::message_type) {
+            auto const error = parse<request_extensions_error>(payload);
+            if (error && ! error->required_extensions.empty()) {
+                return fail("upstream requires an extension this connection did not negotiate",
+                    ! worker_names_);
+            }
+        }
+    }
     if (header.extension() != 0) return {{}, false, ready(), {}};
     if (state_ == state::awaiting_setup) return process_setup(header, payload);
+    if (state_ == state::awaiting_extensions) {
+        return fail("unexpected upstream message during extension negotiation");
+    }
     if (state_ == state::awaiting_channel) return process_channel(header, payload);
     if (peer_ == jd_peer::mining) return process_mining(header, payload);
     return fail("unexpected upstream declaration message");

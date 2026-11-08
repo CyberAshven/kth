@@ -29,10 +29,13 @@ struct jd_session {
         bool close = false;
         bool ready = false;
         std::string error;
+        bool incompatible = false;
     };
 
+    // `worker_names` marks a Mining upstream the operator runs. Only such a
+    // session asks for Worker-Specific Hashrate Tracking (0x0002).
     jd_session(jd_peer peer, std::string host, uint16_t port,
-        std::string user_identity, bool full_template);
+        std::string user_identity, bool full_template, bool worker_names = false);
 
     // Single use. Empty means the session could not be started.
     [[nodiscard]] data_chunk start();
@@ -40,13 +43,24 @@ struct jd_session {
     [[nodiscard]] bool ready() const;
     // True only after RequestExtensions.Success lists Requested Payout Outputs.
     [[nodiscard]] bool payout_outputs() const;
-    [[nodiscard]] bool awaiting_extensions() const;
     // RequestExtensions went unanswered. Return to idle so start() sends
     // SetupConnection again, and leave negotiation off: the next success is
     // ready and does not send RequestExtensions. Returns false unless that
-    // wait was still open, so a mining timeout is unchanged.
+    // wait was still open. The JDS connection restarts this way; a Mining
+    // session left unanswered is replaced with its pair, see skip_extensions().
     bool restart_without_extensions();
     [[nodiscard]] std::optional<open_extended_mining_channel_success> const& channel() const;
+
+    // A marked Mining session sends RequestExtensions for 0x0002 after
+    // SetupConnection.Success and opens the channel once it is answered. Call
+    // before start() to open it without asking: the previous connection to
+    // this pool got no answer.
+    void skip_extensions();
+    // RequestExtensions is unanswered, and no channel request or Job
+    // Declaration message has been sent.
+    [[nodiscard]] bool awaiting_extensions() const;
+    // The pool granted 0x0002: each SubmitSharesExtended carries the worker.
+    [[nodiscard]] bool worker_identities() const;
 
     // The downstream channels' summed nominal hash rate (sv2-spec 5.3.2), zero
     // until a miner connects. The channel request carries the value noted last.
@@ -60,9 +74,12 @@ private:
         idle, awaiting_setup, awaiting_extensions, awaiting_channel, ready, closed
     };
 
-    [[nodiscard]] result fail(std::string error);
+    [[nodiscard]] result fail(std::string error, bool incompatible = false);
     [[nodiscard]] result process_setup(message_header const& header, byte_span payload);
     [[nodiscard]] result process_extensions(message_header const& header, byte_span payload);
+    [[nodiscard]] result process_declaration_extensions(message_header const& header, byte_span payload);
+    [[nodiscard]] result open_channel();
+    [[nodiscard]] data_chunk request_worker_identities();
     [[nodiscard]] result process_channel(message_header const& header, byte_span payload);
     [[nodiscard]] result process_mining(message_header const& header, byte_span payload);
     [[nodiscard]] bool matches_channel(uint32_t id) const;
@@ -73,15 +90,23 @@ private:
     std::string identity_;
     bool full_template_;
     state state_ = state::idle;
-    // The first connection always asks. Cleared only for the one reconnect
-    // that proceeds without extensions.
-    bool negotiate_extensions_ = true;
     bool payout_outputs_ = false;
     std::string error_;
     std::optional<open_extended_mining_channel_success> channel_;
     float hash_rate_ = 0;
     // Sent in the channel request or the last UpdateChannel.
     float reported_hash_rate_ = 0;
+    bool worker_names_;
+    // A declaration session's first connection always asks for Requested
+    // Payout Outputs; restart_without_extensions() clears it for the one
+    // reconnect that proceeds without. A Mining session asks for 0x0002 when
+    // worker_names_, until skip_extensions().
+    bool negotiate_extensions_;
+    // The Mining connection's RequestExtensions is outstanding. Only the
+    // latest request_id answers it.
+    bool extensions_pending_ = false;
+    uint16_t extensions_request_ = 0;
+    bool worker_identities_ = false;
 };
 
 } // namespace kth::node::sv2
