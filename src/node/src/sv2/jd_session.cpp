@@ -290,10 +290,7 @@ jd_session::result jd_session::process_declaration_extensions(message_header con
             return fail("invalid extension negotiation error");
         }
         // An extension this node does not implement, and the pool requires it.
-        // A retry cannot supply it, as on the Mining connection.
-        if ( ! error->required_extensions.empty()) {
-            return fail("upstream requires an unsupported extension", true);
-        }
+        if ( ! error->required_extensions.empty()) return fail("upstream requires an unsupported extension");
         payout_outputs_ = false;
         state_ = state::ready;
         return {{}, false, true, {}};

@@ -360,7 +360,7 @@ refusal and does not fall back to solo: that Job Declaration socket is closed
 and one new connection completes `SetupConnection` without sending
 `RequestExtensions`. The pool connection stays up, and declarations use the
 base coinbase. A required extension this node does not implement closes the
-attempt and disables the entry until restart, like a missing required feature.
+attempt, which fails over like any other failed attempt.
 
 With the extension off, each new template asks the JDS for
 `AllocateMiningJobToken` and builds the coinbase from the allocation's
