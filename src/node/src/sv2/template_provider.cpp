@@ -931,6 +931,13 @@ template_provider::template_provider(sv2_settings const& settings,
             // its next message is read. Other connections have their own loop.
             if (session.sending_data() && (session.answering() || ! inbox.ready())) {
                 if ( ! co_await send_data()) co_return;
+                // An explicit answer cannot be interrupted by a fee refresh.
+                // Once its final page drains, wake dispatch even if no more
+                // transactions or client messages arrive in the meantime.
+                if ( ! session.answering() && ! refresh_queued && refresh_due()) {
+                    refresh_queued = inbox.try_send(std::error_code{},
+                        event{event_kind::refresh, {}, {}});
+                }
                 continue;
             }
             auto [error, input] = co_await next_event();
@@ -1014,7 +1021,7 @@ template_provider::template_provider(sv2_settings const& settings,
             if ( ! co_await deliver(result)) co_return;
             // After every event, not only a refresh wake-up: one may have been
             // dropped, and the pool itself says whether a look is due.
-            if (auto const current = refresh_due(); view && current) {
+            if (auto const current = session.answering() ? std::nullopt : refresh_due(); view && current) {
                 auto better = co_await refresh_fees(view->tip_hash, *current);
                 if ( ! co_await deliver(better)) co_return;
             }

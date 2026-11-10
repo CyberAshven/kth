@@ -26,6 +26,7 @@
 #include <asio/io_context.hpp>
 #include <asio/ip/address_v4.hpp>
 #include <asio/read.hpp>
+#include <asio/socket_base.hpp>
 #include <asio/use_future.hpp>
 #include <asio/write.hpp>
 
@@ -147,13 +148,15 @@ struct listener_fixture {
     std::vector<std::shared_ptr<::asio::ip::tcp::socket>> clients;
     bool running = false;
 
-    explicit listener_fixture(node::sv2_settings const& settings, bool local_admission = false)
+    explicit listener_fixture(node::sv2_settings const& settings, bool local_admission = false,
+        bool non_standard_transactions = false)
         : submissions(local_admission ? std::make_shared<blockchain::block_submission_channel>(4, 1) : nullptr)
     {
         REQUIRE(chain.created());
         // Every mempool change rebuilds the next template the chain serves, so
         // a fee refresh is paced only by the provider's own interval.
         chain.settings().gbt_template_refresh_seconds = 0;
+        chain.settings().accept_non_standard_transactions = non_standard_transactions;
         REQUIRE(chain.start(submissions));
         provider = std::make_shared<template_provider>(settings, io.get_executor(), chain.chain());
     }
@@ -210,9 +213,13 @@ struct listener_fixture {
         return state->port;
     }
 
-    std::shared_ptr<::asio::ip::tcp::socket> connect(uint16_t port) {
+    std::shared_ptr<::asio::ip::tcp::socket> connect(uint16_t port, int receive_buffer = 0) {
         auto client = std::make_shared<::asio::ip::tcp::socket>(io);
         clients.push_back(client);
+        if (receive_buffer > 0) {
+            client->open(::asio::ip::tcp::v4());
+            client->set_option(::asio::socket_base::receive_buffer_size(receive_buffer));
+        }
         auto state = std::make_shared<operation>();
         client->async_connect({::asio::ip::address_v4::loopback(), port},
             [state](std::error_code error) {
@@ -702,6 +709,46 @@ data_chunk raw_transaction(domain::chain::transaction const& tx) {
     byte_writer writer(bytes);
     REQUIRE(tx.to_data(writer, true));
     return bytes;
+}
+
+// A consensus-valid signed spend above half a data page. Many ordinary P2PKH
+// outputs make a paged template without a large script or artificial mempool
+// insertion. Its size is nonstandard; only its fixture enables that policy.
+domain::chain::transaction admit_bulk_spend(listener_fixture& fixture,
+    domain::chain::transaction const& funding) {
+    constexpr size_t output_count = 18000;
+    constexpr uint64_t fee = 1000000;
+    constexpr uint64_t padding_value = 1000;
+    domain::chain::input::list inputs;
+    inputs.emplace_back(domain::chain::output_point{funding.hash(), 0},
+        domain::chain::script{}, 0xffffffff);
+    domain::chain::output::list outputs;
+    outputs.emplace_back(funding.outputs().front().value() - fee
+            - (output_count - 1) * padding_value,
+        test::miner_script(), domain::chain::token_data_opt{});
+    for (size_t index = 1; index < output_count; ++index) {
+        outputs.emplace_back(padding_value, test::miner_script(), domain::chain::token_data_opt{});
+    }
+    domain::chain::transaction unsigned_tx(1, 0, std::move(inputs), std::move(outputs));
+    unsigned_tx.inputs()[0].previous_output().validation.cache = funding.outputs().front();
+    auto const view = fixture.chain.chain().chain_view();
+    REQUIRE(view);
+    auto const endorsement = domain::chain::script::create_endorsement(test::miner_secret(),
+        test::miner_script(), unsigned_tx, 0,
+        uint8_t(infrastructure::machine::sighash_algorithm::forkid_all),
+        view->state->enabled_flags(), funding.outputs().front().value());
+    REQUIRE(endorsement.has_value());
+    domain::chain::input::list signed_inputs;
+    signed_inputs.emplace_back(domain::chain::output_point{funding.hash(), 0},
+        domain::chain::script(domain::chain::script::to_pay_public_key_hash_pattern_unlocking(
+            *endorsement, test::miner_public())), 0xffffffff);
+    domain::chain::transaction tx(1, 0, std::move(signed_inputs),
+        domain::chain::output::list(unsigned_tx.outputs()));
+    REQUIRE(tx.serialized_size(true) > template_provider_session::data_page_size / 2);
+    REQUIRE(tx.serialized_size(true) < 1000000);
+    REQUIRE(fixture.execute(fixture.chain.chain().organize(
+        std::make_shared<domain::message::transaction const>(tx))) == error::success);
+    return tx;
 }
 
 } // namespace
@@ -2098,6 +2145,73 @@ TEST_CASE("sv2 pushes a same-tip fee refresh as a non-future large-template delt
     fixture.finish_writing(*client);
     REQUIRE(fixture.receive<request_transaction_data_success>(*client).transaction_list
         == base.transaction_list);
+    fixture.require_closed(*client);
+    fixture.stop();
+}
+
+TEST_CASE("sv2 finishes a paged transaction answer before a due fee refresh", "[sv2 template_provider]") {
+    listener_fixture fixture(refresh_settings(1, 1000), false, true);
+    auto const trunk = seed_chain(fixture, 121);
+    constexpr size_t count = 20;
+    for (size_t index = 0; index < count; ++index) {
+        (void)admit_bulk_spend(fixture, trunk[index].transactions().front());
+    }
+    auto const expected = fixture.execute(fixture.chain.chain().fetch_mining_template(
+        blockchain::coinbase_reserve{248 + 120, 3}));
+    REQUIRE(expected);
+    REQUIRE(expected->selection.txs.size() == count);
+    auto const raw = raw_transactions(*expected);
+
+    // A small advertised window keeps the initial 12 MB push in progress
+    // while the client asks for it again and a fee increase becomes due.
+    auto client = fixture.connect(fixture.start(), 64 * 1024);
+    fixture.write(*client, frame(setup()));
+    (void)fixture.receive<setup_connection_success>(*client);
+    fixture.write(*client, frame(request_extensions{1, {large_templates_extension}}));
+    (void)fixture.receive<request_extensions_success>(*client);
+    auto const first = request_template(fixture, *client);
+    fixture.write(*client, frame(request_transaction_data{first.work.template_id}));
+    auto const past = std::chrono::steady_clock::now() + 1500ms;
+    REQUIRE(fixture.wait_until([&] { return std::chrono::steady_clock::now() >= past; }));
+    auto const added_tx = admit_spend(fixture, trunk[count].transactions().front(), 3000);
+
+    auto const receive_full = [&] {
+        std::vector<data_chunk> transactions;
+        for (size_t index = 0; index < count; ++index) {
+            if (index + 1 == count) {
+                auto const last = fixture.receive<request_transaction_data_success>(*client);
+                REQUIRE(last.template_id == first.work.template_id);
+                REQUIRE(last.transaction_list.size() == 1);
+                transactions.insert(transactions.end(),
+                    last.transaction_list.begin(), last.transaction_list.end());
+            } else {
+                auto const page = fixture.receive<request_transaction_data_transactions>(*client);
+                REQUIRE(page.template_id == first.work.template_id);
+                REQUIRE(page.transaction_list.size() == 1);
+                transactions.insert(transactions.end(),
+                    page.transaction_list.begin(), page.transaction_list.end());
+            }
+        }
+        REQUIRE(transactions == raw);
+    };
+    // The push and explicit answer both finish before another NewTemplate.
+    receive_full();
+    receive_full();
+
+    // No further input or admission is needed to wake the deferred refresh.
+    auto const refreshed = fixture.receive<new_template>(*client);
+    REQUIRE_FALSE(refreshed.future_template);
+    REQUIRE(refreshed.coinbase_tx_value_remaining == first.work.coinbase_tx_value_remaining + 3000);
+    auto const kept = fixture.receive<request_transaction_data_kept>(*client);
+    REQUIRE(kept.template_id == refreshed.template_id);
+    REQUIRE(kept.base_template_id == first.work.template_id);
+    REQUIRE(kept.kept == data_chunk{0xff, 0xff, 0x0f});
+    auto const added = fixture.receive<request_transaction_data_success>(*client);
+    REQUIRE(added.template_id == refreshed.template_id);
+    REQUIRE(added.transaction_list == std::vector<data_chunk>{raw_transaction(added_tx)});
+    template_data const delta{kept, added.transaction_list, 0};
+    REQUIRE(client_merkle_path(rebuild(delta, raw)) == refreshed.merkle_path);
+    fixture.finish_writing(*client);
     fixture.require_closed(*client);
     fixture.stop();
 }
