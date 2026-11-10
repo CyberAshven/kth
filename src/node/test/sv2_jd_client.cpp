@@ -31,9 +31,9 @@
 #include <asio/use_future.hpp>
 #include <asio/write.hpp>
 
+#include <kth/blockchain/interface/block_chain.hpp>
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
-
 #include <kth/domain/chain/compact.hpp>
 #include <kth/domain/chain/header.hpp>
 #include <kth/domain/chain/output.hpp>
@@ -46,7 +46,9 @@
 #include <kth/node/mining/work.hpp>
 #include <kth/node/p2p_node.hpp>
 #include <kth/node/sv2/connection.hpp>
+#include <kth/node/sv2/extensions.hpp>
 #include <kth/node/sv2/jd_client.hpp>
+#include <kth/node/sv2/jd_failover.hpp>
 #include <kth/node/sv2/jd_messages.hpp>
 #include <kth/node/sv2/mining_messages.hpp>
 #include <kth/node/sv2/noise.hpp>
@@ -163,6 +165,23 @@ struct io_driver {
         REQUIRE(state->size == 0);
         REQUIRE(state->error == ::asio::error::eof);
     }
+
+    void eof_after_pending(::asio::ip::tcp::socket& socket) {
+        auto const end = std::chrono::steady_clock::now() + 5s;
+        for (;;) {
+            auto const now = std::chrono::steady_clock::now();
+            REQUIRE(now < end);
+            auto const state = begin_read(socket, 8192, false);
+            REQUIRE(wait_until([&] { return state->done; },
+                std::chrono::duration_cast<std::chrono::milliseconds>(end - now)));
+            if (state->error) {
+                REQUIRE(state->error == ::asio::error::eof);
+                REQUIRE(state->size == 0);
+                return;
+            }
+            REQUIRE(state->size != 0);
+        }
+    }
 };
 
 struct fake_upstream {
@@ -205,6 +224,19 @@ struct fake_upstream {
         socket.close(ignored);
     }
 
+    void accept_again() {
+        std::error_code error;
+        socket.close(error);
+        REQUIRE_FALSE(error);
+        transport.reset();
+        frames.clear();
+        accepted = std::make_shared<operation>();
+        acceptor.async_accept(socket, [state = accepted](std::error_code error) {
+            state->error = error;
+            state->done = true;
+        });
+    }
+
     void handshake() {
         REQUIRE(driver.wait_until([&] { return accepted->done; }));
         REQUIRE_FALSE(accepted->error);
@@ -223,8 +255,8 @@ struct fake_upstream {
         transport.emplace(*responder.keys(), false);
     }
 
-    template <typename Message>
-    Message receive() {
+    // One whole plaintext frame, header included.
+    data_chunk receive_frame() {
         auto const end = std::chrono::steady_clock::now() + 5s;
         while (frames.empty() && std::chrono::steady_clock::now() < end) {
             auto const bytes = driver.read(socket, 8192, false);
@@ -235,20 +267,29 @@ struct fake_upstream {
         REQUIRE_FALSE(frames.empty());
         auto bytes = std::move(frames.front());
         frames.pop_front();
-        return decode<Message>(bytes);
+        return bytes;
+    }
+
+    template <typename Message>
+    Message receive() {
+        return decode<Message>(receive_frame());
     }
 
     template <typename Message>
     void send(Message const& message) {
-        send_plain(frame(message));
+        send_frame(frame(message));
     }
 
-    void send_plain(data_chunk plain) {
-        auto const bytes = transport->encrypt_frame(plain);
+    void send_frame(data_chunk const& plaintext) {
+        auto const bytes = transport->encrypt_frame(plaintext);
         REQUIRE(bytes);
         // A protocol reply can straddle reads just like its encrypted tags.
         driver.write(socket, data_chunk(bytes->begin(), bytes->end() - 1));
         driver.write(socket, data_chunk(bytes->end() - 1, bytes->end()));
+    }
+
+    void send_plain(data_chunk plain) {
+        send_frame(plain);
     }
 
     void finish_writing() {
@@ -257,6 +298,15 @@ struct fake_upstream {
         REQUIRE_FALSE(error);
     }
 };
+
+// The Mining connection asks for Worker-Specific Hashrate Tracking right after
+// SetupConnection.Success. The pool grants it or refuses it.
+void answer_extensions(fake_upstream& pool, bool grant) {
+    auto const request = pool.receive<request_extensions>();
+    REQUIRE(request.requested_extensions == std::vector<uint16_t>{worker_hashrate_tracking_extension});
+    if (grant) pool.send(request_extensions_success{request.request_id, {worker_hashrate_tracking_extension}});
+    else pool.send(request_extensions_error{request.request_id, request.requested_extensions, {}});
+}
 
 std::string payout_address() {
     data_chunk bytes(21, 0x11);
@@ -292,6 +342,29 @@ node::sv2_settings settings(fake_upstream const& pool, fake_upstream const& jds)
     value.jd.user_identity = "account.worker";
     value.jd.mode = "full-template";
     value.jd.response_timeout_seconds = 3;
+    return value;
+}
+
+std::string upstream(fake_upstream const& pool, fake_upstream const& jds,
+    std::string const& identity = "account.worker", std::string const& mode = "full-template") {
+    return "127.0.0.1:" + std::to_string(pool.port) + "|"
+        + noise_authority_key(pool.authority.public_key()) + "|127.0.0.1:"
+        + std::to_string(jds.port) + "|" + noise_authority_key(jds.authority.public_key())
+        + "|" + identity + "|" + mode;
+}
+
+node::sv2_settings settings(fake_upstream const& first_pool, fake_upstream const& first_jds,
+    fake_upstream const& second_pool, fake_upstream const& second_jds,
+    std::string const& mode = "full-template") {
+    auto value = settings(first_pool, first_jds);
+    value.jd.mining_address.clear();
+    value.jd.mining_authority_public_key.clear();
+    value.jd.jds_address.clear();
+    value.jd.jds_authority_public_key.clear();
+    value.jd.user_identity.clear();
+    value.jd.mode.clear();
+    value.jd.upstreams = {upstream(first_pool, first_jds, "account.worker", mode),
+        upstream(second_pool, second_jds, "account.worker", mode)};
     return value;
 }
 
@@ -342,8 +415,9 @@ struct client_fixture : io_driver {
         REQUIRE(mining.endpoint_port == pool.port);
     }
 
-    open_extended_mining_channel open() {
+    open_extended_mining_channel open(bool grant = false) {
         pool.send(setup_connection_success{2, mining_flag_requires_extended_channels});
+        answer_extensions(pool, grant);
         auto const request = pool.receive<open_extended_mining_channel>();
         REQUIRE(request.user_identity == "account.worker");
         REQUIRE(request.min_extranonce_size == jd_session::min_extranonce_size);
@@ -358,11 +432,12 @@ struct client_fixture : io_driver {
     }
 
     void finished(bool success) {
-        await(result);
-        REQUIRE_NOTHROW(result.get());
         await(ready);
         if (success) REQUIRE_NOTHROW(ready.get());
         else REQUIRE_THROWS_AS(ready.get(), std::system_error);
+        client->stop();
+        await(result);
+        REQUIRE_NOTHROW(result.get());
     }
 };
 
@@ -571,7 +646,9 @@ struct miner_link {
     open_extended_mining_channel_success opened;
     downstream_work work;
 
-    miner_link(io_driver& driver, uint16_t port, float hash_rate = 0.f)
+    // `tracking` negotiates Worker-Specific Hashrate Tracking with the listener,
+    // as a proxy that names each share's worker does.
+    miner_link(io_driver& driver, uint16_t port, float hash_rate = 0.f, bool tracking = false)
         : driver(driver)
         , socket(driver.io) {
         auto connected = std::make_shared<operation>();
@@ -590,6 +667,11 @@ struct miner_link {
         target.fill(0xff);
         driver.write(socket, frame(setup));
         REQUIRE(receive_plain<setup_connection_success>(driver, socket).used_version == 2);
+        if (tracking) {
+            driver.write(socket, frame(request_extensions{1, {worker_hashrate_tracking_extension}}));
+            REQUIRE(receive_plain<request_extensions_success>(driver, socket).supported_extensions
+                == std::vector<uint16_t>{worker_hashrate_tracking_extension});
+        }
         // With JD enabled a downstream channel rolls JD's fixed reserve.
         driver.write(socket, frame(open_extended_mining_channel{1, "miner", hash_rate, target,
             node::mining::jd_downstream_extranonce_size}));
@@ -739,35 +821,76 @@ void send_encrypted(io_driver& driver, ::asio::ip::tcp::socket& socket,
     driver.write(socket, data_chunk(bytes->end() - 1, bytes->end()));
 }
 
-void answer_extensions(client_fixture& fixture, bool grant) {
-    auto const request = fixture.jds.receive<request_extensions>();
+// The Job Declaration connection asks for Requested Payout Outputs right after
+// SetupConnection.Success. The JDS grants it or refuses it.
+void answer_payout_extensions(fake_upstream& jds, bool grant) {
+    auto const request = jds.receive<request_extensions>();
     REQUIRE(request.request_id == 1);
     REQUIRE(request.requested_extensions == std::vector<uint16_t>{requested_payout_outputs_extension});
     if (grant) {
-        fixture.jds.send(request_extensions_success{request.request_id,
+        jds.send(request_extensions_success{request.request_id,
             {requested_payout_outputs_extension}});
         return;
     }
-    fixture.jds.send(request_extensions_error{request.request_id, {}, {}});
+    jds.send(request_extensions_error{request.request_id, {}, {}});
+}
+
+// `grant` answers the pool's 0x0002 request and `payout` the JDS's 0x5052 one.
+void handshake_upstreams(fake_upstream& pool, fake_upstream& jds, bool full,
+    hash_digest const* target = nullptr, std::string const& identity = "account.worker",
+    bool grant = false, bool payout = false) {
+    pool.handshake();
+    jds.handshake();
+    auto const mining = pool.receive<setup_connection>();
+    REQUIRE(mining.protocol == setup_connection::protocol_mining);
+    REQUIRE(mining.endpoint_port == pool.port);
+    REQUIRE(mining.flags == (mining_flag_requires_work_selection | mining_flag_requires_version_rolling));
+    auto const declaration = jds.receive<setup_connection>();
+    REQUIRE(declaration.protocol == setup_connection::protocol_job_declaration);
+    REQUIRE(declaration.endpoint_port == jds.port);
+    REQUIRE(declaration.flags == (full ? 1u : 0u));
+    jds.send(setup_connection_success{2, 0});
+    answer_payout_extensions(jds, payout);
+    pool.send(setup_connection_success{2, mining_flag_requires_extended_channels});
+    answer_extensions(pool, grant);
+    auto const request = pool.receive<open_extended_mining_channel>();
+    REQUIRE(request.user_identity == identity);
+    REQUIRE(request.min_extranonce_size == jd_session::min_extranonce_size);
+    hash_digest maximum;
+    maximum.fill(0xff);
+    pool.send(open_extended_mining_channel_success{request.request_id, 7,
+        target == nullptr ? maximum : *target,
+        jd_session::min_extranonce_size, data_chunk(8, 0x12), 8});
 }
 
 void handshake_upstreams(client_fixture& fixture, bool full, hash_digest const* target = nullptr,
-    bool grant = false) {
-    fixture.pool.handshake();
-    fixture.jds.handshake();
-    (void)fixture.pool.receive<setup_connection>();
-    auto const declaration = fixture.jds.receive<setup_connection>();
-    REQUIRE(declaration.protocol == setup_connection::protocol_job_declaration);
-    REQUIRE(declaration.flags == (full ? 1u : 0u));
-    fixture.jds.send(setup_connection_success{2, 0});
-    answer_extensions(fixture, grant);
-    auto const request = fixture.open();
-    if (target == nullptr) {
-        fixture.accept(request);
-        return;
-    }
-    fixture.pool.send(open_extended_mining_channel_success{request.request_id, 7, *target,
-        jd_session::min_extranonce_size, data_chunk(8, 0x12), 8});
+    bool grant = false, bool payout = false) {
+    handshake_upstreams(fixture.pool, fixture.jds, full, target, "account.worker", grant, payout);
+}
+
+set_custom_mining_job accept_coinbase_template(fake_upstream& pool, fake_upstream& jds,
+    uint32_t job_id = 77) {
+    auto const allocation = jds.receive<allocate_mining_job_token>();
+    jds.send(allocate_mining_job_token_success{allocation.request_id,
+        {1, 2, 3}, output_bytes(pool_output_list())});
+    auto const custom = pool.receive<set_custom_mining_job>();
+    REQUIRE(custom.request_id == allocation.request_id);
+    pool.send(set_custom_mining_job_success{custom.channel_id, custom.request_id, job_id});
+    return custom;
+}
+
+node::mining::pool_proof proof_for(jd_notice const& notice) {
+    node::mining::pool_proof proof;
+    proof.work_id = notice.pooled.work_id;
+    // Coinbase generation the pool declared. A zero here is not "unset":
+    // the client drops a proof whose generation is not that declaration.
+    proof.generation = notice.pooled.generation;
+    proof.prev_hash = notice.previous;
+    proof.upstream_extranonce.resize(notice.pooled.upstream_extranonce_size, 0x44);
+    proof.version = notice.pooled.tmpl.version;
+    proof.ntime = notice.pooled.tmpl.current_time;
+    proof.bits = notice.pooled.tmpl.bits;
+    return proof;
 }
 
 struct declared_template {
@@ -780,20 +903,20 @@ struct declared_template {
 // `finish` false stops after DeclareMiningJob, before its Success. The pool
 // coinbase is already published from the token, so the caller can refuse the
 // declaration and watch the next job return to the solo payout.
-declared_template declare_local_template(client_fixture& fixture, miner_link& miner,
-    bool full, bool finish = true) {
-    auto const allocation = fixture.jds.receive<allocate_mining_job_token>();
+declared_template declare_local_template(io_driver& driver, fake_upstream& pool,
+    fake_upstream& jds, miner_link& miner, bool full, bool finish = true) {
+    auto const allocation = jds.receive<allocate_mining_job_token>();
     REQUIRE(allocation.user_identifier == "account.worker");
     REQUIRE(allocation.request_id != 0);
     // Coinbase-only must not follow the token with DeclareMiningJob. Arm the
     // read before the token succeeds, while the JDS socket is still idle.
     std::shared_ptr<operation> quiet;
-    if ( ! full) quiet = fixture.begin_read(fixture.jds.socket, 1);
-    fixture.jds.send(allocate_mining_job_token_success{allocation.request_id,
+    if ( ! full) quiet = driver.begin_read(jds.socket, 1);
+    jds.send(allocate_mining_job_token_success{allocation.request_id,
         {1, 2, 3}, output_bytes(pool_output_list())});
     declare_mining_job declaration{};
     if (full) {
-        declaration = fixture.jds.receive<declare_mining_job>();
+        declaration = jds.receive<declare_mining_job>();
         REQUIRE(declaration.request_id == allocation.request_id);
         REQUIRE(declaration.mining_job_token == data_chunk{1, 2, 3});
         REQUIRE(declaration.excess_data.empty());
@@ -806,20 +929,20 @@ declared_template declare_local_template(client_fixture& fixture, miner_link& mi
             REQUIRE(pays(coinbase_from(pooled), pool_script(), 2));
             return {std::move(declaration), full, {}, pooled};
         }
-        fixture.jds.send(provide_missing_transactions{declaration.request_id, {}});
-        auto const supplied = fixture.jds.receive<provide_missing_transactions_success>();
+        jds.send(provide_missing_transactions{declaration.request_id, {}});
+        auto const supplied = jds.receive<provide_missing_transactions_success>();
         REQUIRE(supplied.request_id == declaration.request_id);
         REQUIRE(supplied.transaction_list.empty());
-        fixture.jds.send(declare_mining_job_success{declaration.request_id, {9, 8, 7}});
+        jds.send(declare_mining_job_success{declaration.request_id, {9, 8, 7}});
     }
-    auto const custom = fixture.pool.receive<set_custom_mining_job>();
+    auto const custom = pool.receive<set_custom_mining_job>();
     if (quiet) {
         CHECK_FALSE(quiet->done);
         // Join the silence read before callers read the JDS socket again.
         std::error_code error;
-        fixture.jds.socket.cancel(error);
+        jds.socket.cancel(error);
         REQUIRE_FALSE(error);
-        REQUIRE(fixture.wait_until([&] { return quiet->done; }));
+        REQUIRE(driver.wait_until([&] { return quiet->done; }));
     }
     REQUIRE(custom.channel_id == 7);
     REQUIRE(custom.request_id == allocation.request_id);
@@ -853,6 +976,11 @@ declared_template declare_local_template(client_fixture& fixture, miner_link& mi
     REQUIRE(std::equal(custom.coinbase_prefix.begin(), custom.coinbase_prefix.end(), script.begin()));
     REQUIRE(pays(tx, pool_script(), 2));
     return {std::move(declaration), full, custom, pooled};
+}
+
+declared_template declare_local_template(client_fixture& fixture, miner_link& miner,
+    bool full, bool finish = true) {
+    return declare_local_template(fixture, fixture.pool, fixture.jds, miner, full, finish);
 }
 
 hash_digest share_hash(downstream_work const& work, data_chunk const& extranonce, uint32_t nonce) {
@@ -900,7 +1028,7 @@ void expect_idle(io_driver& driver, ::asio::ip::tcp::socket& socket) {
     REQUIRE(driver.wait_until([&] { return quiet->done; }));
 }
 
-void require_no_reconnect(client_fixture& fixture) {
+void require_no_immediate_retry(client_fixture& fixture) {
     ::asio::ip::tcp::socket retry(fixture.io);
     auto accepted = std::make_shared<operation>();
     fixture.pool.acceptor.async_accept(retry, [accepted](std::error_code error) {
@@ -915,6 +1043,10 @@ void require_no_reconnect(client_fixture& fixture) {
     });
     CHECK_FALSE(fixture.wait_until([&] { return accepted->done; }, 50ms));
     CHECK_FALSE(jd_accepted->done);
+}
+
+void require_no_reconnect(client_fixture& fixture) {
+    require_no_immediate_retry(fixture);
 }
 
 // Swap the default logger for one that keeps what was written, including debug.
@@ -1087,7 +1219,7 @@ payout_round complete_payout(client_fixture& fixture, miner_link& miner, bool fu
 
 } // namespace
 
-TEST_CASE("sv2 JD client negotiates both modes and consumes either upstream disconnect without reconnecting", "[sv2 jd]") {
+TEST_CASE("sv2 JD client negotiates both modes and backs off after either upstream disconnect", "[sv2 jd]") {
     for (bool const full_template : {false, true}) {
         for (bool const pool_drop : {false, true}) {
             CAPTURE(full_template, pool_drop);
@@ -1101,7 +1233,7 @@ TEST_CASE("sv2 JD client negotiates both modes and consumes either upstream disc
             REQUIRE(declaration.flags == (full_template ? 1u : 0u));
             REQUIRE(declaration.endpoint_port == fixture.jds.port);
             fixture.jds.send(setup_connection_success{2, 0});
-            answer_extensions(fixture, false);
+            answer_payout_extensions(fixture.jds, false);
             auto const request = fixture.open();
             fixture.accept(request);
             fixture.await(fixture.ready);
@@ -1109,27 +1241,268 @@ TEST_CASE("sv2 JD client negotiates both modes and consumes either upstream disc
             // An EOF after the one channel request also proves that no second
             // channel request was queued while both upstreams were ready.
             (pool_drop ? fixture.pool : fixture.jds).finish_writing();
-            fixture.await(fixture.result);
-            REQUIRE_NOTHROW(fixture.result.get());
             fixture.eof(fixture.pool.socket);
             fixture.eof(fixture.jds.socket);
-
-            ::asio::ip::tcp::socket retry(fixture.io);
-            auto accepted = std::make_shared<operation>();
-            fixture.pool.acceptor.async_accept(retry, [accepted](std::error_code error) {
-                accepted->error = error;
-                accepted->done = true;
-            });
-            ::asio::ip::tcp::socket jd_retry(fixture.io);
-            auto jd_accepted = std::make_shared<operation>();
-            fixture.jds.acceptor.async_accept(jd_retry, [jd_accepted](std::error_code error) {
-                jd_accepted->error = error;
-                jd_accepted->done = true;
-            });
-            CHECK_FALSE(fixture.wait_until([&] { return accepted->done; }, 50ms));
-            CHECK_FALSE(jd_accepted->done);
+            require_no_immediate_retry(fixture);
+            CHECK(fixture.result.wait_for(0s) != std::future_status::ready);
+            fixture.client->stop();
+            fixture.await(fixture.result);
+            REQUIRE_NOTHROW(fixture.result.get());
         }
     }
+}
+
+TEST_CASE("sv2 JD starts the first configured entry and advances after connection or setup failure", "[sv2 jd]") {
+    enum class trigger { connect, pool_setup, jds_setup, fixed_version, channel, timeout, latency, pool_drop, jds_drop };
+    auto which = trigger::connect;
+    SECTION("connect failure") {}
+    SECTION("pool setup refused") { which = trigger::pool_setup; }
+    SECTION("JDS setup refused") { which = trigger::jds_setup; }
+    SECTION("required version rolling missing") { which = trigger::fixed_version; }
+    SECTION("extended channel refused") { which = trigger::channel; }
+    SECTION("setup message timeout") { which = trigger::timeout; }
+    SECTION("setup latency exceeds threshold") { which = trigger::latency; }
+    SECTION("pool dropped") { which = trigger::pool_drop; }
+    SECTION("JDS dropped") { which = trigger::jds_drop; }
+    client_fixture fixture;
+    fake_upstream backup_pool(fixture, 6);
+    fake_upstream backup_jds(fixture, 7);
+    auto configuration = settings(fixture.pool, fixture.jds, backup_pool, backup_jds);
+    configuration.jd.response_timeout_seconds = 1;
+    if (which == trigger::latency) {
+        configuration.jd.response_timeout_seconds = 3;
+        configuration.jd.max_latency_milliseconds = 1000;
+    }
+    configuration.jd.upstreams.back() = upstream(backup_pool, backup_jds, "backup.worker", "coinbase-only");
+    if (which == trigger::connect) {
+        std::error_code error;
+        fixture.pool.acceptor.close(error);
+        REQUIRE_FALSE(error);
+    }
+    fixture.start(configuration);
+    if (which != trigger::connect) {
+        fixture.setup();
+        (void)fixture.jds.receive<setup_connection>();
+        CHECK_FALSE(backup_pool.accepted->done);
+        CHECK_FALSE(backup_jds.accepted->done);
+        if (which == trigger::pool_setup) {
+            fixture.pool.send(setup_connection_error{mining_flag_requires_work_selection, "unsupported-feature-flags"});
+        } else if (which == trigger::jds_setup) {
+            fixture.jds.send(setup_connection_error{1, "unsupported-feature-flags"});
+        } else if (which == trigger::fixed_version) {
+            fixture.pool.send(setup_connection_success{2, mining_flag_requires_fixed_version});
+        } else if (which == trigger::timeout) {
+            fixture.jds.send(setup_connection_success{2, 0});
+            answer_payout_extensions(fixture.jds, false);
+        } else {
+            fixture.jds.send(setup_connection_success{2, 0});
+            answer_payout_extensions(fixture.jds, false);
+            if (which == trigger::latency) {
+                auto const delayed_until = std::chrono::steady_clock::now() + 1100ms;
+                REQUIRE(fixture.wait_until([&] {
+                    return std::chrono::steady_clock::now() >= delayed_until;
+                }, 2s));
+                fixture.pool.send(setup_connection_success{2, mining_flag_requires_extended_channels});
+            } else {
+                auto const request = fixture.open();
+                if (which == trigger::channel) {
+                    fixture.pool.send(open_mining_channel_error{request.request_id, "unknown-user"});
+                } else {
+                    fixture.accept(request);
+                    fixture.await(fixture.ready);
+                    REQUIRE_NOTHROW(fixture.ready.get());
+                    (which == trigger::pool_drop ? fixture.pool : fixture.jds).finish_writing();
+                }
+            }
+        }
+        fixture.eof(fixture.pool.socket);
+        fixture.eof(fixture.jds.socket);
+    }
+    handshake_upstreams(backup_pool, backup_jds, false, nullptr, "backup.worker");
+    REQUIRE(fixture.wait_until([&] {
+        auto const status = fixture.client->status();
+        return status && status->active == std::optional<size_t>{1}
+            && status->entries[1].health == jd_health::healthy;
+    }));
+    if (fixture.ready.valid()) {
+        fixture.await(fixture.ready);
+        REQUIRE_NOTHROW(fixture.ready.get());
+    }
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
+    fixture.eof(backup_pool.socket);
+    fixture.eof(backup_jds.socket);
+}
+
+TEST_CASE("sv2 JD flags an authority mismatch and moves to the next entry without an immediate retry", "[sv2 jd]") {
+    client_fixture fixture;
+    fake_upstream backup_pool(fixture, 6);
+    fake_upstream backup_jds(fixture, 7);
+    auto configuration = settings(fixture.pool, fixture.jds, backup_pool, backup_jds);
+    auto const wrong_key = noise_authority_key(keypair(9).public_key());
+    auto& first = configuration.jd.upstreams.front();
+    auto const actual_key = noise_authority_key(fixture.pool.authority.public_key());
+    auto const offset = first.find(actual_key);
+    REQUIRE(offset != std::string::npos);
+    first.replace(offset, actual_key.size(), wrong_key);
+    fixture.start(configuration);
+    fixture.jds.handshake();
+    (void)fixture.jds.receive<setup_connection>();
+    fixture.pool.handshake();
+    fixture.eof(fixture.pool.socket);
+    fixture.eof(fixture.jds.socket);
+    handshake_upstreams(backup_pool, backup_jds, true);
+    fixture.await(fixture.ready);
+    REQUIRE_NOTHROW(fixture.ready.get());
+    REQUIRE(fixture.wait_until([&] {
+        auto const status = fixture.client->status();
+        return status && status->active == std::optional<size_t>{1}
+            && status->entries[1].health == jd_health::healthy;
+    }));
+    auto const status = fixture.client->status();
+    REQUIRE(status->entries.size() == 2);
+    REQUIRE(status->entries.front().health == jd_health::authority_hold);
+    REQUIRE_FALSE(status->entries.front().last_error.empty());
+    REQUIRE(status->entries.front().retry_at > std::chrono::steady_clock::now());
+    require_no_immediate_retry(fixture);
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
+}
+
+TEST_CASE("sv2 JD follows a Reconnect to another server of the same pool and keeps the entry's place", "[sv2 jd]") {
+    enum class side { mining, declaration, present };
+    auto moving = side::mining;
+    SECTION("the Mining connection moves") {}
+    SECTION("the JDS connection moves") { moving = side::declaration; }
+    SECTION("an empty host and a zero port keep the present address") { moving = side::present; }
+    client_fixture fixture;
+    // The fixture's pool and JDS authority secrets, so both prove the configured keys.
+    fake_upstream moved_pool(fixture, 4);
+    fake_upstream moved_jds(fixture, 5);
+    captured_log log;
+    fixture.start(settings(fixture.pool, fixture.jds));
+    handshake_upstreams(fixture, true);
+    fixture.await(fixture.ready);
+    REQUIRE_NOTHROW(fixture.ready.get());
+    if (moving == side::mining) fixture.pool.send(reconnect{"127.0.0.1", moved_pool.port});
+    else if (moving == side::declaration) fixture.jds.send(reconnect{"127.0.0.1", moved_jds.port});
+    else fixture.pool.send(reconnect{});
+    // The whole pair starts over; only the connection that was moved changes address.
+    fixture.eof_after_pending(fixture.pool.socket);
+    fixture.eof_after_pending(fixture.jds.socket);
+    if (moving != side::mining) fixture.pool.accept_again();
+    if (moving != side::declaration) fixture.jds.accept_again();
+    // SetupConnection names the address each connection now uses.
+    handshake_upstreams(moving == side::mining ? moved_pool : fixture.pool,
+        moving == side::declaration ? moved_jds : fixture.jds, true);
+    REQUIRE(fixture.wait_until([&] {
+        auto const status = fixture.client->status();
+        return status && status->active == std::optional<size_t>{0}
+            && status->entries[0].health == jd_health::healthy;
+    }));
+    auto const status = fixture.client->status();
+    REQUIRE(status->entries[0].last_error.empty());
+    REQUIRE(status->entries[0].backoff == 0s);
+    REQUIRE(log.count("at the upstream's Reconnect") == 1);
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
+}
+
+TEST_CASE("sv2 JD Reconnect cannot reach another authority, skip the retry hold or keep a dead address", "[sv2 jd]") {
+    enum class trigger { authority, early, malformed, invalid, unreachable };
+    auto which = trigger::authority;
+    SECTION("the new server proves another authority") {}
+    SECTION("Reconnect before the pair is healthy") { which = trigger::early; }
+    SECTION("malformed Reconnect") { which = trigger::malformed; }
+    SECTION("Reconnect to an invalid host") { which = trigger::invalid; }
+    SECTION("the new server drops the connection after its handshake") { which = trigger::unreachable; }
+    client_fixture fixture;
+    fake_upstream moved_pool(fixture, which == trigger::authority ? 9 : 4);
+    auto configuration = settings(fixture.pool, fixture.jds);
+    configuration.jd.retry_initial_seconds = 1;
+    configuration.jd.recovery_hold_seconds = 1;
+    fixture.start(configuration);
+    auto const expect_error = [&](std::string_view text, jd_health health) {
+        REQUIRE(fixture.wait_until([&] {
+            auto const status = fixture.client->status();
+            return status && status->entries[0].health == health;
+        }));
+        REQUIRE(fixture.client->status()->entries[0].last_error.find(text) != std::string::npos);
+    };
+    if (which == trigger::early) {
+        fixture.setup();
+        (void)fixture.jds.receive<setup_connection>();
+        fixture.pool.send(reconnect{"127.0.0.1", moved_pool.port});
+        fixture.eof_after_pending(fixture.pool.socket);
+        fixture.eof_after_pending(fixture.jds.socket);
+        expect_error("Reconnect before the pair was healthy", jd_health::backoff);
+        // The move waits for the retry hold, then uses the new address.
+        CHECK_FALSE(fixture.wait_until([&] { return moved_pool.accepted->done; }, 500ms));
+        fixture.jds.accept_again();
+        handshake_upstreams(moved_pool, fixture.jds, true);
+        REQUIRE(fixture.wait_until([&] {
+            auto const status = fixture.client->status();
+            return status && status->entries[0].health == jd_health::healthy;
+        }));
+    } else {
+        handshake_upstreams(fixture, true);
+        fixture.await(fixture.ready);
+        REQUIRE_NOTHROW(fixture.ready.get());
+        if (which == trigger::malformed) {
+            data_chunk const payload{0x05, 'p', 'o'};
+            auto bytes = to_data_chunk(message_header{0, reconnect::message_type,
+                static_cast<uint32_t>(payload.size())});
+            bytes.insert(bytes.end(), payload.begin(), payload.end());
+            fixture.pool.send_plain(bytes);
+        } else if (which == trigger::invalid) {
+            fixture.pool.send(reconnect{"pool host", 0});
+        } else {
+            fixture.pool.send(reconnect{"127.0.0.1", moved_pool.port});
+        }
+        fixture.eof_after_pending(fixture.pool.socket);
+        fixture.eof_after_pending(fixture.jds.socket);
+        if (which == trigger::malformed) {
+            expect_error("malformed upstream Reconnect", jd_health::backoff);
+        } else if (which == trigger::invalid) {
+            expect_error("named an invalid address", jd_health::backoff);
+        } else if (which == trigger::authority) {
+            // Mining goes to the new server; the JDS returns to its own address.
+            fixture.jds.accept_again();
+            REQUIRE(fixture.wait_until([&] { return fixture.jds.accepted->done; }));
+            moved_pool.handshake();
+            expect_error("", jd_health::authority_hold);
+            fixture.eof_after_pending(fixture.jds.socket);
+            require_no_immediate_retry(fixture);
+        } else {
+            fixture.jds.accept_again();
+            REQUIRE(fixture.wait_until([&] {
+                return moved_pool.accepted->done && fixture.jds.accepted->done;
+            }));
+            // Past the handshake, so the drop is a plain transient failure. A
+            // handshake cut short is held like an authentication failure.
+            moved_pool.handshake();
+            (void)moved_pool.receive<setup_connection>();
+            std::error_code error;
+            moved_pool.socket.close(error);
+            REQUIRE_FALSE(error);
+            expect_error("", jd_health::backoff);
+            fixture.eof_after_pending(fixture.jds.socket);
+            // The failed entry drops the redirect: its retry uses the configured address.
+            fixture.pool.accept_again();
+            fixture.jds.accept_again();
+            handshake_upstreams(fixture, true);
+            REQUIRE(fixture.wait_until([&] {
+                auto const status = fixture.client->status();
+                return status && status->entries[0].health == jd_health::healthy;
+            }));
+        }
+    }
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
 }
 
 TEST_CASE("sv2 JD client setup and extended channel refusals terminate both upstreams", "[sv2 jd]") {
@@ -1147,7 +1520,7 @@ TEST_CASE("sv2 JD client setup and extended channel refusals terminate both upst
     }
     SECTION("pool channel") {
         fixture.jds.send(setup_connection_success{2, 0});
-        answer_extensions(fixture, false);
+        answer_payout_extensions(fixture.jds, false);
         auto const request = fixture.open();
         fixture.pool.send(open_mining_channel_error{request.request_id, "unknown-user"});
         fixture.pool.finish_writing();
@@ -1259,7 +1632,7 @@ TEST_CASE("sv2 JD silent setup or channel closes both upstreams while solo jobs 
     REQUIRE(pool_closed->error == ::asio::error::eof);
     REQUIRE(jds_closed->size == 0);
     REQUIRE(jds_closed->error == ::asio::error::eof);
-    // The client has stopped. Either no second JDS connection was opened, or
+    // The pair has stopped. Either no second JDS connection was opened, or
     // the negotiation deadline opened one and the pool deadline already closed
     // it. Handshake bytes may already be buffered; the socket must not stay up.
     // Which of the two deadlines fired first does not change this.
@@ -1361,7 +1734,7 @@ TEST_CASE("sv2 JD publications wake every subscriber and coalesce to the latest 
     fixture.setup();
     (void)fixture.jds.receive<setup_connection>();
     fixture.jds.send(setup_connection_success{2, 0});
-    answer_extensions(fixture, false);
+    answer_payout_extensions(fixture.jds, false);
     auto const request = fixture.open();
     fixture.accept(request);
     fixture.await(fixture.ready);
@@ -1456,7 +1829,12 @@ TEST_CASE("sv2 JD client ends both upstreams when chain notifications stop", "[s
 TEST_CASE("sv2 JD fallback finishes before a later tip and chain shutdown", "[sv2 jd]") {
     auto chain = started_chain("sv2_jd_fallback_tip_stop");
     client_fixture fixture;
-    fixture.start(settings(fixture.pool, fixture.jds), &chain->chain());
+    auto configuration = settings(fixture.pool, fixture.jds);
+    // DeclareMiningJob.Error demotes this entry. The client keeps running, so
+    // the hold has to outlast the successor below or that tip could revive it.
+    configuration.jd.retry_initial_seconds = 3600;
+    configuration.jd.retry_max_seconds = 3600;
+    fixture.start(configuration, &chain->chain());
     handshake_upstreams(fixture, true);
     fixture.await(fixture.ready);
     REQUIRE_NOTHROW(fixture.ready.get());
@@ -1471,18 +1849,44 @@ TEST_CASE("sv2 JD fallback finishes before a later tip and chain shutdown", "[sv
     fixture.jds.send(declare_mining_job_error{declaration.request_id, "policy-refused", {}});
     fixture.jds.finish_writing();
     REQUIRE(fixture.wait_until([&] {
-        return fixture.result.wait_for(0s) == std::future_status::ready;
+        auto const status = fixture.client->status();
+        auto const notice = fixture.client->notice();
+        return status && notice && ! notice->pool && notice->generation > pooled->generation
+            && status->entries.size() == 1
+            && status->entries[0].health == jd_health::backoff
+            && ! status->active && ! status->probe
+            && fixture.result.wait_for(0s) != std::future_status::ready;
     }, 1s));
-    REQUIRE_NOTHROW(fixture.result.get());
     auto const solo = fixture.client->notice();
     REQUIRE(solo);
     REQUIRE_FALSE(solo->pool);
     REQUIRE(solo->generation > pooled->generation);
+    auto const demoted = fixture.client->status();
+    REQUIRE(demoted);
+    REQUIRE(demoted->entries[0].health == jd_health::backoff);
+    REQUIRE(demoted->entries[0].last_error.find("JDS refused the local template") != std::string::npos);
+    REQUIRE(demoted->entries[0].retry_at > std::chrono::steady_clock::now());
+    REQUIRE_FALSE(demoted->active);
+    REQUIRE_FALSE(demoted->probe);
+    REQUIRE(fixture.result.wait_for(0s) != std::future_status::ready);
     fixture.eof(fixture.pool.socket);
     fixture.eof(fixture.jds.socket);
 
-    // Connecting a successor publishes a real tip after the JD attempt ended.
-    // It must not revive declarations or replace the terminal solo notice.
+    ::asio::ip::tcp::socket retry(fixture.io);
+    auto accepted = std::make_shared<operation>();
+    fixture.pool.acceptor.async_accept(retry, [accepted](std::error_code error) {
+        accepted->error = error;
+        accepted->done = true;
+    });
+    ::asio::ip::tcp::socket jd_retry(fixture.io);
+    auto jd_accepted = std::make_shared<operation>();
+    fixture.jds.acceptor.async_accept(jd_retry, [jd_accepted](std::error_code error) {
+        jd_accepted->error = error;
+        jd_accepted->done = true;
+    });
+
+    // The successor is a real tip on this client's strand. It must not open
+    // either socket again or replace the solo notice published for the error.
     auto const block = test::mine_block(solo->previous, 2, uint32_t(zulu_time()), 0, {}, 0);
     std::vector<domain::chain::block> const blocks{block};
     REQUIRE(chain->organizer().add_headers(test::headers_of(blocks)).headers_added == 1);
@@ -1491,8 +1895,23 @@ TEST_CASE("sv2 JD fallback finishes before a later tip and chain shutdown", "[sv
     auto const view = chain->chain().chain_view();
     REQUIRE(view);
     REQUIRE(view->tip_hash == block.hash());
-    CHECK_FALSE(fixture.wait_until([&] { return fixture.client->notice() != solo; }, 50ms));
+    REQUIRE_FALSE(fixture.wait_until([&] {
+        auto const status = fixture.client->status();
+        return accepted->done || jd_accepted->done
+            || fixture.client->notice() != solo
+            || ! status
+            || status->entries.size() != 1
+            || status->entries[0].health != jd_health::backoff
+            || status->active.has_value()
+            || status->probe.has_value()
+            || fixture.result.wait_for(0s) == std::future_status::ready;
+    }, 50ms));
 
+    fixture.client->stop();
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.result.wait_for(0s) == std::future_status::ready;
+    }, 1s));
+    REQUIRE_NOTHROW(fixture.result.get());
     // run() has joined its receiver, so chain shutdown can outlive the client.
     std::weak_ptr<jd_client> const ended = fixture.client;
     fixture.client.reset();
@@ -1662,6 +2081,11 @@ TEST_CASE("sv2 JD fallback pays the solo address on the next downstream job", "[
     client_fixture fixture;
     auto configuration = settings(fixture.pool, fixture.jds);
     configuration.jd.mode = full ? "full-template" : "coinbase-only";
+    // One entry, demoted rather than removed. The hold has to outlast every
+    // section, including the share refusal's dishonest hold.
+    configuration.jd.retry_initial_seconds = 3600;
+    configuration.jd.retry_max_seconds = 3600;
+    configuration.jd.authority_hold_seconds = 3600;
     std::string error;
     auto const payout = node::mining::payout_from_address(configuration.mining.address,
         domain::config::network::regtest, error);
@@ -1687,7 +2111,8 @@ TEST_CASE("sv2 JD fallback pays the solo address on the next downstream job", "[
         REQUIRE(jds_closed->error == ::asio::error::eof);
         CHECK_FALSE(pending->done);
         solo_job(fixture, provider.port, payout->script);
-        require_no_reconnect(fixture);
+        require_no_immediate_retry(fixture);
+        REQUIRE(provider.result.wait_for(0s) != std::future_status::ready);
         return;
     }
     auto const declared = declare_local_template(fixture, miner, full,
@@ -1720,7 +2145,8 @@ TEST_CASE("sv2 JD fallback pays the solo address on the next downstream job", "[
     require_solo_again(miner, declared.pooled, payout->script);
     fixture.eof(fixture.pool.socket);
     fixture.eof(fixture.jds.socket);
-    require_no_reconnect(fixture);
+    require_no_immediate_retry(fixture);
+    REQUIRE(provider.result.wait_for(0s) != std::future_status::ready);
 }
 
 TEST_CASE("sv2 JD granted payout outputs are what downstream miners and the pool see", "[sv2 jd]") {
@@ -1741,7 +2167,7 @@ TEST_CASE("sv2 JD granted payout outputs are what downstream miners and the pool
         domain::config::network::regtest, error);
     REQUIRE(solo);
     provider_run provider(fixture, configuration, chain);
-    handshake_upstreams(fixture, full, nullptr, true);
+    handshake_upstreams(fixture, full, nullptr, false, true);
     miner_link miner(fixture, provider.port);
     REQUIRE(pays(coinbase_from(miner.work), solo->script, 1));
     auto const tip = chain->chain().chain_view();
@@ -1803,7 +2229,7 @@ TEST_CASE("sv2 JD stale payout notice allocates a new token before declaring", "
     auto chain = started_chain("sv2_jd_pay_stale");
     client_fixture fixture;
     provider_run provider(fixture, settings(fixture.pool, fixture.jds), chain);
-    handshake_upstreams(fixture, true, nullptr, true);
+    handshake_upstreams(fixture, true, nullptr, false, true);
     auto const allocation = fixture.jds.receive<allocate_mining_job_token>();
     auto const reserved = output_bytes(paid_split(false));
     fixture.jds.send(allocate_mining_job_token_success{allocation.request_id,
@@ -1843,7 +2269,7 @@ TEST_CASE("sv2 JD payout error and timeout fall back without replacing the solo 
         domain::config::network::regtest, error);
     REQUIRE(solo);
     provider_run provider(fixture, configuration, chain);
-    handshake_upstreams(fixture, true, nullptr, true);
+    handshake_upstreams(fixture, true, nullptr, false, true);
     miner_link miner(fixture, provider.port);
     REQUIRE(pays(coinbase_from(miner.work), solo->script, 1));
     auto const allocation = fixture.jds.receive<allocate_mining_job_token>();
@@ -1879,7 +2305,7 @@ TEST_CASE("sv2 JD repeated stale payout answers fall back to solo", "[sv2 jd]") 
         domain::config::network::regtest, error);
     REQUIRE(solo);
     provider_run provider(fixture, configuration, chain);
-    handshake_upstreams(fixture, true, nullptr, true);
+    handshake_upstreams(fixture, true, nullptr, false, true);
     miner_link miner(fixture, provider.port);
     REQUIRE(pays(coinbase_from(miner.work), solo->script, 1));
     auto const reserved = output_bytes(paid_split(false));
@@ -1907,6 +2333,685 @@ TEST_CASE("sv2 JD repeated stale payout answers fall back to solo", "[sv2 jd]") 
     CHECK_FALSE(pending->done);
     solo_job(fixture, provider.port, solo->script);
     require_no_reconnect(fixture);
+}
+
+TEST_CASE("sv2 JD advances to the next pool after token, declaration, custom job or share failure", "[sv2 jd]") {
+    enum class trigger { token, declaration, custom, share, share_timeout };
+    auto which = trigger::token;
+    SECTION("token timeout") {}
+    SECTION("declaration refused") { which = trigger::declaration; }
+    SECTION("custom job refused") { which = trigger::custom; }
+    SECTION("valid share refused") { which = trigger::share; }
+    SECTION("share response timeout") { which = trigger::share_timeout; }
+    bool const full = which != trigger::custom;
+    auto chain = started_chain("sv2_jd_next_pool");
+    client_fixture fixture;
+    fake_upstream backup_pool(fixture, 6);
+    fake_upstream backup_jds(fixture, 7);
+    auto configuration = settings(fixture.pool, fixture.jds, backup_pool, backup_jds,
+        full ? "full-template" : "coinbase-only");
+    configuration.jd.response_timeout_seconds = 1;
+    std::string error;
+    auto const solo = node::mining::payout_from_address(configuration.mining.address,
+        domain::config::network::regtest, error);
+    REQUIRE(solo);
+    provider_run provider(fixture, configuration, chain);
+    handshake_upstreams(fixture, full);
+    miner_link miner(fixture, provider.port);
+    REQUIRE(pays(coinbase_from(miner.work), solo->script, 1));
+    auto const original = miner.work;
+    std::optional<declared_template> declared;
+    if (which == trigger::token) {
+        auto const token = fixture.jds.receive<allocate_mining_job_token>();
+        REQUIRE(token.user_identifier == "account.worker");
+    } else {
+        declared = declare_local_template(fixture, miner, full, which != trigger::declaration);
+        if (which == trigger::declaration) {
+            fixture.jds.send(declare_mining_job_error{declared->declaration.request_id,
+                "pool-policy", {}});
+        } else if (which == trigger::custom) {
+            fixture.pool.send(set_custom_mining_job_error{declared->custom.channel_id,
+                declared->custom.request_id, "pool-policy"});
+        } else {
+            fixture.pool.send(set_custom_mining_job_success{declared->custom.channel_id,
+                declared->custom.request_id, 77});
+            data_chunk const extranonce(miner.opened.extranonce_size, 0x5a);
+            auto const nonce = find_nonce(declared->pooled, extranonce, false);
+            fixture.write(miner.socket, frame(submit_shares_extended{miner.opened.channel_id, 1,
+                declared->pooled.job.job_id, nonce, declared->pooled.prev.ntime_start,
+                declared->pooled.job.version, extranonce}));
+            auto const forwarded = fixture.pool.receive<submit_shares_extended>();
+            REQUIRE(forwarded.job_id == 77);
+            REQUIRE(receive_plain<submit_shares_success>(fixture, miner.socket).last_sequence_number == 1);
+            if (which == trigger::share) {
+                fixture.pool.send(submit_shares_error{forwarded.channel_id,
+                    forwarded.sequence_number, "stale-share"});
+            }
+        }
+        require_solo_again(miner, declared->pooled, solo->script);
+    }
+    fixture.eof(fixture.pool.socket);
+    fixture.eof(fixture.jds.socket);
+    // No template or downstream connection was replaced while the first pool
+    // failed. The second entry declares the same local transaction selection.
+    handshake_upstreams(backup_pool, backup_jds, full);
+    auto const replacement = declare_local_template(fixture, backup_pool, backup_jds, miner, full);
+    REQUIRE(replacement.pooled.prev.prev_hash == original.prev.prev_hash);
+    REQUIRE(replacement.pooled.job.merkle_path == original.job.merkle_path);
+    backup_pool.send(set_custom_mining_job_success{replacement.custom.channel_id,
+        replacement.custom.request_id, 88});
+    backup_pool.finish_writing();
+    require_solo_again(miner, replacement.pooled, solo->script);
+    fixture.eof(backup_pool.socket);
+    fixture.eof(backup_jds.socket);
+    solo_job(fixture, provider.port, solo->script);
+    provider.provider->stop();
+    fixture.await(provider.result);
+    REQUIRE_NOTHROW(provider.result.get());
+}
+
+TEST_CASE("sv2 JD retains one silent recovery probe while the healthy entry stays active", "[sv2 jd]") {
+    client_fixture fixture;
+    fake_upstream second_pool(fixture, 6);
+    fake_upstream second_jds(fixture, 7);
+    fake_upstream third_pool(fixture, 8);
+    fake_upstream third_jds(fixture, 9);
+    auto configuration = settings(fixture.pool, fixture.jds, second_pool, second_jds);
+    configuration.jd.upstreams.push_back(upstream(third_pool, third_jds));
+    configuration.jd.retry_initial_seconds = 1;
+    configuration.jd.probe_interval_seconds = 1;
+    fixture.start(configuration);
+    handshake_upstreams(fixture, true);
+    fixture.await(fixture.ready);
+    REQUIRE_NOTHROW(fixture.ready.get());
+    fixture.pool.finish_writing();
+    fixture.eof(fixture.pool.socket);
+    fixture.eof(fixture.jds.socket);
+    handshake_upstreams(second_pool, second_jds, true);
+    second_pool.finish_writing();
+    fixture.eof(second_pool.socket);
+    fixture.eof(second_jds.socket);
+    handshake_upstreams(third_pool, third_jds, true);
+    REQUIRE(fixture.wait_until([&] {
+        auto const status = fixture.client->status();
+        return status && status->active == std::optional<size_t>{2}
+            && status->entries[2].health == jd_health::healthy;
+    }));
+    fixture.pool.accept_again();
+    fixture.jds.accept_again();
+    second_pool.accept_again();
+    second_jds.accept_again();
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.pool.accepted->done && fixture.jds.accepted->done;
+    }, 2s));
+    REQUIRE_FALSE(fixture.pool.accepted->error);
+    REQUIRE_FALSE(fixture.jds.accepted->error);
+    auto const probing = fixture.client->status();
+    REQUIRE(probing->active == std::optional<size_t>{2});
+    REQUIRE(probing->probe == std::optional<size_t>{0});
+    // Leave the first probe in Noise. Even once the other entry is eligible,
+    // it must not reserve another pair or displace the working third entry.
+    CHECK_FALSE(fixture.wait_until([&] {
+        return second_pool.accepted->done || second_jds.accepted->done;
+    }, 1100ms));
+    auto const held = fixture.client->status();
+    REQUIRE(held->active == std::optional<size_t>{2});
+    REQUIRE(held->probe == std::optional<size_t>{0});
+    REQUIRE(held->entries[2].health == jd_health::healthy);
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
+    fixture.eof(third_pool.socket);
+    fixture.eof(third_jds.socket);
+}
+
+TEST_CASE("sv2 JD recovery waits for accepted work, the hold and a local job boundary", "[sv2 jd]") {
+    bool from_solo = false;
+    SECTION("recover from another pool") {}
+    SECTION("recover from solo after every pool failed") { from_solo = true; }
+    auto chain = started_chain("sv2_jd_recovery");
+    client_fixture fixture;
+    fake_upstream backup_pool(fixture, 6);
+    fake_upstream backup_jds(fixture, 7);
+    auto configuration = settings(fixture.pool, fixture.jds, backup_pool, backup_jds, "coinbase-only");
+    if (from_solo) configuration.jd.upstreams.pop_back();
+    configuration.jd.retry_initial_seconds = 1;
+    configuration.jd.probe_interval_seconds = 1;
+    configuration.jd.recovery_hold_seconds = 1;
+    fixture.start(configuration, &chain->chain());
+    handshake_upstreams(fixture, false);
+    (void)accept_coinbase_template(fixture.pool, fixture.jds);
+    REQUIRE(fixture.wait_until([&] {
+        auto const status = fixture.client->status();
+        return status && status->entries[0].health == jd_health::healthy;
+    }));
+    fixture.pool.finish_writing();
+    fixture.eof(fixture.pool.socket);
+    fixture.eof(fixture.jds.socket);
+    if ( ! from_solo) {
+        handshake_upstreams(backup_pool, backup_jds, false);
+        (void)accept_coinbase_template(backup_pool, backup_jds, 88);
+    }
+    auto const retained = from_solo ? std::optional<size_t>{} : std::optional<size_t>{1};
+    REQUIRE(fixture.wait_until([&] {
+        auto const status = fixture.client->status();
+        return status && status->active == retained
+            && (from_solo || status->entries[1].health == jd_health::healthy);
+    }));
+    auto const active_notice = fixture.client->notice();
+    REQUIRE(active_notice);
+    REQUIRE(active_notice->pool == ! from_solo);
+    fixture.pool.accept_again();
+    fixture.jds.accept_again();
+    handshake_upstreams(fixture, false);
+    auto const token = fixture.jds.receive<allocate_mining_job_token>();
+    auto const connected_probe = fixture.client->status();
+    REQUIRE(connected_probe->probe == std::optional<size_t>{0});
+    REQUIRE(connected_probe->entries[0].health == jd_health::connecting);
+    REQUIRE(connected_probe->active == retained);
+    fixture.jds.send(allocate_mining_job_token_success{token.request_id,
+        {1, 2, 3}, output_bytes(pool_output_list())});
+    auto const custom = fixture.pool.receive<set_custom_mining_job>();
+    fixture.pool.send(set_custom_mining_job_success{custom.channel_id, custom.request_id, 99});
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.client->status()->entries[0].healthy_since.has_value();
+    }));
+    auto const recovered = fixture.client->status();
+    REQUIRE(recovered->active == retained);
+    REQUIRE(fixture.client->notice()->generation == active_notice->generation);
+    auto const hold_end = *recovered->entries[0].healthy_since + 1s;
+    REQUIRE(fixture.wait_until([&] { return std::chrono::steady_clock::now() >= hold_end; }, 2s));
+    CHECK_FALSE(fixture.wait_until([&] {
+        return fixture.client->status()->active == std::optional<size_t>{0};
+    }, 100ms));
+    REQUIRE(fixture.client->notice()->generation == active_notice->generation);
+    auto const view = chain->chain().chain_view();
+    REQUIRE(view);
+    auto const block = test::mine_block(view->tip_hash, 2, uint32_t(zulu_time()), 0, {}, 0);
+    std::vector<domain::chain::block> const blocks{block};
+    REQUIRE(chain->organizer().add_headers(test::headers_of(blocks)).headers_added == 1);
+    test::persist_headers(*chain, blocks, 2);
+    test::connect_bodies(*chain, blocks, 2);
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.client->status()->active == std::optional<size_t>{0};
+    }));
+    REQUIRE_FALSE(fixture.client->status()->probe);
+    if ( ! from_solo) {
+        fixture.eof_after_pending(backup_pool.socket);
+        fixture.eof_after_pending(backup_jds.socket);
+    }
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
+}
+
+TEST_CASE("sv2 JD flags valid share refusals and demotes invalid acknowledgements", "[sv2 jd]") {
+    enum class response { channel, sequence, count, malformed_success, trailing_success,
+        refusal_channel, refusal_sequence, malformed_refusal, trailing_refusal, dishonest };
+    auto which = response::channel;
+    SECTION("success names another channel") {}
+    SECTION("success names an unknown sequence") { which = response::sequence; }
+    SECTION("success count disagrees with sequence") { which = response::count; }
+    SECTION("success is truncated") { which = response::malformed_success; }
+    SECTION("success has trailing data") { which = response::trailing_success; }
+    SECTION("refusal names another channel") { which = response::refusal_channel; }
+    SECTION("refusal names an unknown sequence") { which = response::refusal_sequence; }
+    SECTION("refusal is truncated") { which = response::malformed_refusal; }
+    SECTION("refusal has trailing data") { which = response::trailing_refusal; }
+    SECTION("valid share refused on the current accepted job") { which = response::dishonest; }
+    auto chain = started_chain("sv2_jd_bad_share_reply");
+    client_fixture fixture;
+    fake_upstream backup_pool(fixture, 6);
+    fake_upstream backup_jds(fixture, 7);
+    auto const configuration = settings(fixture.pool, fixture.jds, backup_pool, backup_jds, "coinbase-only");
+    fixture.start(configuration, &chain->chain());
+    handshake_upstreams(fixture, false);
+    (void)accept_coinbase_template(fixture.pool, fixture.jds);
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.client->status()->entries[0].health == jd_health::healthy;
+    }));
+    auto const notice = fixture.client->notice();
+    REQUIRE(notice);
+    fixture.client->observe_share(proof_for(*notice));
+    auto const share = fixture.pool.receive<submit_shares_extended>();
+    // An error for a sequence this attempt did not send is not a refusal.
+    // send() runs the strand, so the capture has to be installed first.
+    std::optional<captured_log> unknown_refusal;
+    if (which == response::refusal_sequence) unknown_refusal.emplace();
+    if (which == response::malformed_success || which == response::malformed_refusal) {
+        auto const type = which == response::malformed_success
+            ? submit_shares_success::message_type : submit_shares_error::message_type;
+        fixture.pool.send_frame(to_data_chunk(message_header{message_header::channel_msg_flag, type, 0}));
+    } else if (which == response::trailing_success || which == response::trailing_refusal) {
+        auto payload = which == response::trailing_success
+            ? to_data_chunk(submit_shares_success{share.channel_id, share.sequence_number, 1, 1})
+            : to_data_chunk(submit_shares_error{share.channel_id, share.sequence_number, "stale-share"});
+        payload.push_back(0);
+        auto const type = which == response::trailing_success
+            ? submit_shares_success::message_type : submit_shares_error::message_type;
+        auto bytes = to_data_chunk(message_header{message_header::channel_msg_flag,
+            type, static_cast<uint32_t>(payload.size())});
+        bytes.insert(bytes.end(), payload.begin(), payload.end());
+        fixture.pool.send_frame(bytes);
+    } else if (which == response::refusal_channel || which == response::refusal_sequence
+        || which == response::dishonest) {
+        fixture.pool.send(submit_shares_error{share.channel_id + (which == response::refusal_channel ? 1u : 0u),
+            share.sequence_number + (which == response::refusal_sequence ? 1u : 0u), "stale-share"});
+    } else {
+        fixture.pool.send(submit_shares_success{share.channel_id + (which == response::channel ? 1u : 0u),
+            share.sequence_number + (which == response::sequence ? 1u : 0u),
+            which == response::count ? 2u : 1u, 1});
+    }
+    if (unknown_refusal) {
+        auto const sequence = share.sequence_number + 1;
+        REQUIRE(fixture.wait_until([&] {
+            return unknown_refusal->count("ignoring share error for unknown sequence "
+                + std::to_string(sequence)) >= 1;
+        }));
+        CHECK_FALSE(fixture.wait_until([&] {
+            return fixture.client->status()->entries[0].health != jd_health::healthy;
+        }, 100ms));
+        REQUIRE(fixture.client->status()->entries[0].health == jd_health::healthy);
+        REQUIRE(fixture.client->status()->active == std::optional<size_t>{0});
+        REQUIRE(unknown_refusal->count("pool refused a valid share") == 0);
+        REQUIRE(unknown_refusal->count("invalid upstream share") == 0);
+        REQUIRE(fixture.result.wait_for(0s) != std::future_status::ready);
+        fixture.client->stop();
+        fixture.await(fixture.result);
+        REQUIRE_NOTHROW(fixture.result.get());
+        return;
+    }
+    fixture.eof(fixture.pool.socket);
+    fixture.eof(fixture.jds.socket);
+    handshake_upstreams(backup_pool, backup_jds, false);
+    (void)accept_coinbase_template(backup_pool, backup_jds, 88);
+    REQUIRE(fixture.wait_until([&] {
+        auto const status = fixture.client->status();
+        return status && status->active == std::optional<size_t>{1}
+            && status->entries[1].health == jd_health::healthy;
+    }));
+    auto const failed = fixture.client->status()->entries[0];
+    REQUIRE(failed.health == (which == response::dishonest ? jd_health::dishonest : jd_health::backoff));
+    REQUIRE(failed.last_error.find(which == response::dishonest
+        ? "pool refused a valid share" : "invalid upstream share") != std::string::npos);
+    if (which == response::dishonest) {
+        REQUIRE(failed.retry_at > std::chrono::steady_clock::now());
+    }
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
+}
+
+TEST_CASE("sv2 JD accepts a batched share success that counts fewer than the submits it covers", "[sv2 jd]") {
+    auto chain = started_chain("sv2_jd_batched_share_success");
+    client_fixture fixture;
+    fake_upstream backup_pool(fixture, 6);
+    fake_upstream backup_jds(fixture, 7);
+    auto const configuration = settings(fixture.pool, fixture.jds, backup_pool, backup_jds, "coinbase-only");
+    fixture.start(configuration, &chain->chain());
+    handshake_upstreams(fixture, false);
+    (void)accept_coinbase_template(fixture.pool, fixture.jds);
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.client->status()->entries[0].health == jd_health::healthy;
+    }));
+    auto const notice = fixture.client->notice();
+    REQUIRE(notice);
+    auto proof = proof_for(*notice);
+    fixture.client->observe_share(proof);
+    auto const first = fixture.pool.receive<submit_shares_extended>();
+    ++proof.nonce;
+    fixture.client->observe_share(proof);
+    auto const second = fixture.pool.receive<submit_shares_extended>();
+    ++proof.nonce;
+    fixture.client->observe_share(proof);
+    auto const third = fixture.pool.receive<submit_shares_extended>();
+    auto const channel = first.channel_id;
+    auto const s0 = first.sequence_number;
+    auto const s1 = second.sequence_number;
+    auto const s2 = third.sequence_number;
+    REQUIRE(second.channel_id == channel);
+    REQUIRE(third.channel_id == channel);
+    REQUIRE(s1 == s0 + 1);
+    REQUIRE(s2 == s1 + 1);
+    // sv2-spec 5.3.13: last_sequence_number is the newest correct submit.
+    // The accepted count may be smaller than that prefix. The sum is not checked.
+    captured_log log;
+    fixture.pool.send(submit_shares_success{channel, s2, 2, 2});
+    ++proof.nonce;
+    fixture.client->observe_share(proof);
+    auto const forwarded = fixture.pool.receive<submit_shares_extended>();
+    REQUIRE(forwarded.channel_id == channel);
+    REQUIRE(forwarded.sequence_number == s2 + 1);
+    REQUIRE(forwarded.nonce == proof.nonce);
+    CHECK_FALSE(fixture.wait_until([&] {
+        return fixture.client->status()->entries[0].health != jd_health::healthy;
+    }, 100ms));
+    auto const staying = fixture.client->status();
+    REQUIRE(staying->entries[0].health == jd_health::healthy);
+    REQUIRE(staying->active == std::optional<size_t>{0});
+    REQUIRE(log.count("invalid upstream share") == 0);
+    // A count of 2 accepts the newest submits in the prefix and leaves the
+    // older one, s0, in the refusal record. The tip and this declaration are
+    // still the ones that share was mined on, so its error is a refusal of
+    // current work (sv2-spec 5.3.14), not the stale race.
+    fixture.pool.send(submit_shares_error{channel, s0, "difficulty-too-low"});
+    REQUIRE(fixture.wait_until([&] {
+        return log.count("pool refused a valid share on an accepted job (difficulty-too-low)") >= 1;
+    }));
+    fixture.eof(fixture.pool.socket);
+    fixture.eof(fixture.jds.socket);
+    handshake_upstreams(backup_pool, backup_jds, false);
+    (void)accept_coinbase_template(backup_pool, backup_jds, 88);
+    REQUIRE(fixture.wait_until([&] {
+        auto const status = fixture.client->status();
+        return status && status->active == std::optional<size_t>{1}
+            && status->entries[1].health == jd_health::healthy;
+    }));
+    auto const failed = fixture.client->status()->entries[0];
+    REQUIRE(failed.health == jd_health::dishonest);
+    REQUIRE(failed.last_error.find("pool refused a valid share") != std::string::npos);
+    REQUIRE(failed.retry_at > std::chrono::steady_clock::now());
+    REQUIRE(fixture.result.wait_for(0s) != std::future_status::ready);
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
+}
+
+TEST_CASE("sv2 JD still refuses a share success with a zero count or a count past its sequence", "[sv2 jd]") {
+    uint32_t count = 0;
+    SECTION("zero count") {}
+    SECTION("count past its sequence") { count = 2; }
+    auto chain = started_chain("sv2_jd_share_success_count");
+    client_fixture fixture;
+    fake_upstream backup_pool(fixture, 6);
+    fake_upstream backup_jds(fixture, 7);
+    auto const configuration = settings(fixture.pool, fixture.jds, backup_pool, backup_jds, "coinbase-only");
+    fixture.start(configuration, &chain->chain());
+    handshake_upstreams(fixture, false);
+    (void)accept_coinbase_template(fixture.pool, fixture.jds);
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.client->status()->entries[0].health == jd_health::healthy;
+    }));
+    auto const notice = fixture.client->notice();
+    REQUIRE(notice);
+    fixture.client->observe_share(proof_for(*notice));
+    auto const share = fixture.pool.receive<submit_shares_extended>();
+    // Built in share_response as "invalid upstream share " + kind + ": " + detail.
+    char const* const acknowledgement =
+        "invalid upstream share acknowledgement: share success does not match the outstanding submits";
+    captured_log log;
+    fixture.pool.send(submit_shares_success{share.channel_id, share.sequence_number, count, 1});
+    REQUIRE(fixture.wait_until([&] { return log.count(acknowledgement) >= 1; }));
+    fixture.eof(fixture.pool.socket);
+    fixture.eof(fixture.jds.socket);
+    handshake_upstreams(backup_pool, backup_jds, false);
+    (void)accept_coinbase_template(backup_pool, backup_jds, 88);
+    REQUIRE(fixture.wait_until([&] {
+        auto const status = fixture.client->status();
+        return status && status->active == std::optional<size_t>{1}
+            && status->entries[1].health == jd_health::healthy;
+    }));
+    auto const failed = fixture.client->status()->entries[0];
+    REQUIRE(failed.health == jd_health::backoff);
+    REQUIRE(failed.last_error == acknowledgement);
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
+}
+
+TEST_CASE("sv2 JD bounds unacknowledged shares and a cached flush cannot block failover", "[sv2 jd]") {
+    enum class bound { history, cached, solutions };
+    auto which = bound::history;
+    SECTION("unacknowledged share history is bounded") {}
+    SECTION("cached shares fill the output queue on acceptance") { which = bound::cached; }
+    SECTION("solution burst fills the JDS output queue") { which = bound::solutions; }
+    bool const full = which == bound::solutions;
+    auto chain = started_chain("sv2_jd_share_bounds");
+    client_fixture fixture;
+    fake_upstream backup_pool(fixture, 6);
+    fake_upstream backup_jds(fixture, 7);
+    auto configuration = settings(fixture.pool, fixture.jds, backup_pool, backup_jds,
+        full ? "full-template" : "coinbase-only");
+    configuration.jd.upstreams.back() = upstream(backup_pool, backup_jds, "account.worker", "coinbase-only");
+    configuration.jd.response_timeout_seconds = 600;
+    configuration.jd.max_latency_milliseconds = 600000;
+    fixture.start(configuration, &chain->chain());
+    handshake_upstreams(fixture, full);
+    auto const allocation = fixture.jds.receive<allocate_mining_job_token>();
+    fixture.jds.send(allocate_mining_job_token_success{allocation.request_id,
+        {1, 2, 3}, output_bytes(pool_output_list())});
+    if (full) {
+        auto const declared = fixture.jds.receive<declare_mining_job>();
+        fixture.jds.send(declare_mining_job_success{declared.request_id, {9, 8, 7}});
+    }
+    auto const custom = fixture.pool.receive<set_custom_mining_job>();
+    auto const notice = fixture.client->notice();
+    REQUIRE(notice);
+    auto proof = proof_for(*notice);
+    if (which == bound::cached) {
+        // A single accepted job flushes the cache without waiting for writes.
+        // More than the queue fits must demote the pool instead of blocking.
+        for (uint32_t nonce = 0; nonce < 33; ++nonce) {
+            proof.nonce = nonce;
+            fixture.client->observe_share(proof);
+        }
+        CHECK_FALSE(fixture.wait_until([&] {
+            return fixture.client->status()->entries[0].health == jd_health::backoff;
+        }, 50ms));
+        fixture.pool.send(set_custom_mining_job_success{custom.channel_id, custom.request_id, 77});
+    } else {
+        fixture.pool.send(set_custom_mining_job_success{custom.channel_id, custom.request_id, 77});
+        REQUIRE(fixture.wait_until([&] {
+            return fixture.client->status()->entries[0].health == jd_health::healthy;
+        }));
+        if (which == bound::solutions) {
+            proof.block = true;
+            proof.full_extranonce.resize(32, 0x44);
+            for (uint32_t nonce = 0; nonce < 33; ++nonce) {
+                proof.nonce = nonce;
+                fixture.client->observe_share(proof);
+            }
+        } else {
+            auto const end = std::chrono::steady_clock::now() + 10s;
+            for (uint32_t nonce = 0; nonce < 1024; ++nonce) {
+                REQUIRE(std::chrono::steady_clock::now() < end);
+                proof.nonce = nonce;
+                fixture.client->observe_share(proof);
+                auto const share = fixture.pool.receive<submit_shares_extended>();
+                REQUIRE(share.sequence_number == nonce);
+            }
+            REQUIRE(fixture.client->status()->entries[0].health == jd_health::healthy);
+            ++proof.nonce;
+            fixture.client->observe_share(proof);
+        }
+    }
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.client->status()->entries[0].health == jd_health::backoff;
+    }));
+    auto const reason = fixture.client->status()->entries[0].last_error;
+    auto const expected = which == bound::cached ? "pool output queue refused a share"
+        : which == bound::solutions ? "JDS output queue refused PushSolution"
+        : "upstream share acknowledgement history exhausted";
+    REQUIRE(reason == expected);
+    handshake_upstreams(backup_pool, backup_jds, false);
+    (void)accept_coinbase_template(backup_pool, backup_jds, 88);
+    REQUIRE(fixture.wait_until([&] {
+        auto const status = fixture.client->status();
+        return status && status->active == std::optional<size_t>{1}
+            && status->entries[1].health == jd_health::healthy;
+    }));
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
+}
+
+TEST_CASE("sv2 JD changing the coinbase prefix after allocation demotes the entry", "[sv2 jd]") {
+    auto chain = started_chain("sv2_jd_declaration_bounds");
+    client_fixture fixture;
+    fake_upstream backup_pool(fixture, 6);
+    fake_upstream backup_jds(fixture, 7);
+    auto const configuration = settings(fixture.pool, fixture.jds, backup_pool, backup_jds, "coinbase-only");
+    fixture.start(configuration, &chain->chain());
+    handshake_upstreams(fixture, false);
+    auto const allocation = fixture.jds.receive<allocate_mining_job_token>();
+    fixture.jds.send(allocate_mining_job_token_success{allocation.request_id,
+        {1, 2, 3}, output_bytes(pool_output_list())});
+    auto const custom = fixture.pool.receive<set_custom_mining_job>();
+    fixture.pool.send(set_extranonce_prefix{custom.channel_id, data_chunk(8, 0x34)});
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.client->status()->entries[0].health == jd_health::backoff;
+    }));
+    auto const reason = fixture.client->status()->entries[0].last_error;
+    REQUIRE(reason == "pool changed the extranonce prefix of declared work");
+    handshake_upstreams(backup_pool, backup_jds, false);
+    (void)accept_coinbase_template(backup_pool, backup_jds, 88);
+    REQUIRE(fixture.wait_until([&] {
+        auto const status = fixture.client->status();
+        return status && status->active == std::optional<size_t>{1}
+            && status->entries[1].health == jd_health::healthy;
+    }));
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
+}
+
+TEST_CASE("sv2 JD ignores proofs for another publication or an incompatible share", "[sv2 jd]") {
+    auto chain = started_chain("sv2_jd_share_owner");
+    client_fixture fixture;
+    fake_upstream backup_pool(fixture, 6);
+    fake_upstream backup_jds(fixture, 7);
+    auto const configuration = settings(fixture.pool, fixture.jds, backup_pool, backup_jds, "coinbase-only");
+    fixture.start(configuration, &chain->chain());
+    handshake_upstreams(fixture, false);
+    (void)accept_coinbase_template(fixture.pool, fixture.jds);
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.client->status()->entries[0].health == jd_health::healthy;
+    }));
+    auto const original = fixture.client->notice();
+    REQUIRE(original);
+    auto const old_proof = proof_for(*original);
+    fixture.pool.finish_writing();
+    fixture.eof(fixture.pool.socket);
+    fixture.eof(fixture.jds.socket);
+    hash_digest target{};
+    target[0] = 1;
+    handshake_upstreams(backup_pool, backup_jds, false, &target);
+    (void)accept_coinbase_template(backup_pool, backup_jds);
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.client->status()->entries[1].health == jd_health::healthy;
+    }));
+    auto const replacement = fixture.client->notice();
+    REQUIRE(replacement);
+    REQUIRE(replacement->pooled.work_id != original->pooled.work_id);
+    REQUIRE(replacement->pooled.upstream_channel_id == original->pooled.upstream_channel_id);
+    REQUIRE(replacement->pooled.upstream_extranonce_prefix == original->pooled.upstream_extranonce_prefix);
+    auto proof = proof_for(*replacement);
+    fixture.client->observe_share(proof);
+    auto const first = backup_pool.receive<submit_shares_extended>();
+    ++proof.nonce;
+    fixture.client->observe_share(proof);
+    auto const second = backup_pool.receive<submit_shares_extended>();
+    REQUIRE(second.sequence_number == first.sequence_number + 1);
+    backup_pool.send(submit_shares_success{second.channel_id, second.sequence_number, 2, 2});
+    auto const quiet = fixture.begin_read(backup_pool.socket, 1);
+    fixture.client->observe_share(old_proof);
+    auto wrong_width = proof;
+    wrong_width.upstream_extranonce.pop_back();
+    fixture.client->observe_share(std::move(wrong_width));
+    proof.header_hash.fill(0xff);
+    fixture.client->observe_share(std::move(proof));
+    CHECK_FALSE(fixture.wait_until([&] { return quiet->done; }, 100ms));
+    REQUIRE(fixture.client->status()->entries[1].health == jd_health::healthy);
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
+}
+
+TEST_CASE("sv2 JD slow declarations and share health thresholds advance to the next entry", "[sv2 jd]") {
+    enum class trigger { declaration_latency, share_latency, stale, rejected };
+    auto which = trigger::declaration_latency;
+    SECTION("token allocation exceeds latency limit") {}
+    SECTION("accepted share exceeds latency limit") { which = trigger::share_latency; }
+    SECTION("old tip stale share rate exceeds limit") { which = trigger::stale; }
+    SECTION("old tip rejected share rate exceeds limit") { which = trigger::rejected; }
+    auto chain = started_chain("sv2_jd_health_demotion");
+    client_fixture fixture;
+    fake_upstream backup_pool(fixture, 6);
+    fake_upstream backup_jds(fixture, 7);
+    auto configuration = settings(fixture.pool, fixture.jds, backup_pool, backup_jds, "coinbase-only");
+    configuration.jd.max_latency_milliseconds = 1000;
+    configuration.jd.health_window = 2;
+    configuration.jd.max_stale_percent = which == trigger::stale ? 1 : 100;
+    configuration.jd.max_reject_percent = which == trigger::rejected ? 1 : 100;
+    if (which == trigger::stale || which == trigger::rejected) {
+        configuration.jd.response_timeout_seconds = 600;
+        configuration.jd.max_latency_milliseconds = 600000;
+    }
+    fixture.start(configuration, &chain->chain());
+    handshake_upstreams(fixture, false);
+    if (which == trigger::declaration_latency) {
+        auto const allocation = fixture.jds.receive<allocate_mining_job_token>();
+        auto const delayed_until = std::chrono::steady_clock::now() + 1100ms;
+        REQUIRE(fixture.wait_until([&] {
+            return std::chrono::steady_clock::now() >= delayed_until;
+        }, 2s));
+        fixture.jds.send(allocate_mining_job_token_success{allocation.request_id,
+            {1, 2, 3}, output_bytes(pool_output_list())});
+    } else {
+        (void)accept_coinbase_template(fixture.pool, fixture.jds);
+        REQUIRE(fixture.wait_until([&] {
+            return fixture.client->status()->entries[0].health == jd_health::healthy;
+        }));
+        auto const notice = fixture.client->notice();
+        REQUIRE(notice);
+        auto proof = proof_for(*notice);
+        fixture.client->observe_share(proof);
+        auto const first = fixture.pool.receive<submit_shares_extended>();
+        if (which == trigger::share_latency) {
+            auto const delayed_until = std::chrono::steady_clock::now() + 1100ms;
+            REQUIRE(fixture.wait_until([&] {
+                return std::chrono::steady_clock::now() >= delayed_until;
+            }, 2s));
+            fixture.pool.send(submit_shares_success{first.channel_id, first.sequence_number, 1, 1});
+        } else {
+            ++proof.nonce;
+            fixture.client->observe_share(proof);
+            auto const second = fixture.pool.receive<submit_shares_extended>();
+            auto const view = chain->chain().chain_view();
+            REQUIRE(view);
+            auto const block = test::mine_block(view->tip_hash, 2, uint32_t(zulu_time()), 0, {}, 0);
+            std::vector<domain::chain::block> const blocks{block};
+            REQUIRE(chain->organizer().add_headers(test::headers_of(blocks)).headers_added == 1);
+            test::persist_headers(*chain, blocks, 2);
+            test::connect_bodies(*chain, blocks, 2);
+            auto const reason = which == trigger::stale ? "stale-share" : "pool-rejected";
+            fixture.pool.send(submit_shares_error{first.channel_id, first.sequence_number, reason});
+            CHECK_FALSE(fixture.wait_until([&] {
+                return fixture.client->status()->entries[0].health != jd_health::healthy;
+            }, 100ms));
+            REQUIRE(fixture.client->status()->entries[0].health == jd_health::healthy);
+            fixture.pool.send(submit_shares_error{second.channel_id, second.sequence_number, reason});
+        }
+    }
+    // There can be a new-tip allocation queued before the refusal arrives.
+    // Observe the status transition instead of mistaking that frame for EOF.
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.client->status()->entries[0].health == jd_health::backoff;
+    }));
+    auto const failed = fixture.client->status()->entries[0];
+    auto const expected = which == trigger::stale ? "stale share rate"
+        : which == trigger::rejected ? "rejected share rate" : "latency";
+    REQUIRE(failed.last_error.find(expected) != std::string::npos);
+    handshake_upstreams(backup_pool, backup_jds, false);
+    (void)accept_coinbase_template(backup_pool, backup_jds, 88);
+    REQUIRE(fixture.wait_until([&] {
+        auto const status = fixture.client->status();
+        return status && status->active == std::optional<size_t>{1}
+            && status->entries[1].health == jd_health::healthy;
+    }));
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
 }
 
 TEST_CASE("sv2 JD forwards a share for an upstream job id of zero without falling back", "[sv2 jd]") {
@@ -2145,7 +3250,7 @@ TEST_CASE("sv2 JD ignores a share error for a replaced declaration", "[sv2 jd]")
     fixture.pool.send(submit_shares_error{forwarded.channel_id,
         forwarded.sequence_number, "replaced-job"});
     REQUIRE(fixture.wait_until([&] {
-        return log.count("ignoring stale share error replaced-job for sequence 0") >= 1;
+        return log.count("stale share error replaced-job for sequence 0 on a replaced declaration") >= 1;
     }));
     REQUIRE(log.count("pool refused a valid share") == 0);
 
@@ -2161,10 +3266,104 @@ TEST_CASE("sv2 JD ignores a share error for a replaced declaration", "[sv2 jd]")
     REQUIRE(again.nonce == nonce);
 }
 
+TEST_CASE("sv2 JD demotes an entry when a replaced declaration's share error fills the stale window", "[sv2 jd]") {
+    auto chain = started_chain("sv2_jd_stale_window");
+    client_fixture fixture;
+    auto configuration = settings(fixture.pool, fixture.jds);
+    // The accepted declaration has to survive connect_bodies, which publishes
+    // the tip that replaces it. This test does not wait that deadline out.
+    configuration.jd.response_timeout_seconds = 30;
+    // The default window is 20, so one stale sample returns before the rate
+    // check. One sample is the whole window, and one percent is under it.
+    configuration.jd.health_window = 1;
+    configuration.jd.max_stale_percent = 1;
+    // The hold has to outlast the close observed below. The default retry
+    // could open this entry again while that read is still running.
+    configuration.jd.retry_initial_seconds = 3600;
+    configuration.jd.retry_max_seconds = 3600;
+    provider_run provider(fixture, configuration, chain);
+    handshake_upstreams(fixture, true);
+    miner_link miner(fixture, provider.port);
+    auto const first = declare_local_template(fixture, miner, true);
+    fixture.pool.send(set_custom_mining_job_success{first.custom.channel_id,
+        first.custom.request_id, 77});
+
+    data_chunk const first_extranonce(miner.opened.extranonce_size, 0x5a);
+    auto const first_nonce = find_nonce(first.pooled, first_extranonce, false);
+    fixture.write(miner.socket, frame(submit_shares_extended{miner.opened.channel_id, 1,
+        first.pooled.job.job_id, first_nonce, first.pooled.prev.ntime_start,
+        first.pooled.job.version, first_extranonce}));
+    auto const forwarded = fixture.pool.receive<submit_shares_extended>();
+    REQUIRE(forwarded.channel_id == 7);
+    REQUIRE(forwarded.sequence_number == 0);
+    REQUIRE(forwarded.job_id == 77);
+    fixture.pool.send(submit_shares_success{forwarded.channel_id,
+        forwarded.sequence_number, 1, 1});
+
+    auto const block = test::mine_block(first.pooled.prev.prev_hash, 2,
+        uint32_t(zulu_time()), 0, {}, 0);
+    std::vector<domain::chain::block> const blocks{block};
+    REQUIRE(chain->organizer().add_headers(test::headers_of(blocks)).headers_added == 1);
+    test::persist_headers(*chain, blocks, 2);
+    test::connect_bodies(*chain, blocks, 2);
+    auto const view = chain->chain().chain_view();
+    REQUIRE(view);
+    REQUIRE(view->tip_hash == block.hash());
+
+    auto const allocation = fixture.jds.receive<allocate_mining_job_token>();
+    REQUIRE(allocation.request_id != first.custom.request_id);
+    fixture.jds.send(allocate_mining_job_token_success{allocation.request_id,
+        {1, 2, 3}, output_bytes(pool_output_list())});
+    auto const declaration = fixture.jds.receive<declare_mining_job>();
+    REQUIRE(declaration.request_id == allocation.request_id);
+    fixture.jds.send(provide_missing_transactions{declaration.request_id, {}});
+    auto const supplied = fixture.jds.receive<provide_missing_transactions_success>();
+    REQUIRE(supplied.request_id == declaration.request_id);
+    REQUIRE(supplied.transaction_list.empty());
+    fixture.jds.send(declare_mining_job_success{declaration.request_id, {9, 8, 7}});
+    auto const custom = fixture.pool.receive<set_custom_mining_job>();
+    REQUIRE(custom.channel_id == 7);
+    REQUIRE(custom.request_id == allocation.request_id);
+    REQUIRE(custom.prev_hash == block.hash());
+
+    std::optional<downstream_work> accepted_work;
+    for (int attempt = 0; attempt < 3 && ! accepted_work; ++attempt) {
+        auto const job = miner.next();
+        if (pays(coinbase_from(job), pool_script(), 2) && job.prev.prev_hash == block.hash()) {
+            accepted_work = job;
+        }
+    }
+    REQUIRE(accepted_work);
+    constexpr uint32_t accepted_job_id = 91;
+    fixture.pool.send(set_custom_mining_job_success{custom.channel_id,
+        custom.request_id, accepted_job_id});
+
+    // The success above filled the window with one accepted sample. This error
+    // replaces that sample. The share belongs to the declaration just replaced,
+    // so the sample is stale, and one stale sample is over the one percent cap.
+    captured_log log;
+    fixture.pool.send(submit_shares_error{forwarded.channel_id,
+        forwarded.sequence_number, "replaced-job"});
+    REQUIRE(fixture.wait_until([&] {
+        return log.count("Entry 1 backoff: upstream stale share rate exceeded threshold") >= 1;
+    }));
+    REQUIRE(log.count("stale share error replaced-job for sequence 0 on a replaced declaration") >= 1);
+    REQUIRE(log.count("pool refused a valid share") == 0);
+    REQUIRE(log.count("upstream rejected share rate exceeded threshold") == 0);
+    fixture.eof(fixture.pool.socket);
+    fixture.eof(fixture.jds.socket);
+    require_no_immediate_retry(fixture);
+    REQUIRE(provider.result.wait_for(0s) != std::future_status::ready);
+}
+
 TEST_CASE("sv2 JD falls back when the pool rejects a share on the accepted declaration", "[sv2 jd]") {
     auto chain = started_chain("sv2_jd_share_refused");
     client_fixture fixture;
     auto configuration = settings(fixture.pool, fixture.jds);
+    // The refusal flags the pool and holds it. The client stays up on solo.
+    configuration.jd.retry_initial_seconds = 3600;
+    configuration.jd.retry_max_seconds = 3600;
+    configuration.jd.authority_hold_seconds = 3600;
     std::string error;
     auto const payout = node::mining::payout_from_address(configuration.mining.address,
         domain::config::network::regtest, error);
@@ -2192,6 +3391,7 @@ TEST_CASE("sv2 JD falls back when the pool rejects a share on the accepted decla
     fixture.eof(fixture.pool.socket);
     fixture.eof(fixture.jds.socket);
     require_no_reconnect(fixture);
+    REQUIRE(provider.result.wait_for(0s) != std::future_status::ready);
 }
 
 TEST_CASE("sv2 JD applies a SetTarget that crosses SetCustomMiningJob to the custom job", "[sv2 jd]") {
@@ -2332,6 +3532,10 @@ TEST_CASE("sv2 JD closes on a malformed or misaddressed share reply", "[sv2 jd]"
     auto chain = started_chain(tag);
     client_fixture fixture;
     auto configuration = settings(fixture.pool, fixture.jds);
+    // A malformed reply fails this attempt. The retry must not fall inside the test.
+    configuration.jd.retry_initial_seconds = 3600;
+    configuration.jd.retry_max_seconds = 3600;
+    configuration.jd.authority_hold_seconds = 3600;
     std::string error;
     auto const payout = node::mining::payout_from_address(configuration.mining.address,
         domain::config::network::regtest, error);
@@ -2356,78 +3560,7 @@ TEST_CASE("sv2 JD closes on a malformed or misaddressed share reply", "[sv2 jd]"
     fixture.eof(fixture.pool.socket);
     fixture.eof(fixture.jds.socket);
     require_no_reconnect(fixture);
-}
-
-TEST_CASE("sv2 JD falls back when the pool changes the extranonce prefix of declared work", "[sv2 jd]") {
-    bool group = false;
-    SECTION("channel prefix") {}
-    SECTION("group prefix") { group = true; }
-    auto chain = started_chain(group ? "sv2_jd_prefix_group" : "sv2_jd_prefix_channel");
-    client_fixture fixture;
-    auto configuration = settings(fixture.pool, fixture.jds);
-    std::string error;
-    auto const payout = node::mining::payout_from_address(configuration.mining.address,
-        domain::config::network::regtest, error);
-    REQUIRE(payout);
-    provider_run provider(fixture, configuration, chain);
-    handshake_upstreams(fixture, true);
-    miner_link miner(fixture, provider.port);
-    auto const declared = declare_local_template(fixture, miner, true);
-
-    // accept() stored an 8-byte prefix of 0x12 and an extranonce size of 8.
-    // Eight bytes of 0x34 still fit (8 + 8 <= 32) and are not that prefix.
-    data_chunk const prefix(8, 0x34);
-    captured_log log;
-    fixture.pool.send(set_extranonce_prefix{group ? uint32_t{8} : uint32_t{7}, prefix});
-    if ( ! group) {
-        require_solo_again(miner, declared.pooled, payout->script);
-        REQUIRE(fixture.wait_until([&] {
-            return log.count("pool changed the extranonce prefix of declared work") >= 1;
-        }));
-        fixture.eof(fixture.pool.socket);
-        fixture.eof(fixture.jds.socket);
-        require_no_reconnect(fixture);
-        return;
-    }
-
-    // A prefix addressed to the group is ignored, so this declaration keeps
-    // the prefix it was built with and neither upstream closes.
-    auto pool_quiet = fixture.begin_read(fixture.pool.socket, 1);
-    auto jds_quiet = fixture.begin_read(fixture.jds.socket, 1);
-    auto miner_quiet = fixture.begin_read(miner.socket, 1);
-    REQUIRE_FALSE(fixture.wait_until([&] {
-        return pool_quiet->done || jds_quiet->done || miner_quiet->done;
-    }, 300ms));
-    REQUIRE(log.count("pool changed the extranonce prefix of declared work") == 0);
-    // Cancel so the next read on each socket starts at a frame boundary.
-    std::error_code cancel_error;
-    fixture.pool.socket.cancel(cancel_error);
-    REQUIRE_FALSE(cancel_error);
-    fixture.jds.socket.cancel(cancel_error);
-    REQUIRE_FALSE(cancel_error);
-    miner.socket.cancel(cancel_error);
-    REQUIRE_FALSE(cancel_error);
-    REQUIRE(fixture.wait_until([&] {
-        return pool_quiet->done && jds_quiet->done && miner_quiet->done;
-    }));
-
-    // The custom job is still in flight. Accepting it and forwarding a share
-    // is the declaration staying up after the ignored prefix.
-    fixture.pool.send(set_custom_mining_job_success{declared.custom.channel_id,
-        declared.custom.request_id, 77});
-    data_chunk const extranonce(miner.opened.extranonce_size, 0x5a);
-    auto const nonce = find_nonce(declared.pooled, extranonce, false);
-    fixture.write(miner.socket, frame(submit_shares_extended{miner.opened.channel_id, 1,
-        declared.pooled.job.job_id, nonce, declared.pooled.prev.ntime_start,
-        declared.pooled.job.version, extranonce}));
-    auto const local = receive_plain<submit_shares_success>(fixture, miner.socket);
-    REQUIRE(local.channel_id == miner.opened.channel_id);
-    auto const forwarded = fixture.pool.receive<submit_shares_extended>();
-    REQUIRE(forwarded.channel_id == 7);
-    REQUIRE(forwarded.sequence_number == 0);
-    REQUIRE(forwarded.job_id == 77);
-    REQUIRE(forwarded.nonce == nonce);
-    REQUIRE(log.count("pool changed the extranonce prefix of declared work") == 0);
+    REQUIRE(provider.result.wait_for(0s) != std::future_status::ready);
 }
 
 TEST_CASE("sv2 JD pushes a block found before DeclareMiningJob.Success once", "[sv2 jd]") {
@@ -2495,7 +3628,7 @@ TEST_CASE("sv2 JD pushes a block found before DeclareMiningJob.Success once", "[
     fixture.pool.send(submit_shares_error{forwarded.channel_id, forwarded.sequence_number,
         "invalid-job-id"});
     REQUIRE(fixture.wait_until([&] {
-        return log.count("ignoring share error invalid-job-id for the block found by sequence 0") >= 1;
+        return log.count("share error invalid-job-id for the block found by sequence 0 counts as stale") >= 1;
     }));
     REQUIRE(log.count("pool refused a valid share") == 0);
     expect_idle(fixture, fixture.jds.socket);
@@ -2573,26 +3706,15 @@ TEST_CASE("sv2 JD pushes a block only for the declaration it was mined on", "[sv
     auto const latest = declare();
     REQUIRE(latest->pooled.generation != older->pooled.generation);
 
-    auto const& mined = current ? latest->pooled : older->pooled;
-    node::mining::pool_proof proof;
-    proof.generation = mined.generation;
-    proof.prev_hash = mined.tmpl.previous_block_hash;
-    proof.upstream_extranonce.assign(mined.upstream_extranonce_size, 0x44);
-    proof.full_extranonce = mined.upstream_extranonce_prefix;
+    auto const& mined = current ? *latest : *older;
+    auto proof = proof_for(mined);
+    proof.full_extranonce = mined.pooled.upstream_extranonce_prefix;
     proof.full_extranonce.insert(proof.full_extranonce.end(),
         proof.upstream_extranonce.begin(), proof.upstream_extranonce.end());
-    proof.version = mined.tmpl.version;
-    proof.ntime = mined.tmpl.current_time;
     proof.nonce = 5;
-    proof.bits = mined.tmpl.bits;
     proof.block = true;
-    captured_log log;
     fixture.client->observe_share(proof);
     if ( ! current) {
-        REQUIRE(fixture.wait_until([&] {
-            return log.count("Block from replaced declaration "
-                + std::to_string(mined.generation) + " is submitted locally, not to the JDS") >= 1;
-        }));
         expect_idle(fixture, fixture.jds.socket);
         return;
     }
@@ -2605,7 +3727,6 @@ TEST_CASE("sv2 JD pushes a block only for the declaration it was mined on", "[sv
     REQUIRE(pushed.version == proof.version);
     REQUIRE(fixture.jds.frames.empty());
     expect_idle(fixture, fixture.jds.socket);
-    REQUIRE(log.count("is submitted locally, not to the JDS") == 0);
 }
 
 TEST_CASE("sv2 JD pushes a block whose share misses a harder downstream target", "[sv2 jd]") {
@@ -2833,7 +3954,7 @@ TEST_CASE("sv2 JD opens the upstream channel with the hash rate already connecte
     (void)fixture.pool.receive<setup_connection>();
     (void)fixture.jds.receive<setup_connection>();
     fixture.jds.send(setup_connection_success{2, 0});
-    answer_extensions(fixture, false);
+    answer_payout_extensions(fixture.jds, false);
     // Solo work does not wait for the pool, so a miner can be mining before
     // the upstream channel exists.
     std::optional<miner_link> miner;
@@ -2895,7 +4016,8 @@ TEST_CASE("sv2 JD keeps mining after the pool refuses a hash rate update", "[sv2
         auto const changed = fixture.pool.receive<update_channel>();
         REQUIRE(changed.channel_id == 7);
         REQUIRE(changed.nominal_hash_rate == 2000.f);
-        REQUIRE(log.count("continuing solo mining") == 0);
+        // Every ended attempt logs its entry's retry hold.
+        REQUIRE(log.count("retry hold") == 0);
         return;
     }
 
@@ -2910,4 +4032,219 @@ TEST_CASE("sv2 JD keeps mining after the pool refuses a hash rate update", "[sv2
         return log.count("invalid upstream channel update error") >= 1;
     }));
     require_no_reconnect(fixture);
+}
+
+TEST_CASE("sv2 JD reports the hash rate from the active pair, and from a probe once it takes over", "[sv2 jd]") {
+    // Only the active pair's pool is sent shares, so only it is told the sum.
+    auto chain = started_chain("sv2_jd_probe_rate");
+    client_fixture fixture;
+    fake_upstream backup_pool(fixture, 6);
+    fake_upstream backup_jds(fixture, 7);
+    auto configuration = settings(fixture.pool, fixture.jds, backup_pool, backup_jds, "coinbase-only");
+    configuration.jd.retry_initial_seconds = 1;
+    configuration.jd.probe_interval_seconds = 1;
+    configuration.jd.recovery_hold_seconds = 1;
+    fixture.start(configuration, &chain->chain());
+    handshake_upstreams(fixture, false);
+    (void)accept_coinbase_template(fixture.pool, fixture.jds);
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.client->status()->entries[0].health == jd_health::healthy;
+    }));
+    fixture.pool.finish_writing();
+    fixture.eof(fixture.pool.socket);
+    fixture.eof(fixture.jds.socket);
+
+    // The backup is started as the active pair, so its channel opens with the sum.
+    fixture.client->observe_hash_rate(1, 1500.);
+    backup_pool.handshake();
+    backup_jds.handshake();
+    (void)backup_pool.receive<setup_connection>();
+    (void)backup_jds.receive<setup_connection>();
+    backup_jds.send(setup_connection_success{2, 0});
+    answer_payout_extensions(backup_jds, false);
+    backup_pool.send(setup_connection_success{2, mining_flag_requires_extended_channels});
+    answer_extensions(backup_pool, false);
+    auto const active_open = backup_pool.receive<open_extended_mining_channel>();
+    REQUIRE(active_open.nominal_hash_rate == 1500.f);
+    backup_pool.send(open_extended_mining_channel_success{active_open.request_id, 7,
+        active_open.max_target, jd_session::min_extranonce_size, data_chunk(8, 0x12), 8});
+    (void)accept_coinbase_template(backup_pool, backup_jds, 88);
+    REQUIRE(fixture.wait_until([&] {
+        auto const status = fixture.client->status();
+        return status->active == std::optional<size_t>{1}
+            && status->entries[1].health == jd_health::healthy;
+    }));
+
+    // The first entry returns as a probe. Its channel opens with zero.
+    fixture.pool.accept_again();
+    fixture.jds.accept_again();
+    fixture.setup();
+    (void)fixture.jds.receive<setup_connection>();
+    fixture.jds.send(setup_connection_success{2, 0});
+    answer_payout_extensions(fixture.jds, false);
+    auto const probe_open = fixture.open();
+    REQUIRE(probe_open.nominal_hash_rate == 0.f);
+    fixture.accept(probe_open);
+    REQUIRE(fixture.client->status()->probe == std::optional<size_t>{0});
+    // A change while it probes goes to the active pair only.
+    fixture.client->observe_hash_rate(2, 500.);
+    REQUIRE(backup_pool.receive<update_channel>().nominal_hash_rate == 2000.f);
+    auto const token = fixture.jds.receive<allocate_mining_job_token>();
+    fixture.jds.send(allocate_mining_job_token_success{token.request_id,
+        {1, 2, 3}, output_bytes(pool_output_list())});
+    // An UpdateChannel from the probe would arrive before its custom job.
+    auto const custom = fixture.pool.receive<set_custom_mining_job>();
+    fixture.pool.send(set_custom_mining_job_success{custom.channel_id, custom.request_id, 99});
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.client->status()->entries[0].healthy_since.has_value();
+    }));
+    auto const hold_end = *fixture.client->status()->entries[0].healthy_since + 1s;
+    REQUIRE(fixture.wait_until([&] { return std::chrono::steady_clock::now() >= hold_end; }, 2s));
+
+    // A connected tip is the job boundary where the probe takes over and sends
+    // the current sum at once.
+    auto const view = chain->chain().chain_view();
+    REQUIRE(view);
+    auto const block = test::mine_block(view->tip_hash, 2, uint32_t(zulu_time()), 0, {}, 0);
+    std::vector<domain::chain::block> const blocks{block};
+    REQUIRE(chain->organizer().add_headers(test::headers_of(blocks)).headers_added == 1);
+    test::persist_headers(*chain, blocks, 2);
+    test::connect_bodies(*chain, blocks, 2);
+    REQUIRE(fixture.wait_until([&] {
+        return fixture.client->status()->active == std::optional<size_t>{0};
+    }));
+    auto const promoted = fixture.pool.receive<update_channel>();
+    REQUIRE(promoted.channel_id == 7);
+    REQUIRE(promoted.nominal_hash_rate == 2000.f);
+    REQUIRE(promoted.max_target == probe_open.max_target);
+    fixture.eof_after_pending(backup_pool.socket);
+    fixture.eof_after_pending(backup_jds.socket);
+    // Each pair's reporter ends with it, so the client joins both and returns.
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
+}
+
+TEST_CASE("sv2 JD tags forwarded shares with the downstream worker only when the pool grants it", "[sv2 jd]") {
+    // The fake pool listens on 127.0.0.1. An upstream on this machine is the
+    // operator's own without the mark, so it asks; jd_sends_worker_names and
+    // the session tests cover an unmarked LAN or remote pool, which never asks.
+    enum class kind { refused, channel, proxy, marked };
+    auto mode = kind::refused;
+    SECTION("the pool refuses worker tracking") {}
+    SECTION("granted: the channel's user_identity") { mode = kind::channel; }
+    SECTION("granted: the worker a downstream proxy names") { mode = kind::proxy; }
+    SECTION("granted: an upstream marked as the operator's own") { mode = kind::marked; }
+    char const* tag = "sv2_jd_worker_refused";
+    if (mode == kind::channel) tag = "sv2_jd_worker_channel";
+    if (mode == kind::proxy) tag = "sv2_jd_worker_proxy";
+    if (mode == kind::marked) tag = "sv2_jd_worker_marked";
+    auto chain = started_chain(tag);
+    client_fixture fixture;
+    auto configuration = settings(fixture.pool, fixture.jds);
+    configuration.jd.own_upstream = mode == kind::marked;
+    provider_run provider(fixture, configuration, chain);
+    handshake_upstreams(fixture, true, nullptr, mode != kind::refused);
+    miner_link miner(fixture, provider.port, 0.f, mode == kind::proxy);
+    auto const declared = declare_local_template(fixture, miner, true);
+    constexpr uint32_t custom_job_id = 77;
+    fixture.pool.send(set_custom_mining_job_success{declared.custom.channel_id,
+        declared.custom.request_id, custom_job_id});
+    data_chunk const extranonce(miner.opened.extranonce_size, 0x5a);
+    auto const nonce = find_nonce(declared.pooled, extranonce, false);
+    auto payload = to_data_chunk(submit_shares_extended{miner.opened.channel_id, 1,
+        declared.pooled.job.job_id, nonce, declared.pooled.prev.ntime_start,
+        declared.pooled.job.version, extranonce});
+    if (mode == kind::proxy) {
+        auto const field = to_data_chunk(user_identity_tlv("rig-7"));
+        payload.insert(payload.end(), field.begin(), field.end());
+    }
+    auto submission = to_data_chunk(message_header{extension<submit_shares_extended>(),
+        submit_shares_extended::message_type, static_cast<uint32_t>(payload.size())});
+    submission.insert(submission.end(), payload.begin(), payload.end());
+    fixture.write(miner.socket, std::move(submission));
+
+    auto const forwarded = fixture.pool.receive_frame();
+    byte_reader source(forwarded);
+    auto const header = message_header::from_data(source);
+    REQUIRE(header);
+    // A TLV field does not change the frame's extension type (sv2-spec 3.4.1).
+    REQUIRE(header->extension_type == message_header::channel_msg_flag);
+    REQUIRE(header->msg_type == submit_shares_extended::message_type);
+    REQUIRE(header->msg_length == source.remaining_size());
+    auto const share = submit_shares_extended::from_data(source);
+    REQUIRE(share);
+    REQUIRE(share->channel_id == 7);
+    REQUIRE(share->job_id == custom_job_id);
+    REQUIRE(share->nonce == nonce);
+    auto const fields = read_tlv_fields(source);
+    REQUIRE(fields);
+    if (mode == kind::refused) {
+        // Not granted: the share ends with its own fields.
+        REQUIRE(fields->empty());
+        return;
+    }
+    REQUIRE(fields->size() == 1);
+    REQUIRE(fields->front().extension_type == worker_hashrate_tracking_extension);
+    REQUIRE(fields->front().field_type == user_identity_field);
+    REQUIRE(std::string(fields->front().value.begin(), fields->front().value.end())
+        == (mode == kind::proxy ? "rig-7" : "miner"));
+}
+
+TEST_CASE("sv2 JD connects again without RequestExtensions when the pool leaves it unanswered", "[sv2 jd]") {
+    // Extension 0x0001, section 4: nothing may follow an unanswered request on
+    // that socket. The pair is replaced at once, without a retry hold, by one
+    // that does not ask. The pair after a later failure asks again.
+    client_fixture fixture;
+    auto configuration = settings(fixture.pool, fixture.jds);
+    configuration.jd.response_timeout_seconds = 1;
+    configuration.jd.retry_initial_seconds = 1;
+    captured_log log;
+    fixture.start(configuration);
+    fixture.setup();
+    (void)fixture.jds.receive<setup_connection>();
+    fixture.jds.send(setup_connection_success{2, 0});
+    answer_payout_extensions(fixture.jds, false);
+    fixture.pool.send(setup_connection_success{2, mining_flag_requires_extended_channels});
+    auto const unanswered = fixture.pool.receive<request_extensions>();
+    REQUIRE(unanswered.requested_extensions == std::vector<uint16_t>{worker_hashrate_tracking_extension});
+    // No channel request follows on either socket before both close.
+    fixture.eof(fixture.pool.socket);
+    fixture.eof(fixture.jds.socket);
+
+    fixture.pool.accept_again();
+    fixture.jds.accept_again();
+    fixture.setup();
+    (void)fixture.jds.receive<setup_connection>();
+    fixture.jds.send(setup_connection_success{2, 0});
+    answer_payout_extensions(fixture.jds, false);
+    fixture.pool.send(setup_connection_success{2, mining_flag_requires_extended_channels});
+    auto const request = fixture.pool.receive<open_extended_mining_channel>();
+    REQUIRE(request.user_identity == "account.worker");
+    fixture.accept(request);
+    fixture.await(fixture.ready);
+    REQUIRE_NOTHROW(fixture.ready.get());
+    REQUIRE(fixture.wait_until([&] {
+        auto const status = fixture.client->status();
+        return status && status->entries[0].health == jd_health::healthy;
+    }));
+    auto const status = fixture.client->status();
+    REQUIRE(status->entries[0].last_error.empty());
+    REQUIRE(status->entries[0].backoff == 0s);
+    REQUIRE(log.count("did not answer RequestExtensions") == 1);
+
+    fixture.pool.finish_writing();
+    fixture.eof(fixture.pool.socket);
+    fixture.eof(fixture.jds.socket);
+    fixture.pool.accept_again();
+    fixture.jds.accept_again();
+    // answer_extensions requires the request again; the pool grants it now.
+    handshake_upstreams(fixture, true, nullptr, true);
+    REQUIRE(fixture.wait_until([&] {
+        auto const now = fixture.client->status();
+        return now && now->entries[0].health == jd_health::healthy;
+    }));
+    fixture.client->stop();
+    fixture.await(fixture.result);
+    REQUIRE_NOTHROW(fixture.result.get());
 }

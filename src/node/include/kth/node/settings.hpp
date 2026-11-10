@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <kth/domain.hpp>
 #include <kth/infrastructure/display_mode.hpp>
@@ -49,6 +50,18 @@ struct KND_API sv2_settings {
         uint32_t open_channel_timeout_seconds;
     };
 
+    struct jd_upstream {
+        std::string mining_address;
+        std::string mining_authority_public_key;
+        std::string jds_address;
+        std::string jds_authority_public_key;
+        std::string user_identity;
+        std::string mode;
+        // The operator runs this upstream, so it is sent downstream worker
+        // names (Worker-Specific Hashrate Tracking). Off unless marked.
+        bool own = false;
+    };
+
     struct jd_settings {
         jd_settings();
 
@@ -59,7 +72,19 @@ struct KND_API sv2_settings {
         std::string jds_authority_public_key;
         std::string user_identity;
         std::string mode;
+        // jd_upstream::own for the single-pool settings (sv2.jd.own_upstream).
+        bool own_upstream;
+        std::vector<std::string> upstreams;
         uint32_t response_timeout_seconds;
+        uint32_t retry_initial_seconds;
+        uint32_t retry_max_seconds;
+        uint32_t authority_hold_seconds;
+        uint32_t recovery_hold_seconds;
+        uint32_t probe_interval_seconds;
+        uint32_t max_latency_milliseconds;
+        uint32_t max_stale_percent;
+        uint32_t max_reject_percent;
+        uint32_t health_window;
     };
 
     sv2_settings();

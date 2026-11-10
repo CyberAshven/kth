@@ -41,35 +41,6 @@ expect<std::vector<hash_digest>> read_hash_seq_u16(byte_reader& source) {
     return result;
 }
 
-expect<void> write_u16_seq(byte_writer& sink, std::vector<uint16_t> const& items) {
-    if (items.size() > b0_64k_max) return std::unexpected(error::operation_failed);
-    if (auto r = sink.write_little_endian<uint16_t>(static_cast<uint16_t>(items.size())); ! r) return r;
-    for (auto const item : items) {
-        if (auto r = sink.write_little_endian<uint16_t>(item); ! r) return r;
-    }
-    return {};
-}
-
-expect<std::vector<uint16_t>> read_u16_seq(byte_reader& source) {
-    auto const count = source.read_little_endian<uint16_t>();
-    if ( ! count) return std::unexpected(count.error());
-    if (*count > source.remaining_size() / sizeof(uint16_t)) {
-        return std::unexpected(error::operation_failed);
-    }
-    std::vector<uint16_t> items;
-    items.reserve(*count);
-    for (size_t i = 0; i < *count; ++i) {
-        auto const item = source.read_little_endian<uint16_t>();
-        if ( ! item) return std::unexpected(item.error());
-        items.push_back(*item);
-    }
-    return items;
-}
-
-size_t u16_seq_size(std::vector<uint16_t> const& items) {
-    return 2 + 2 * items.size();
-}
-
 } // namespace
 
 expect<void> allocate_mining_job_token::to_data(byte_writer& sink) const {
@@ -328,61 +299,6 @@ expect<set_custom_mining_job_success> set_custom_mining_job_success::from_data(b
     auto const job_id = source.read_little_endian<uint32_t>();
     if ( ! job_id) return std::unexpected(job_id.error());
     return complete(source, set_custom_mining_job_success{*channel_id, *request_id, *job_id});
-}
-
-size_t request_extensions::serialized_size() const {
-    return 2 + u16_seq_size(requested_extensions);
-}
-
-expect<void> request_extensions::to_data(byte_writer& sink) const {
-    if (auto r = sink.write_little_endian<uint16_t>(request_id); ! r) return r;
-    return write_u16_seq(sink, requested_extensions);
-}
-
-expect<request_extensions> request_extensions::from_data(byte_reader& source) {
-    auto const request_id = source.read_little_endian<uint16_t>();
-    if ( ! request_id) return std::unexpected(request_id.error());
-    auto requested = read_u16_seq(source);
-    if ( ! requested) return std::unexpected(requested.error());
-    return complete(source, request_extensions{*request_id, std::move(*requested)});
-}
-
-size_t request_extensions_success::serialized_size() const {
-    return 2 + u16_seq_size(supported_extensions);
-}
-
-expect<void> request_extensions_success::to_data(byte_writer& sink) const {
-    if (auto r = sink.write_little_endian<uint16_t>(request_id); ! r) return r;
-    return write_u16_seq(sink, supported_extensions);
-}
-
-expect<request_extensions_success> request_extensions_success::from_data(byte_reader& source) {
-    auto const request_id = source.read_little_endian<uint16_t>();
-    if ( ! request_id) return std::unexpected(request_id.error());
-    auto supported = read_u16_seq(source);
-    if ( ! supported) return std::unexpected(supported.error());
-    return complete(source, request_extensions_success{*request_id, std::move(*supported)});
-}
-
-size_t request_extensions_error::serialized_size() const {
-    return 2 + u16_seq_size(unsupported_extensions) + u16_seq_size(required_extensions);
-}
-
-expect<void> request_extensions_error::to_data(byte_writer& sink) const {
-    if (auto r = sink.write_little_endian<uint16_t>(request_id); ! r) return r;
-    if (auto r = write_u16_seq(sink, unsupported_extensions); ! r) return r;
-    return write_u16_seq(sink, required_extensions);
-}
-
-expect<request_extensions_error> request_extensions_error::from_data(byte_reader& source) {
-    auto const request_id = source.read_little_endian<uint16_t>();
-    if ( ! request_id) return std::unexpected(request_id.error());
-    auto unsupported = read_u16_seq(source);
-    if ( ! unsupported) return std::unexpected(unsupported.error());
-    auto required = read_u16_seq(source);
-    if ( ! required) return std::unexpected(required.error());
-    return complete(source, request_extensions_error{*request_id,
-        std::move(*unsupported), std::move(*required)});
 }
 
 size_t request_payout_outputs::serialized_size() const {

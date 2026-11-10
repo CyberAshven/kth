@@ -8,9 +8,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
-#include <deque>
-#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -31,6 +30,7 @@
 #include <kth/node/settings.hpp>
 #include <kth/node/sv2/jd_connection.hpp>
 #include <kth/node/sv2/jd_declaration.hpp>
+#include <kth/node/sv2/jd_failover.hpp>
 #include <kth/node/sv2/jd_session.hpp>
 #include <kth/node/sv2/jd_settings.hpp>
 
@@ -49,10 +49,10 @@ struct jd_notice {
     blockchain::mining_template solo{};
 };
 
-// Own both upstreams together. A refusal or disconnect closes the other one.
-// One exception: unanswered RequestExtensions closes only that JDS socket and
-// replaces it once, and does not close the pool. The listener and its solo
-// mining sessions have independent lifetimes.
+// Own each Mining/JDS pair together. Only the active pair publishes payouts;
+// one higher-priority pair may recover without disturbing downstream work.
+// A JDS that leaves RequestExtensions unanswered is replaced once within its
+// pair, without closing that pair's pool connection.
 struct jd_client {
     // settings have passed validate_jd_settings and solo payout validation.
     jd_client(sv2_settings const& settings, ::asio::any_io_executor executor,
@@ -73,6 +73,7 @@ struct jd_client {
     // Empty until an allocation has been published, or until fallback republishes
     // the same template for the solo payout. Safe to call off this client's strand.
     [[nodiscard]] boost::shared_ptr<jd_notice const> notice() const;
+    [[nodiscard]] boost::shared_ptr<jd_status const> status() const;
 
     using publication_channel = broadcaster<int>::channel_type;
 
@@ -92,96 +93,77 @@ struct jd_client {
     void observe_hash_rate(uint64_t connection, double rate);
 
 private:
+    struct attempt;
     ::asio::awaitable<void> run_owned();
+    ::asio::awaitable<void> run_attempt(std::shared_ptr<attempt> value);
     // negotiation_timeout is set only when this JDS socket was closed because
     // RequestExtensions went unanswered. The caller then opens one replacement.
     // A null pointer means a later deadline is terminal, so the replacement
     // itself cannot open a third connection.
-    ::asio::awaitable<void> serve(jd_connection& connection, jd_session& session,
-        char const* name, bool* negotiation_timeout = nullptr);
-    ::asio::awaitable<void> serve_declaration();
-    // Frames go to the socket declaration_io_ names: declaration_ until
-    // negotiation silence publishes the replacement.
-    [[nodiscard]] bool send_declaration(data_chunk frame);
-    ::asio::awaitable<void> declare_templates();
-    void wake_declarations();
-    ::asio::awaitable<void> report_hash_rate();
-    void wake_hash_rate();
-    bool dispatch(jd_declaration::result result);
-    void publish_pool();
-    void publish_solo();
-    void note_share(mining::pool_proof const& proof);
-    void forward_share(mining::pool_proof const& proof);
-    void remember_submitted(uint32_t sequence, uint32_t generation, bool block);
-    // A share reply names one submission. Success changes nothing. An error
-    // falls back only when that submission is still the accepted declaration
-    // (sv2-spec 6.2). nullopt leaves the mining connection up; a string closes it.
-    [[nodiscard]] std::optional<std::string> share_reply(message_header const& header,
-        byte_span payload);
-    // False when the JDS queue refuses the frame and this client is stopping.
-    [[nodiscard]] bool push_block(mining::pool_proof const& proof);
-    [[nodiscard]] bool flush_pending_solutions();
-    void flush_cached();
+    ::asio::awaitable<void> serve(attempt& value, jd_connection& connection,
+        jd_session& session, jd_peer peer, bool* negotiation_timeout = nullptr);
+    // The pair's JDS: the first connection negotiates Requested Payout Outputs,
+    // and its silence opens the one replacement that does not.
+    ::asio::awaitable<void> serve_declaration(attempt& value);
+    ::asio::awaitable<void> declare_templates(attempt& value);
+    // The only sender of this pair's UpdateChannel. Ends once the pair stops.
+    ::asio::awaitable<void> report_hash_rate(attempt& value);
+    // hash_rates_ added up, as the F32 the pool is sent.
+    [[nodiscard]] float hash_rate_total() const;
+    void start_attempt(size_t index, bool probe);
+    void fail(attempt& value, jd_failure kind, std::string reason);
+    void update_status();
+    void mark_ready(attempt& value);
+    bool recover_at_boundary();
+    bool dispatch(attempt& value, jd_declaration::result result);
+    bool share_response(attempt& value, message_header const& header, byte_span payload);
+    // Always false: the attempt ends, and the entry starts again at the new
+    // address now or, before the pair was healthy, after its retry hold.
+    bool follow_reconnect(attempt& value, jd_peer peer, byte_span payload);
+    // The pool left RequestExtensions unanswered. The entry starts again at
+    // once with a pair that does not ask (extension 0x0001, section 4).
+    void restart_without_extensions(attempt& value);
+    void publish_pool(attempt& value);
+    void publish_solo(attempt const& value);
+    void note_share(attempt& value, mining::pool_proof const& proof);
+    void forward_share(attempt& value, mining::pool_proof const& proof);
+    void remember_submitted(attempt& value, uint32_t sequence, uint32_t generation,
+        hash_digest const& previous, std::chrono::steady_clock::time_point sent, bool block);
+    // False when the JDS queue refuses the frame and this attempt is stopping.
+    [[nodiscard]] bool push_block(attempt& value, mining::pool_proof const& proof);
+    [[nodiscard]] bool flush_pending_solutions(attempt& value);
+    void flush_cached(attempt& value);
     // Drop shares and unpushed block proofs from a declaration being replaced.
-    void retire_cached();
+    void retire_cached(attempt& value);
 
     ::asio::strand<::asio::any_io_executor> owner_;
-    jd_connection mining_;
-    // jd_connection keeps these private. The replacement is built from them
-    // after the first JDS run() has returned.
-    std::string jds_host_;
-    uint16_t jds_port_;
-    hash_digest jds_authority_;
-    std::chrono::milliseconds jds_handshake_timeout_;
-    jd_connection declaration_;
-    // Empty until negotiation silence. Not a second run of declaration_.
-    std::unique_ptr<jd_connection> jds_replacement_;
-    // declaration_ until that replacement is published. Later frames and stop()
-    // follow it, including a pool stop() from another thread.
-    std::atomic<jd_connection*> declaration_io_;
-    jd_session mining_session_;
-    jd_session declaration_session_;
-    jd_declaration jobs_;
+    sv2_settings const settings_;
+    std::vector<sv2_settings::jd_upstream> const upstreams_;
+    jd_failover policy_;
+    // Addresses named by a followed Reconnect, per entry and connection. An
+    // entry's are dropped when it fails, so its retry uses the configured ones.
+    struct redirect {
+        std::optional<jd_endpoint> mining;
+        std::optional<jd_endpoint> declaration;
+    };
+    std::vector<redirect> redirects_;
+    // Entries whose last pair got no RequestExtensions answer. Their next pair
+    // opens its channel without asking; starting it clears the mark.
+    std::vector<bool> unanswered_;
+    std::shared_ptr<attempt> active_;
+    std::shared_ptr<attempt> probe_;
     blockchain::block_chain* const chain_;
     std::chrono::seconds const response_timeout_;
-    std::optional<std::chrono::steady_clock::time_point> job_deadline_;
-    ::asio::steady_timer declaration_wake_;
-    // Wakes report_hash_rate() for a changed sum, unless an update was just
-    // sent: then it expires at the end of the hold and the loop reads the sum.
-    ::asio::steady_timer hash_rate_wake_;
-    bool hash_rate_held_ = false;
     // Each downstream connection's summed channel hash rate, by connection salt.
+    // Only the active pair reports their total; a probe's channel carries zero.
     std::map<uint64_t, double> hash_rates_;
-    // Installed and cleared by run_owned(), and invoked only on owner_.
-    // Client stop has to finish a parked receive. The channel is created on
-    // owner_, so the close notice is posted there rather than on the chain
-    // executor that stop() then shuts down.
-    std::function<void()> cancel_tips_;
     ::asio::experimental::concurrent_channel<void(std::error_code, int)> ready_;
+    ::asio::experimental::concurrent_channel<void(std::error_code, int)> wake_;
     boost::atomic_shared_ptr<jd_notice> notice_;
+    boost::atomic_shared_ptr<jd_status> status_;
     broadcaster<int> publications_;
-    // Proofs found before SetCustomMiningJob.Success. Each proof's generation
-    // is the declaration it was mined on; a replacement drops the vector.
-    std::vector<mining::pool_proof> cached_;
-    // sequence_number and declared_work::generation of each SubmitSharesExtended
-    // this channel sent. Bounded so a slow pool cannot pin every share. A reply
-    // for a sequence that has aged out is ignored, same as one never sent.
-    struct submitted_share {
-        uint32_t sequence = 0;
-        uint32_t generation = 0;
-        // The share also met the network target, so its block ends this job.
-        bool block = false;
-    };
-    std::deque<submitted_share> submitted_;
-    // Full-template blocks found before DeclareMiningJob.Success. Sent once
-    // can_push_solution() is true for that generation. Two covers a pair found
-    // on the same coinbase; a later one is dropped rather than queued forever.
-    std::vector<mining::pool_proof> pending_solutions_;
-    uint32_t share_sequence_ = 0;
     std::atomic_bool stopped_{false};
     bool published_ = false;
-    bool pool_live_ = false;
-    bool declaration_changed_ = false;
 };
 
 } // namespace kth::node::sv2
