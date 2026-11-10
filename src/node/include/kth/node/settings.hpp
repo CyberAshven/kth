@@ -16,9 +16,9 @@
 
 namespace kth::node {
 
-/// JSON-RPC server settings. Always present so config parsing is uniform; the
-/// server itself is only compiled when KTH_WITH_RPC is defined and only started
-/// when `enabled` is true.
+/// RPC server settings, shared by whichever backend the build selected (JSON-RPC
+/// when KTH_WITH_RPC is defined, gRPC when KTH_WITH_GRPC is). Always present so
+/// config parsing is uniform; the server is only started when `enabled` is true.
 struct KND_API rpc_settings {
     rpc_settings();
 
@@ -99,6 +99,8 @@ struct KND_API sv2_settings {
     std::string authority_public_key;
     uint32_t certificate_validity_seconds;
     uint32_t handshake_timeout_seconds;
+    uint32_t template_refresh_seconds;
+    uint64_t minimum_fee_gain_satoshis;
     mining_settings mining;
     jd_settings jd;
 };
