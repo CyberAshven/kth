@@ -448,8 +448,12 @@ with the raw transactions, and uses the new token from
 and uses the token already allocated. Either mode then sends
 `SetCustomMiningJob` on the mining connection.
 
-Declarations wake on connected-tip notifications and upstream replies. Only
-an outstanding response arms a deadline; an idle client does not poll the chain.
+Declarations wake on connected-tip notifications and upstream replies. Between
+tips, the client checks the mempool generation at `sv2.template_refresh_seconds`
+intervals and fetches a template only after it changes. A fee gain of at least
+`sv2.minimum_fee_gain_satoshis` starts a new declaration once the preceding one
+has completed. Pooled work keeps its declared payout while that request is
+pending; a connection-local fee refresh never replaces it with solo work.
 
 Bitcoin Cash differs from the parts of the specification written for Bitcoin.
 There is no segregated witness, so the declared "wtxid" list carries ordinary
