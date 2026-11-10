@@ -961,4 +961,3 @@ TEST_CASE("sv2 mining shares the authenticated Noise transport", "[sv2 mining]")
     fixture.stop();
     fixture.require_closed(*partial);
 }
-
