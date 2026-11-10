@@ -117,6 +117,8 @@ jd_client::jd_client(sv2_settings const& settings, ::asio::any_io_executor execu
     , jobs_(settings.jd.user_identity, settings.jd.mode == "full-template")
     , chain_(chain)
     , response_timeout_(settings.jd.response_timeout_seconds)
+    , template_refresh_interval_(settings.template_refresh_seconds)
+    , minimum_fee_gain_satoshis_(settings.minimum_fee_gain_satoshis)
     , declaration_wake_(owner_)
     , hash_rate_wake_(owner_)
     , ready_(owner_, 1)
@@ -350,6 +352,8 @@ bool jd_client::dispatch(jd_declaration::result result) {
     // A slow JDS cannot pin a queue of old templates or delay solo jobs. After
     // the response, fetch only the latest connected tip's own selection.
     std::optional<hash_digest> previous;
+    std::optional<uint64_t> looked_generation;
+    std::optional<std::chrono::steady_clock::time_point> next_look;
     while ( ! stopped_) {
         declaration_changed_ = false;
         if (job_deadline_ && std::chrono::steady_clock::now() >= *job_deadline_) {
@@ -370,7 +374,17 @@ bool jd_client::dispatch(jd_declaration::result result) {
         }
         if (chain_ && mining_session_.ready() && declaration_session_.ready() && ! jobs_.pending()) {
             auto const view = chain_->chain_view();
-            if (view && previous != view->tip_hash && mining_session_.channel()) {
+            auto const now = std::chrono::steady_clock::now();
+            bool const new_tip = view && previous != view->tip_hash;
+            bool const look_due = ! next_look || now >= *next_look;
+            auto const generation = chain_->mempool_ref().generation();
+            bool const changed = ! looked_generation || generation != *looked_generation;
+            if (view && mining_session_.channel() && (new_tip || (look_due && changed))) {
+                // Read before suspension: admissions during this fetch still
+                // count as changes at the next rate-limited look. Same-tip
+                // improvements go through JD, never a solo payout replacement.
+                looked_generation = generation;
+                next_look = now + template_refresh_interval_;
                 // Allocation outputs fit B0_64K. Reserve their maximum size
                 // before selecting transactions; the builder checks the exact
                 // completed coinbase against the returned block limit.
@@ -382,6 +396,13 @@ bool jd_client::dispatch(jd_declaration::result result) {
                 // second declaration over one that completed during the fetch.
                 if (value && latest && latest->tip_hash == value->previous_block_hash
                     && ! jobs_.pending() && mining_session_.channel()) {
+                    if (previous == value->previous_block_hash && jobs_.has_template()) {
+                        auto const current = jobs_.template_value().coinbase_value;
+                        if (value->coinbase_value < current
+                            || value->coinbase_value - current < minimum_fee_gain_satoshis_) {
+                            continue;
+                        }
+                    }
                     previous = value->previous_block_hash;
                     // start() drops the previous declared coinbase before its
                     // token exists. A cached share from that coinbase must not
@@ -389,13 +410,21 @@ bool jd_client::dispatch(jd_declaration::result result) {
                     retire_cached();
                     if ( ! dispatch(jobs_.start(std::move(*value), *mining_session_.channel()))) co_return;
                 }
+            } else if (look_due) {
+                // Poll only the cheap generation counter on an unchanged pool.
+                // No scan or new declaration is needed until it moves.
+                next_look = now + template_refresh_interval_;
             }
         }
         // A tip or reply can arrive while the template fetch is suspended.
         // Remember that wake even when there was no timer wait to cancel.
         if (declaration_changed_) continue;
-        declaration_wake_.expires_at(job_deadline_.value_or(
-            std::chrono::steady_clock::time_point::max()));
+        auto wake = job_deadline_.value_or(std::chrono::steady_clock::time_point::max());
+        if (chain_ && mining_session_.ready() && declaration_session_.ready()
+            && ! jobs_.pending() && next_look) {
+            wake = std::min(wake, *next_look);
+        }
+        declaration_wake_.expires_at(wake);
         (void)co_await declaration_wake_.async_wait(::asio::as_tuple(::asio::use_awaitable));
     }
 }

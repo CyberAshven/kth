@@ -123,6 +123,8 @@ private:
     jd_declaration jobs_;
     blockchain::block_chain* const chain_;
     std::chrono::seconds const response_timeout_;
+    std::chrono::seconds const template_refresh_interval_;
+    uint64_t const minimum_fee_gain_satoshis_;
     std::optional<std::chrono::steady_clock::time_point> job_deadline_;
     ::asio::steady_timer declaration_wake_;
     // Wakes report_hash_rate() for a changed sum, unless an update was just
