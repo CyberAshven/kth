@@ -16,6 +16,7 @@
 #include <kth/infrastructure/utility/byte_reader.hpp>
 #include <kth/infrastructure/utility/byte_writer.hpp>
 #include <kth/infrastructure/utility/data.hpp>
+#include <kth/node/sv2/extensions.hpp>
 #include <kth/node/sv2/framing.hpp>
 
 namespace kth::node::sv2 {
@@ -187,9 +188,9 @@ struct set_custom_mining_job_error {
     [[nodiscard]] static expect<set_custom_mining_job_error> from_data(byte_reader& source);
 };
 
-// Extensions Negotiation, extension 0x0001. Sent on the Job Declaration
-// connection immediately after SetupConnection.Success.
-inline constexpr uint16_t extensions_negotiation_type = 0x0001;
+// Extensions Negotiation (0x0001) and its three messages are in extensions.hpp.
+// The Job Declaration connection sends RequestExtensions immediately after
+// SetupConnection.Success.
 
 // Requested Payout Outputs uses the experimental identifier 0x5052, which is
 // not in the SV2 extension registry. sv2-spec PR #249 proposed it as 0x0004
@@ -200,46 +201,6 @@ inline constexpr uint16_t requested_payout_outputs_extension = 0x5052;
 inline constexpr uint32_t exact_outputs_flag = 1u;
 
 inline constexpr std::string_view error_stale_payout_outputs = "stale-payout-outputs";
-
-struct request_extensions {
-    static constexpr uint8_t message_type = 0x00;
-    static constexpr bool channel_message = false;
-    static constexpr uint16_t extension_id = extensions_negotiation_type;
-
-    uint16_t request_id = 0;
-    std::vector<uint16_t> requested_extensions;
-
-    [[nodiscard]] size_t serialized_size() const;
-    [[nodiscard]] expect<void> to_data(byte_writer& sink) const;
-    [[nodiscard]] static expect<request_extensions> from_data(byte_reader& source);
-};
-
-struct request_extensions_success {
-    static constexpr uint8_t message_type = 0x01;
-    static constexpr bool channel_message = false;
-    static constexpr uint16_t extension_id = extensions_negotiation_type;
-
-    uint16_t request_id = 0;
-    std::vector<uint16_t> supported_extensions;
-
-    [[nodiscard]] size_t serialized_size() const;
-    [[nodiscard]] expect<void> to_data(byte_writer& sink) const;
-    [[nodiscard]] static expect<request_extensions_success> from_data(byte_reader& source);
-};
-
-struct request_extensions_error {
-    static constexpr uint8_t message_type = 0x02;
-    static constexpr bool channel_message = false;
-    static constexpr uint16_t extension_id = extensions_negotiation_type;
-
-    uint16_t request_id = 0;
-    std::vector<uint16_t> unsupported_extensions;
-    std::vector<uint16_t> required_extensions;
-
-    [[nodiscard]] size_t serialized_size() const;
-    [[nodiscard]] expect<void> to_data(byte_writer& sink) const;
-    [[nodiscard]] static expect<request_extensions_error> from_data(byte_reader& source);
-};
 
 // Requested Payout Outputs. Frames use requested_payout_outputs_extension.
 struct request_payout_outputs {
