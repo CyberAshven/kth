@@ -544,6 +544,7 @@ opened_channel work_engine::open(open_request const& request) {
     slot.id = next_channel_++;
     slot.group_id = group_bit | slot.id;
     slot.kind = request.kind;
+    slot.user_identity = request.user_identity;
     slot.hashrate = request.nominal_hash_rate;
     slot.max_target = request.max_target;
     slot.share_target = choose_target(request.nominal_hash_rate, request.max_target);
@@ -760,6 +761,7 @@ std::optional<work_job> work_engine::build(channel& slot,
     created.extranonce_prefix = slot.extranonce_prefix;
     created.extranonce_size = slot.extranonce_size;
     created.pool = pooled;
+    created.pool_work_id = pooled ? pool_.work_id : 0;
     created.pool_prefix_length = pooled ? slot.pool_prefix_length : 0;
     created.pool_extranonce_size = pooled ? slot.pool_extranonce_size : 0;
     // The value split_coinbase wrote. A later pool_.generation must not
@@ -824,6 +826,7 @@ std::optional<std::vector<work_job>> work_engine::on_pool_template(
     pool_.prefix = binding.prefix;
     pool_.extranonce_size = binding.extranonce_size;
     pool_.generation = binding.generation;
+    pool_.work_id = binding.work_id;
     pool_.outputs = pool_outputs;
     pool_.fixed_script = binding.fixed_script;
     pool_.script_prefix = binding.script_prefix;
@@ -924,6 +927,7 @@ share_outcome work_engine::submit(share_request const& share) {
             return std::nullopt;
         }
         pool_proof proof;
+        proof.work_id = job->pool_work_id;
         proof.header_hash = digest;
         proof.full_extranonce = full;
         proof.upstream_extranonce.assign(
@@ -935,6 +939,7 @@ share_outcome work_engine::submit(share_request const& share) {
         proof.nonce = share.nonce;
         proof.bits = job->bits;
         proof.generation = job->generation;
+        proof.worker = share.worker.value_or(slot->user_identity);
         return proof;
     };
     // The channel's latest target, not the one when the job was built: a

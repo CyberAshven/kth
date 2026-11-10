@@ -49,6 +49,9 @@ struct jd_connection {
     // `frames` is one or more complete plaintext frames, queued as one entry
     // and written in order.
     [[nodiscard]] bool send(data_chunk frames);
+    // Read after run() has joined. Handshake failures need a longer hold than
+    // an unreachable address, including a peer that never finishes Noise.
+    [[nodiscard]] bool authentication_failed() const;
     void stop();
 
 private:
@@ -62,6 +65,7 @@ private:
     std::chrono::milliseconds const timeout_;
     std::atomic_bool accepting_{true};
     std::atomic_bool started_{false};
+    bool authentication_failed_ = false;
     ::asio::experimental::concurrent_channel<void(std::error_code, data_chunk)> outgoing_;
     ::asio::experimental::concurrent_channel<void(std::error_code, int)> stopping_;
 };

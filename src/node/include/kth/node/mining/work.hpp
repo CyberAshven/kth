@@ -107,6 +107,8 @@ struct open_request {
     channel_kind kind = channel_kind::standard;
     // The caller asked only for header-only channels (SV2 REQUIRES_STANDARD_JOBS).
     bool standard_only = false;
+    // The miner label the channel was opened with. Pool shares carry it upstream.
+    std::string user_identity;
 };
 
 enum class open_status { opened, rejected, protocol_error };
@@ -146,6 +148,7 @@ struct work_job {
 // Proof fields a pool job share needs upstream. Absent unless the job's
 // coinbase is the one declared to the pool.
 struct pool_proof {
+    uint64_t work_id = 0;
     hash_digest header_hash{};
     data_chunk upstream_extranonce;
     data_chunk full_extranonce;
@@ -162,11 +165,15 @@ struct pool_proof {
     // A pooled job keeps that generation; it is not the downstream job id.
     // Flushing a cache under a later declaration would submit the old coinbase.
     uint32_t generation = 0;
+    // The worker that found it: the name the share itself carried, else the
+    // channel's user_identity. Sent to a pool that tracks workers.
+    std::string worker;
 };
 
 // One coinbase and transaction selection shared by every downstream channel.
 // The upstream channel reserves the complete extranonce between these parts.
 struct declared_work {
+    uint64_t work_id = 0;
     blockchain::mining_template tmpl{};
     domain::chain::output::list outputs;
     uint32_t generation = 0;
@@ -205,6 +212,7 @@ struct pool_binding {
     uint32_t coinbase_version = 1;
     uint32_t coinbase_input_sequence = 0xffffffffu;
     uint32_t coinbase_locktime = 0;
+    uint64_t work_id = 0;
 };
 
 [[nodiscard]]
@@ -244,6 +252,9 @@ struct share_request {
     uint32_t ntime = 0;
     uint32_t version = 0;
     data_chunk extranonce;
+    // A worker name sent with this share, by a front end that negotiated one
+    // per share. Absent means the channel's user_identity.
+    std::optional<std::string> worker;
 };
 
 enum class share_status { accepted, block, rejected };
@@ -338,6 +349,7 @@ private:
         data_chunk extranonce_prefix;
         uint16_t extranonce_size = 0;
         bool pool = false;
+        uint64_t pool_work_id = 0;
         size_t pool_prefix_length = 0;
         uint16_t pool_extranonce_size = 0;
         // Coinbase generation this job was built with. For a pool job that is
@@ -354,6 +366,7 @@ private:
         uint32_t id = 0;
         uint32_t group_id = 0;
         channel_kind kind = channel_kind::standard;
+        std::string user_identity;
         float hashrate = 0;
         hash_digest max_target{};
         hash_digest share_target{};
@@ -375,6 +388,7 @@ private:
         data_chunk prefix;
         uint16_t extranonce_size = 0;
         uint32_t generation = 0;
+        uint64_t work_id = 0;
         domain::chain::output::list outputs;
         // Set with a payout output set so the script prefix committed in the
         // request is not rebuilt around the real output sizes.
