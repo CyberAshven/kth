@@ -679,6 +679,9 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
     // Each pair keeps one outstanding declaration and fetches only the latest
     // connected tip after a reply. Neither upstream can delay solo jobs.
     std::optional<hash_digest> previous;
+    std::optional<uint64_t> looked_generation;
+    std::optional<std::chrono::steady_clock::time_point> next_look;
+    auto const refresh_interval = std::chrono::seconds(settings_.template_refresh_seconds);
     while ( ! stopped_ && ! value.stopped) {
         value.declaration_changed = false;
         auto const now = std::chrono::steady_clock::now();
@@ -701,7 +704,16 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
         }
         if (chain_ && value.ready && ! value.jobs.pending()) {
             auto const view = chain_->chain_view();
-            if (view && previous != view->tip_hash && value.mining_session.channel()) {
+            bool const new_tip = view && previous != view->tip_hash;
+            bool const look_due = ! next_look || now >= *next_look;
+            auto const generation = chain_->mempool_ref().generation();
+            bool const changed = ! looked_generation || generation != *looked_generation;
+            if (view && value.mining_session.channel() && (new_tip || (look_due && changed))) {
+                // Read before suspension: admissions during this fetch still
+                // count as changes at the next rate-limited look. Same-tip
+                // improvements go through JD, never a solo payout replacement.
+                looked_generation = generation;
+                next_look = now + refresh_interval;
                 // Allocation outputs fit B0_64K. Reserve their maximum size
                 // before selecting transactions; the builder checks the exact
                 // completed coinbase against the returned block limit.
@@ -714,6 +726,13 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
                 // second declaration over one that completed during the fetch.
                 if (tmpl && latest && latest->tip_hash == tmpl->previous_block_hash
                     && ! value.jobs.pending() && value.mining_session.channel()) {
+                    if (previous == tmpl->previous_block_hash && value.jobs.has_template()) {
+                        auto const current = value.jobs.template_value().coinbase_value;
+                        if (tmpl->coinbase_value < current
+                            || tmpl->coinbase_value - current < settings_.minimum_fee_gain_satoshis) {
+                            continue;
+                        }
+                    }
                     previous = tmpl->previous_block_hash;
                     value.work_id = 0;
                     // start() drops the previous declared coinbase before its
@@ -722,6 +741,10 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
                     retire_cached(value);
                     if ( ! dispatch(value, value.jobs.start(std::move(*tmpl), *value.mining_session.channel()))) co_return;
                 }
+            } else if (look_due) {
+                // Poll only the cheap generation counter on an unchanged pool.
+                // No scan or new declaration is needed until it moves.
+                next_look = now + refresh_interval;
             }
         }
         // A tip or reply can arrive while the template fetch is suspended.
@@ -730,6 +753,9 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
         auto wake_at = value.job_deadline.value_or(std::chrono::steady_clock::time_point::max());
         if ( ! value.submitted.empty()) {
             wake_at = std::min(wake_at, value.submitted.front().sent + response_timeout_);
+        }
+        if (chain_ && value.ready && ! value.jobs.pending() && next_look) {
+            wake_at = std::min(wake_at, *next_look);
         }
         value.declaration_wake.expires_at(wake_at);
         (void)co_await value.declaration_wake.async_wait(::asio::as_tuple(::asio::use_awaitable));

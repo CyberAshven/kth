@@ -541,6 +541,43 @@ std::shared_ptr<test::chain_fixture> started_chain(char const* tag, bool local_a
     return chain;
 }
 
+// A mature coinbase funds real fee-paying transactions without moving the tip
+// while a declaration is being refreshed.
+std::pair<std::shared_ptr<test::chain_fixture>, domain::chain::transaction>
+fee_refresh_chain(char const* tag) {
+    auto chain = std::make_shared<test::chain_fixture>(tag, 0);
+    chain->settings().gbt_template_refresh_seconds = 0;
+    REQUIRE(chain->created());
+    REQUIRE(chain->start());
+    constexpr uint32_t height = 101;
+    auto const base = uint32_t(zulu_time()) - (height + 10) * test::block_spacing;
+    std::vector<domain::chain::block> blocks;
+    auto previous = domain::chain::block::genesis_regtest().hash();
+    for (uint32_t next_height = 1; next_height <= height; ++next_height) {
+        blocks.push_back(test::mine_block(previous, next_height,
+            base + next_height * test::block_spacing, 0, {}, 0));
+        previous = blocks.back().hash();
+    }
+    REQUIRE(chain->organizer().add_headers(test::headers_of(blocks)).headers_added == height);
+    test::persist_headers(*chain, blocks, 1);
+    test::connect_bodies(*chain, blocks, 1);
+    return {chain, blocks.front().transactions().front()};
+}
+
+domain::chain::transaction admit_fee_spend(io_driver& driver, test::chain_fixture& chain,
+    domain::chain::transaction const& funding, uint64_t fee) {
+    auto const view = chain.chain().chain_view();
+    REQUIRE(view);
+    auto transaction = test::spend_p2pkh(funding, 0, funding.outputs().front().value() - fee,
+        view->state->enabled_flags());
+    auto admitted = ::asio::co_spawn(driver.io,
+        chain.chain().organize(std::make_shared<domain::message::transaction const>(transaction)),
+        ::asio::use_future);
+    driver.await(admitted);
+    REQUIRE(admitted.get() == error::success);
+    return transaction;
+}
+
 domain::chain::script pool_script() {
     short_hash hash{};
     hash.fill(0x22);
@@ -1984,6 +2021,92 @@ TEST_CASE("sv2 JD declares the local template in both modes and pays the pool ou
         declared.custom.request_id, 77});
     auto quiet = fixture.begin_read(fixture.pool.socket, 1);
     CHECK_FALSE(fixture.wait_until([&] { return quiet->done; }, 300ms));
+}
+
+TEST_CASE("sv2 JD redeclares a same-tip fee gain without replacing the pool payout", "[sv2 jd][sv2 fee refresh]") {
+    auto [chain, funding] = fee_refresh_chain("sv2_jd_fee_gain");
+    client_fixture fixture;
+    auto configuration = settings(fixture.pool, fixture.jds);
+    configuration.template_refresh_seconds = 1;
+    configuration.minimum_fee_gain_satoshis = 1000;
+    provider_run provider(fixture, configuration, chain);
+    handshake_upstreams(fixture, true);
+    miner_link miner(fixture, provider.port);
+    auto const first = declare_local_template(fixture, miner, true);
+    fixture.pool.send(set_custom_mining_job_success{first.custom.channel_id,
+        first.custom.request_id, 77});
+
+    auto const transaction = admit_fee_spend(fixture, *chain, funding, 3000);
+    auto const allocation = fixture.jds.receive<allocate_mining_job_token>();
+    REQUIRE(allocation.request_id > first.declaration.request_id);
+    fixture.jds.send(allocate_mining_job_token_success{allocation.request_id,
+        {4, 5, 6}, output_bytes(pool_output_list())});
+    auto const declaration = fixture.jds.receive<declare_mining_job>();
+    REQUIRE(declaration.request_id == allocation.request_id);
+    REQUIRE(declaration.wtxid_list == std::vector<hash_digest>{transaction.hash()});
+
+    auto const pooled = miner.next();
+    REQUIRE(pooled.prev.prev_hash == first.pooled.prev.prev_hash);
+    REQUIRE(pooled.job.job_id != first.pooled.job.job_id);
+    REQUIRE(pooled.job.coinbase_tx_prefix == declaration.coinbase_tx_prefix);
+    REQUIRE(pooled.job.coinbase_tx_suffix == declaration.coinbase_tx_suffix);
+    REQUIRE(pays(coinbase_from(pooled), pool_script(), 2));
+    REQUIRE(coinbase_from(pooled).outputs().front().value() == regtest_subsidy + 3000);
+    fixture.jds.send(provide_missing_transactions{declaration.request_id, {0}});
+    auto const supplied = fixture.jds.receive<provide_missing_transactions_success>();
+    REQUIRE(supplied.request_id == declaration.request_id);
+    REQUIRE(supplied.transaction_list == std::vector<data_chunk>{to_data_chunk(transaction, true)});
+    fixture.jds.send(declare_mining_job_success{declaration.request_id, {8, 7, 6}});
+    auto const custom = fixture.pool.receive<set_custom_mining_job>();
+    REQUIRE(custom.request_id == declaration.request_id);
+    REQUIRE(custom.prev_hash == first.custom.prev_hash);
+    REQUIRE(custom.merkle_path == std::vector<hash_digest>{transaction.hash()});
+    auto const outputs = read_outputs(custom.coinbase_tx_outputs);
+    REQUIRE(outputs.front().script() == pool_script());
+    REQUIRE(outputs.front().value() == regtest_subsidy + 3000);
+    fixture.pool.send(set_custom_mining_job_success{custom.channel_id, custom.request_id, 78});
+}
+
+TEST_CASE("sv2 JD leaves accepted work alone without a sufficient fee gain", "[sv2 jd][sv2 fee refresh]") {
+    auto [chain, funding] = fee_refresh_chain("sv2_jd_fee_small");
+    client_fixture fixture;
+    auto configuration = settings(fixture.pool, fixture.jds);
+    configuration.template_refresh_seconds = 1;
+    configuration.minimum_fee_gain_satoshis = 5000;
+    provider_run provider(fixture, configuration, chain);
+    handshake_upstreams(fixture, true);
+    miner_link miner(fixture, provider.port);
+    auto const first = declare_local_template(fixture, miner, true);
+    fixture.pool.send(set_custom_mining_job_success{first.custom.channel_id,
+        first.custom.request_id, 77});
+    auto const declaration_read = fixture.begin_read(fixture.jds.socket, 1);
+    auto const miner_read = fixture.begin_read(miner.socket, 1);
+    CHECK_FALSE(fixture.wait_until([&] { return declaration_read->done || miner_read->done; }, 1500ms));
+    (void)admit_fee_spend(fixture, *chain, funding, 1000);
+    CHECK_FALSE(fixture.wait_until([&] { return declaration_read->done || miner_read->done; }, 1500ms));
+    REQUIRE(pays(coinbase_from(first.pooled), pool_script(), 2));
+}
+
+TEST_CASE("sv2 JD does not overlap a fee refresh with its pending declaration", "[sv2 jd][sv2 fee refresh]") {
+    auto [chain, funding] = fee_refresh_chain("sv2_jd_fee_pending");
+    client_fixture fixture;
+    auto configuration = settings(fixture.pool, fixture.jds);
+    configuration.template_refresh_seconds = 1;
+    configuration.minimum_fee_gain_satoshis = 1000;
+    provider_run provider(fixture, configuration, chain);
+    handshake_upstreams(fixture, true);
+    miner_link miner(fixture, provider.port);
+    auto const first = declare_local_template(fixture, miner, true);
+    fixture.pool.send(set_custom_mining_job_success{first.custom.channel_id,
+        first.custom.request_id, 77});
+    auto const parent = admit_fee_spend(fixture, *chain, funding, 3000);
+    auto const allocation = fixture.jds.receive<allocate_mining_job_token>();
+    REQUIRE(allocation.request_id > first.declaration.request_id);
+    auto const declaration_read = fixture.begin_read(fixture.jds.socket, 1);
+    auto const miner_read = fixture.begin_read(miner.socket, 1);
+    (void)admit_fee_spend(fixture, *chain, parent, 3000);
+    CHECK_FALSE(fixture.wait_until([&] { return declaration_read->done || miner_read->done; }, 1500ms));
+    REQUIRE(pays(coinbase_from(first.pooled), pool_script(), 2));
 }
 
 TEST_CASE("sv2 JD forwards a share that meets the upstream target and connects a network solution", "[sv2 jd]") {
