@@ -1013,4 +1013,3 @@ TEST_CASE("sv2 mining channels get replacement jobs on the same tip once fees ri
     fixture.require_closed(*client);
     fixture.stop();
 }
-
