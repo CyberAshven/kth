@@ -190,6 +190,9 @@ set(kth_sources_just_legacy
         src/chain/point.cpp
         src/chain/point_iterator.cpp
         src/chain/script.cpp
+        src/chain/script_filter.cpp
+        src/chain/script_filter_builder.cpp
+        src/chain/golomb_set.cpp
         src/chain/transaction.cpp
         src/policy/standardness.cpp
         src/chain/utxo.cpp
@@ -583,6 +586,7 @@ if (ENABLE_TEST AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
         test/chain/compact.cpp
         test/chain/header.cpp
         test/chain/history.cpp
+        test/chain/golomb_set.cpp
         test/chain/input.cpp
         test/chain/light_block.cpp
         test/chain/output.cpp
@@ -595,6 +599,8 @@ if (ENABLE_TEST AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
         test/chain/points_value.cpp
         test/chain/satoshi_words.cpp
         test/chain/script.cpp
+        test/chain/script_filter.cpp
+        test/chain/script_filter_builder.cpp
         test/chain/transaction.cpp
         test/main.cpp
 
