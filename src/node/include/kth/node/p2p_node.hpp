@@ -42,6 +42,7 @@
 #include <asio/thread_pool.hpp>
 
 namespace kth::node::detail { struct p2p_node_test_seam; }
+namespace kth::node::detail { struct ws_discovery_inbox; }
 
 namespace kth::node {
 using namespace kth::network;
@@ -175,6 +176,8 @@ public:
     ::asio::awaitable<void> serve(peer_session& peer);
 
 private:
+    ::asio::awaitable<void> answer_mempool(peer_session& peer,
+                                           detail::tx_announcement_schedule* announcing);
     ::asio::awaitable<void> announce_transactions(peer_session& peer,
                                                   detail::tx_announcement_schedule& schedule);
 
@@ -251,7 +254,7 @@ public:
     using ptr = std::shared_ptr<p2p_node>;
     using address = domain::message::network_address;
 
-    explicit p2p_node(settings const& settings);
+    explicit p2p_node(network::settings const& settings);
     ~p2p_node();
 
     // Lifecycle
@@ -295,7 +298,7 @@ public:
     // -------------------------------------------------------------------------
 
     [[nodiscard]]
-    settings const& network_settings() const;
+    network::settings const& network_settings() const;
 
     [[nodiscard]]
     bool stopped() const;
@@ -539,8 +542,8 @@ private:
     ::asio::awaitable<void> run_seeding();
     ::asio::awaitable<void> run_outbound();
     ::asio::awaitable<void> run_inbound();
-    ::asio::awaitable<void> run_peer_protocols(peer_session::ptr peer);
-    ::asio::awaitable<void> read_peer_messages(peer_session::ptr peer);
+    ::asio::awaitable<void> run_peer_protocols(peer_session::ptr peer, bool discovery);
+    ::asio::awaitable<void> read_peer_messages(peer_session::ptr peer, bool discovery);
     ::asio::awaitable<void> maintain_outbound_connections();
 
     // Peer supervisor - manages all peer lifecycles (structured concurrency)
@@ -559,7 +562,7 @@ private:
     static
     uint64_t generate_ping_nonce();
 
-    settings const& settings_;
+    network::settings const& settings_;
     threadpool pool_;
     peer_manager manager_;
     peer_database peer_db_;  // Unified peer storage (hosts, bans, and reputation)
@@ -578,6 +581,11 @@ private:
 
     // Acceptor for inbound connections
     std::unique_ptr<::asio::ip::tcp::acceptor> acceptor_;
+
+    /// Native WS listener owns its acceptor on its own execution context.
+    ::asio::awaitable<void> run_websocket_inbound();
+    ::asio::awaitable<void> run_websocket_discovery();
+    std::unique_ptr<detail::ws_discovery_inbox> ws_discovery_;
 
     /// The whole lifecycle, in one atomic word.
     ///

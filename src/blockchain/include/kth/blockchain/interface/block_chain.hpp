@@ -840,6 +840,13 @@ struct KB_API block_chain {
     [[nodiscard]]
     ::asio::awaitable<uint64_t> mempool_last_admission();
 
+    // Everything pooled, in admission order (what was pooled otherwise, with
+    // id zero, first), with the last admission's id at the time: a peer's
+    // answer to `mempool` (BIP35). On the chain's executor under the
+    // validation lock.
+    [[nodiscard]]
+    ::asio::awaitable<mempool_admitted> mempool_snapshot();
+
     // Rung when a transaction is admitted. One slot, so rings coalesce: what
     // it wakes reads the last admission afresh. Closed by stop().
     [[nodiscard]]
@@ -1222,6 +1229,8 @@ private:
 
     populate_chain_state const chain_state_populator_;
     database::data_base database_;
+    // db.nocow: the UTXO-Z directory is created NOCOW on btrfs.
+    bool const in_place_nocow_;
 
     /// The published state on its own. Private: a caller that wants the state
     /// wants the tip and the generation that go with it, and reading them apart
