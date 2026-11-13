@@ -207,6 +207,7 @@ set(kth_sources_just_legacy
   src/finalization.cpp
   src/parking.cpp
   src/utxo_builder.cpp
+  src/script_filter_source.cpp
         src/utxo_deletion_sweep.cpp
 )
 
@@ -352,6 +353,7 @@ if (ENABLE_TEST)
         test/mainnet_checkpoints.cpp
         test/parking.cpp
         test/block_undo.cpp
+        test/script_filter_source.cpp
         test/reorg_undo_roundtrip.cpp
         test/undo_scan.cpp
         test/utxo_transition_record.cpp
