@@ -601,6 +601,7 @@ if (ENABLE_TEST AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
         test/chain/script.cpp
         test/chain/script_filter.cpp
         test/chain/script_filter_builder.cpp
+        test/chain/script_filter_bchd.cpp
         test/chain/transaction.cpp
         test/main.cpp
 
