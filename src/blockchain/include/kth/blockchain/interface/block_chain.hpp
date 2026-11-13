@@ -365,6 +365,27 @@ struct KB_API block_chain {
     database::result_code publish_transition(database::transition_heights const& heights,
                                              std::span<database::header_abla_record const> abla_records);
 
+    /// Step 10 with the script filters of the connected blocks as well, in the
+    /// same transaction, and the height of the last of them (absent when the
+    /// transition stores none).
+    [[nodiscard]]
+    database::result_code publish_transition(database::transition_heights const& heights,
+                                             std::span<database::header_abla_record const> abla_records,
+                                             std::span<database::script_filter_record const> script_filters,
+                                             std::optional<uint32_t> script_filter_height);
+
+    /// The stored script filter (compact filter type 1) of a block, as it is
+    /// served, its filter header, and the highest height that has one stored
+    /// with every block below it. `key_not_found` where none is stored.
+    [[nodiscard]]
+    std::expected<data_chunk, database::result_code> script_filter(hash_digest const& block_hash) const;
+
+    [[nodiscard]]
+    std::expected<hash_digest, database::result_code> script_filter_header(hash_digest const& block_hash) const;
+
+    [[nodiscard]]
+    std::expected<uint32_t, database::result_code> script_filter_height() const;
+
     /// Steps 3 and 11. The LMDB environment is opened MDB_NOSYNC, so a commit
     /// that returned success has not necessarily reached the disk.
     [[nodiscard]]

@@ -33,6 +33,12 @@ enum class property_code {
     // rather than a value that each field has to be checked against separately.
     // Zero is not overloaded to mean anything.
     utxo_transition    = 4,
+
+    // The highest connected height whose script filter and filter header are
+    // stored, with those of every block below it. A filter header commits to
+    // the header of the parent block, so the stored ones are always one run
+    // from the genesis block up to this height. Absent: none is stored.
+    script_filter_height = 5,
 };
 
 enum class db_mode_type {

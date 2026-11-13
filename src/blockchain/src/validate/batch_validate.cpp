@@ -22,6 +22,7 @@
 #include <kth/blockchain/validate/validate_header.hpp>
 #include <kth/blockchain/validate/validate_input.hpp>
 #include <kth/domain/constants.hpp>
+#include <kth/domain/chain/script_filter_builder.hpp>
 #include <kth/domain/chain/faster_blocks.hpp>
 #include <kth/infrastructure/utility/assert.hpp>
 
@@ -832,6 +833,48 @@ parse_block_batch(std::span<data_chunk const> raw_blocks) {
         }
     }
     return parsed_block_batch{std::move(blocks), std::move(txids)};
+}
+
+std::expected<database::script_filter_record, code>
+script_filter_record_for(domain::chain::block const& block, hash_digest const& parent_filter_header) {
+    // The output each input spends, for every transaction but the coinbase, in
+    // block order: an output created earlier in the block is among them, since
+    // validation resolved it like any other.
+    std::vector<domain::chain::output> spent;
+    auto const& transactions = block.transactions();
+    for (size_t i = 1; i < transactions.size(); ++i) {
+        for (auto const& input : transactions[i].inputs()) {
+            spent.push_back(input.previous_output().validation.cache);
+        }
+    }
+
+    auto const filter = domain::chain::build_script_filter(block, spent);
+    if ( ! filter) {
+        return std::unexpected(error::operation_failed);
+    }
+
+    return database::script_filter_record{
+        .block_hash = block.hash(),
+        .filter = domain::chain::to_data(*filter),
+        .header = domain::chain::script_filter_header(*filter, parent_filter_header)};
+}
+
+std::expected<std::vector<database::script_filter_record>, code>
+script_filter_records_for(std::span<block_const_ptr const> blocks, hash_digest const& parent_filter_header) {
+    std::vector<database::script_filter_record> records;
+    records.reserve(blocks.size());
+
+    auto parent = parent_filter_header;
+    for (auto const& block : blocks) {
+        auto record = script_filter_record_for(*block, parent);
+        if ( ! record) {
+            return std::unexpected(record.error());
+        }
+        parent = record->header;
+        records.push_back(std::move(*record));
+    }
+
+    return records;
 }
 
 } // namespace kth::blockchain

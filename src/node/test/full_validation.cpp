@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include <kth/blockchain/validate/batch_validate.hpp>
+#include <kth/domain/chain/script_filter_builder.hpp>
 #include <kth/node.hpp>
 
 #include "sync_harness.hpp"
@@ -414,4 +415,145 @@ TEST_CASE("full mode checks header work version and time below a retained anchor
     REQUIRE(expected != error::success);
     CHECK(added.error == expected);
     CHECK(added.headers_added == 0);
+}
+
+// -----------------------------------------------------------------------------
+// Script filters: stored by the connect path for the blocks it validates
+// -----------------------------------------------------------------------------
+//
+// The script filter of a block lists the scripts of the outputs the block
+// spends, and its filter header commits to the filter header of the parent
+// block. So the stored filters are one run from the genesis block up, and the
+// connect path can only extend that run while it validates every block, which
+// is what full mode does.
+
+namespace {
+
+// Headers into the index, then the node's connect path over the bodies, on a
+// fixture the caller keeps to read the chain afterwards.
+void connect_on(chain_fixture& fixture, scenario const& sc) {
+    REQUIRE(fixture.created());
+    REQUIRE(fixture.start());
+    REQUIRE( ! fixture.organizer().add_headers(headers_of(sc.blocks)).error);
+    persist_headers(fixture, sc.blocks, 1);
+    run_connect_tasks(fixture, sc.blocks, 1);
+}
+
+// Every block of the scenario, and the genesis block below it, has the filter
+// the builder gives for the block and the outputs it spends, under a filter
+// header that commits to the one below.
+void check_stored_script_filters(blockchain::block_chain const& chain, scenario const& sc) {
+    auto const stored_height = chain.script_filter_height();
+    REQUIRE(stored_height);
+    CHECK(*stored_height == trunk_len);
+
+    auto const genesis = domain::chain::block::genesis_regtest();
+    auto const genesis_filter = domain::chain::build_script_filter(genesis, {});
+    REQUIRE(genesis_filter);
+    auto parent_header = domain::chain::script_filter_header(*genesis_filter, null_hash);
+
+    auto const stored_genesis = chain.script_filter(genesis.hash());
+    REQUIRE(stored_genesis);
+    CHECK(*stored_genesis == domain::chain::to_data(*genesis_filter));
+    auto const stored_genesis_header = chain.script_filter_header(genesis.hash());
+    REQUIRE(stored_genesis_header);
+    CHECK(*stored_genesis_header == parent_header);
+
+    for (uint32_t h = 1; h <= trunk_len; ++h) {
+        CAPTURE(h);
+        auto const& block = sc.blocks[h - 1];
+
+        // The one spend of the chain is of the coinbase output of block 1.
+        std::vector<domain::chain::output> spent;
+        if (h == spend_height) {
+            spent.push_back(sc.blocks.front().transactions().front().outputs()[0]);
+        }
+
+        auto const expected = domain::chain::build_script_filter(block, spent);
+        REQUIRE(expected);
+        parent_header = domain::chain::script_filter_header(*expected, parent_header);
+
+        auto const stored = chain.script_filter(block.hash());
+        REQUIRE(stored);
+        CHECK(*stored == domain::chain::to_data(*expected));
+
+        auto const stored_header = chain.script_filter_header(block.hash());
+        REQUIRE(stored_header);
+        CHECK(*stored_header == parent_header);
+    }
+}
+
+} // namespace
+
+TEST_CASE("full mode stores the script filter of every block, chained from the genesis block",
+          "[node][full_validation][script_filters]") {
+    auto const sc = build_scenario(/*tampered*/ false, 0);
+    node::parser parser(domain::config::network::regtest);
+    std::ostringstream error;
+    REQUIRE(parse_options(parser, {"--chain.full_validation=true", anchor_option(sc)}, error));
+
+    chain_fixture fixture("fv_filters_full", parser.configured.chain);
+    connect_on(fixture, sc);
+
+    check_stored_script_filters(fixture.chain(), sc);
+}
+
+TEST_CASE("the script filters of a later batch continue the filter headers of the one before",
+          "[node][full_validation][script_filters]") {
+    auto const sc = build_scenario(/*tampered*/ false, 0);
+    node::parser parser(domain::config::network::regtest);
+    std::ostringstream error;
+    // Batches of 100: the second one starts at 101, the block with the spend,
+    // and its first filter header commits to the stored one of block 100.
+    REQUIRE(parse_options(parser, {"--chain.full_validation=true", anchor_option(sc),
+        "--chain.validation_batch_blocks=100"}, error));
+
+    chain_fixture fixture("fv_filters_batches", parser.configured.chain);
+    connect_on(fixture, sc);
+
+    check_stored_script_filters(fixture.chain(), sc);
+}
+
+TEST_CASE("optimized mode stores no script filter, as the run cannot start above the anchor",
+          "[node][full_validation][optimized][script_filters]") {
+    auto const sc = build_scenario(/*tampered*/ false, 0);
+
+    chain_fixture fixture("fv_filters_opt", optimized_settings(sc));
+    connect_on(fixture, sc);
+    auto const& chain = fixture.chain();
+
+    auto const built = chain.get_utxo_built_height();
+    REQUIRE(built);
+    CHECK(*built == trunk_len);
+
+    auto const stored_height = chain.script_filter_height();
+    REQUIRE( ! stored_height);
+    CHECK(stored_height.error() == database::result_code::key_not_found);
+
+    // Not for a block above the anchor either, though that one was validated:
+    // its filter header would commit to a parent that has none.
+    auto const above = chain.script_filter(sc.blocks[anchor_height].hash());
+    REQUIRE( ! above);
+    CHECK(above.error() == database::result_code::key_not_found);
+}
+
+TEST_CASE("chain.script_filters=false stores no script filter in full mode",
+          "[node][full_validation][script_filters]") {
+    auto const sc = build_scenario(/*tampered*/ false, 0);
+    node::parser parser(domain::config::network::regtest);
+    std::ostringstream error;
+    REQUIRE(parse_options(parser, {"--chain.full_validation=true", anchor_option(sc),
+        "--chain.script_filters=false"}, error));
+
+    chain_fixture fixture("fv_filters_off", parser.configured.chain);
+    connect_on(fixture, sc);
+    auto const& chain = fixture.chain();
+
+    auto const built = chain.get_utxo_built_height();
+    REQUIRE(built);
+    CHECK(*built == trunk_len);
+
+    auto const stored_height = chain.script_filter_height();
+    REQUIRE( ! stored_height);
+    CHECK(stored_height.error() == database::result_code::key_not_found);
 }

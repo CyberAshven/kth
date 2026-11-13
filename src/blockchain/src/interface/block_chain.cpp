@@ -1150,6 +1150,30 @@ database::result_code block_chain::publish_transition(
     return database_.internal_db().publish_transition(heights, abla_records);
 }
 
+database::result_code block_chain::publish_transition(
+    database::transition_heights const& heights,
+    std::span<database::header_abla_record const> abla_records,
+    std::span<database::script_filter_record const> script_filters,
+    std::optional<uint32_t> script_filter_height) {
+    return database_.internal_db().publish_transition(heights, abla_records,
+        script_filters, script_filter_height);
+}
+
+std::expected<data_chunk, database::result_code>
+block_chain::script_filter(hash_digest const& block_hash) const {
+    return database_.internal_db().get_script_filter(block_hash);
+}
+
+std::expected<hash_digest, database::result_code>
+block_chain::script_filter_header(hash_digest const& block_hash) const {
+    return database_.internal_db().get_script_filter_header(block_hash);
+}
+
+std::expected<uint32_t, database::result_code>
+block_chain::script_filter_height() const {
+    return database_.internal_db().get_script_filter_height();
+}
+
 database::result_code block_chain::env_sync() {
     return database_.internal_db().env_sync();
 }
@@ -1579,11 +1603,15 @@ database::disconnect_result block_chain::disconnect_block(uint32_t height,
     // the stored-block height named one block and the built height named
     // another: a start landing there reads a chain whose two markers describe
     // different blocks, and neither of them is wrong on its own.
+    //
+    // The script filter of the block leaves in that transaction too, so that no
+    // start finds a filter for a block the markers have already left.
     auto const parent = height - 1;
     if (auto const markers = database_.internal_db().set_heights(
             database::transition_heights{
                 .last_block_height = parent,
-                .utxo_built_height = parent});
+                .utxo_built_height = parent},
+            header_index_.get_hash(idx), height);
         markers != database::result_code::success) {
         spdlog::error("[blockchain] disconnect_block: UTXO set rolled back to {} but the height "
             "markers could not be updated", parent);

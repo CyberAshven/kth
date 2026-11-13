@@ -215,6 +215,76 @@ std::expected<heights_t, result_code> internal_database_basis<Clock>::get_last_h
     return heights_t{*header_result, *block_result};
 }
 
+template <typename Clock>
+std::expected<data_chunk, result_code> internal_database_basis<Clock>::get_script_filter(hash_digest const& block_hash) const {
+    // A database without the table holds no filter, which is the answer.
+    if ( ! dbi_script_filter_) {
+        return std::unexpected(result_code::key_not_found);
+    }
+
+    KTH_DB_txn* db_txn;
+    if (kth_db_txn_begin(env_, NULL, KTH_DB_RDONLY, &db_txn) != KTH_DB_SUCCESS) {
+        return std::unexpected(result_code::other);
+    }
+
+    auto key = kth_db_make_value(block_hash.size(), const_cast<uint8_t*>(block_hash.data()));
+    KTH_DB_val value;
+    auto const res = kth_db_get(db_txn, *dbi_script_filter_, &key, &value);
+    if (res != KTH_DB_SUCCESS) {
+        kth_db_txn_commit(db_txn);
+        return std::unexpected(res == KTH_DB_NOTFOUND ? result_code::key_not_found : result_code::other);
+    }
+
+    // The value points into the map, so it is copied before the transaction ends.
+    auto const* const bytes = static_cast<uint8_t const*>(kth_db_get_data(value));
+    data_chunk filter(bytes, bytes + kth_db_get_size(value));
+    kth_db_txn_commit(db_txn);
+    return filter;
+}
+
+template <typename Clock>
+std::expected<hash_digest, result_code> internal_database_basis<Clock>::get_script_filter_header(hash_digest const& block_hash) const {
+    if ( ! dbi_script_filter_header_) {
+        return std::unexpected(result_code::key_not_found);
+    }
+
+    KTH_DB_txn* db_txn;
+    if (kth_db_txn_begin(env_, NULL, KTH_DB_RDONLY, &db_txn) != KTH_DB_SUCCESS) {
+        return std::unexpected(result_code::other);
+    }
+
+    auto key = kth_db_make_value(block_hash.size(), const_cast<uint8_t*>(block_hash.data()));
+    KTH_DB_val value;
+    auto const res = kth_db_get(db_txn, *dbi_script_filter_header_, &key, &value);
+    if (res != KTH_DB_SUCCESS) {
+        kth_db_txn_commit(db_txn);
+        return std::unexpected(res == KTH_DB_NOTFOUND ? result_code::key_not_found : result_code::other);
+    }
+
+    hash_digest header;
+    if (kth_db_get_size(value) != header.size()) {
+        kth_db_txn_commit(db_txn);
+        return std::unexpected(result_code::db_corrupt);
+    }
+
+    auto const* const bytes = static_cast<uint8_t const*>(kth_db_get_data(value));
+    std::copy(bytes, bytes + header.size(), header.begin());
+    kth_db_txn_commit(db_txn);
+    return header;
+}
+
+template <typename Clock>
+std::expected<uint32_t, result_code> internal_database_basis<Clock>::get_script_filter_height() const {
+    KTH_DB_txn* db_txn;
+    if (kth_db_txn_begin(env_, NULL, KTH_DB_RDONLY, &db_txn) != KTH_DB_SUCCESS) {
+        return std::unexpected(result_code::other);
+    }
+
+    auto result = get_property_height(property_code::script_filter_height, db_txn);
+    kth_db_txn_commit(db_txn);
+    return result;
+}
+
 #if ! defined(KTH_DB_READONLY)
 
 template <typename Clock>
@@ -485,6 +555,97 @@ result_code internal_database_basis<Clock>::set_heights(transition_heights const
 }
 
 template <typename Clock>
+result_code internal_database_basis<Clock>::set_heights(transition_heights const& heights,
+                                                        hash_digest const& disconnected_block,
+                                                        uint32_t disconnected_height) {
+    KTH_DB_txn* db_txn;
+    if (kth_db_txn_begin(env_, NULL, 0, &db_txn) != KTH_DB_SUCCESS) {
+        return result_code::other;
+    }
+
+    auto res = write_heights(heights, db_txn);
+    if (res != result_code::success) {
+        kth_db_txn_abort(db_txn);
+        return res;
+    }
+
+    res = delete_script_filter(disconnected_block, db_txn);
+    if (res != result_code::success) {
+        kth_db_txn_abort(db_txn);
+        return res;
+    }
+
+    // The script filter height names the highest block of the stored run, so
+    // it follows the tip down. A height below the disconnected block is left
+    // as it is: the block had no filter to lose.
+    auto const stored_height = get_property_height(property_code::script_filter_height, db_txn);
+    if ( ! stored_height && stored_height.error() != result_code::key_not_found) {
+        kth_db_txn_abort(db_txn);
+        return stored_height.error();
+    }
+    if (stored_height && *stored_height >= disconnected_height) {
+        res = disconnected_height == 0
+            ? clear_property(property_code::script_filter_height, db_txn)
+            : set_property_height(property_code::script_filter_height,
+                disconnected_height - 1, db_txn);
+        if (res != result_code::success) {
+            kth_db_txn_abort(db_txn);
+            return res;
+        }
+    }
+
+    if (kth_db_txn_commit(db_txn) != KTH_DB_SUCCESS) {
+        return result_code::other;
+    }
+
+    return result_code::success;
+}
+
+template <typename Clock>
+result_code internal_database_basis<Clock>::put_script_filter(script_filter_record const& record, KTH_DB_txn* db_txn) {
+    if ( ! dbi_script_filter_ || ! dbi_script_filter_header_) {
+        return result_code::other;
+    }
+
+    auto key = kth_db_make_value(record.block_hash.size(), const_cast<uint8_t*>(record.block_hash.data()));
+    auto filter = kth_db_make_value(record.filter.size(), const_cast<uint8_t*>(record.filter.data()));
+    if (kth_db_put(db_txn, *dbi_script_filter_, &key, &filter, 0) != KTH_DB_SUCCESS) {
+        spdlog::error("[database] Failed writing a script filter [put_script_filter]");
+        return result_code::other;
+    }
+
+    auto header = kth_db_make_value(record.header.size(), const_cast<uint8_t*>(record.header.data()));
+    if (kth_db_put(db_txn, *dbi_script_filter_header_, &key, &header, 0) != KTH_DB_SUCCESS) {
+        spdlog::error("[database] Failed writing a script filter header [put_script_filter]");
+        return result_code::other;
+    }
+
+    return result_code::success;
+}
+
+template <typename Clock>
+result_code internal_database_basis<Clock>::delete_script_filter(hash_digest const& block_hash, KTH_DB_txn* db_txn) {
+    if ( ! dbi_script_filter_ || ! dbi_script_filter_header_) {
+        return result_code::other;
+    }
+
+    auto key = kth_db_make_value(block_hash.size(), const_cast<uint8_t*>(block_hash.data()));
+
+    // A block without a stored filter has nothing to remove, which is the
+    // state this was asked to reach.
+    for (auto const dbi : {*dbi_script_filter_, *dbi_script_filter_header_}) {
+        auto const res = kth_db_del(db_txn, dbi, &key, nullptr);
+        if (res != KTH_DB_SUCCESS && res != KTH_DB_NOTFOUND) {
+            spdlog::error("[database] Failed removing a script filter [delete_script_filter] {}",
+                int32_t(res));
+            return result_code::other;
+        }
+    }
+
+    return result_code::success;
+}
+
+template <typename Clock>
 result_code internal_database_basis<Clock>::publish_transition(transition_heights const& heights) {
     return publish_transition(heights, std::span<header_abla_record const>{});
 }
@@ -492,6 +653,15 @@ result_code internal_database_basis<Clock>::publish_transition(transition_height
 template <typename Clock>
 result_code internal_database_basis<Clock>::publish_transition(transition_heights const& heights,
                                                                std::span<header_abla_record const> abla_records) {
+    return publish_transition(heights, abla_records,
+        std::span<script_filter_record const>{}, std::nullopt);
+}
+
+template <typename Clock>
+result_code internal_database_basis<Clock>::publish_transition(transition_heights const& heights,
+                                                               std::span<header_abla_record const> abla_records,
+                                                               std::span<script_filter_record const> script_filters,
+                                                               std::optional<uint32_t> script_filter_height) {
     // write_heights treats two absent members as a no-op, and the clear below
     // would then run on its own — which is a transition declared finished
     // without publishing where it finished. That is the one thing this
@@ -521,6 +691,25 @@ result_code internal_database_basis<Clock>::publish_transition(transition_height
         if (updated != result_code::success) {
             kth_db_txn_abort(db_txn);
             return updated;
+        }
+    }
+
+    // The script filters of the connected blocks, in the transaction that
+    // declares those blocks connected, and the height they now reach.
+    for (auto const& record : script_filters) {
+        auto const stored = put_script_filter(record, db_txn);
+        if (stored != result_code::success) {
+            kth_db_txn_abort(db_txn);
+            return stored;
+        }
+    }
+
+    if (script_filter_height) {
+        auto const stored = set_property_height(property_code::script_filter_height,
+            *script_filter_height, db_txn);
+        if (stored != result_code::success) {
+            kth_db_txn_abort(db_txn);
+            return stored;
         }
     }
 
@@ -974,6 +1163,28 @@ bool internal_database_basis<Clock>::open_databases() {
         return false;
 #endif
     }
+
+    // The script filter tables are created with the others. A database written
+    // before they existed has none, which read-only is empty, not unreadable.
+    auto open_optional = [&](auto const& db_name, std::optional<KTH_DB_dbi>& dbi) {
+        dbi.reset();
+        KTH_DB_dbi opened;
+        auto const result = kth_db_dbi_open(db_txn, db_name, KTH_DB_CONDITIONAL_CREATE, &opened);
+        if (result == KTH_DB_SUCCESS) {
+            dbi = opened;
+            return true;
+        }
+#if defined(KTH_DB_READONLY)
+        if (result == KTH_DB_NOTFOUND) {
+            return true;
+        }
+#endif
+        kth_db_txn_abort(db_txn);
+        return false;
+    };
+
+    if ( ! open_optional(script_filter_db_name, dbi_script_filter_)) return false;
+    if ( ! open_optional(script_filter_header_db_name, dbi_script_filter_header_)) return false;
 
     auto commit_res = kth_db_txn_commit(db_txn);
     db_opened_ = commit_res == KTH_DB_SUCCESS;

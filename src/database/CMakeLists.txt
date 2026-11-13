@@ -168,6 +168,7 @@ set(kth_headers
   include/kth/database/databases/lmdb_helper.hpp
   include/kth/database/databases/result_code.hpp
   include/kth/database/databases/header_abla_entry.hpp
+  include/kth/database/databases/script_filter_record.hpp
   include/kth/database/databases/utxo_entry.hpp
   include/kth/database/databases/utxoz_database.hpp
   include/kth/database/databases/header_database.ipp

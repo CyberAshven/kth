@@ -22,6 +22,7 @@
 #include <kth/database/databases/header_abla_entry.hpp>
 #include <kth/database/databases/property_code.hpp>
 #include <kth/database/databases/result_code.hpp>
+#include <kth/database/databases/script_filter_record.hpp>
 #include <kth/database/databases/tools.hpp>
 #include <kth/database/define.hpp>
 #include <kth/database/utxo_transition_record.hpp>
@@ -141,9 +142,9 @@ inline std::atomic<bool> fail_publish_transition_before_commit{false};
 } // namespace testing
 
 
-constexpr size_t max_dbs_full_ = 4;        // KTH_DB_NEW_FULL
-constexpr size_t max_dbs_blocks_ = 4;      // KTH_DB_NEW_BLOCKS
-constexpr size_t max_dbs_pruned_ = 4;       // KTH_DB_NEW_PRUNED
+constexpr size_t max_dbs_full_ = 6;        // KTH_DB_NEW_FULL
+constexpr size_t max_dbs_blocks_ = 6;      // KTH_DB_NEW_BLOCKS
+constexpr size_t max_dbs_pruned_ = 6;       // KTH_DB_NEW_PRUNED
 
 constexpr size_t env_open_mode_ = 0664;
 constexpr int directory_exists = 0;
@@ -156,6 +157,8 @@ struct KD_API internal_database_basis {
     constexpr static char block_header_by_hash_db_name[] = "block_header_by_hash";
     constexpr static char db_properties_name[] = "properties";
     constexpr static char rejected_blocks_name[] = "rejected_blocks";
+    constexpr static char script_filter_db_name[] = "script_filter";
+    constexpr static char script_filter_header_db_name[] = "script_filter_header";
 
     /// Durable contextual rejection identities, independent of the active height table.
     [[nodiscard]] std::expected<std::vector<hash_digest>, result_code> rejected_blocks() const;
@@ -242,6 +245,26 @@ struct KD_API internal_database_basis {
     result_code publish_transition(transition_heights const& heights,
                                    std::span<header_abla_record const> abla_records);
 
+    /// The same, and in the same transaction the script filters of the blocks
+    /// the transition connected, in height order, with the height of the last
+    /// of them. A filter is then stored exactly when the height that says its
+    /// block is connected is: no restart can find one without the other.
+    /// `script_filter_height` is absent when the transition stores none.
+    [[nodiscard]]
+    result_code publish_transition(transition_heights const& heights,
+                                   std::span<header_abla_record const> abla_records,
+                                   std::span<script_filter_record const> script_filters,
+                                   std::optional<uint32_t> script_filter_height);
+
+    /// set_heights for a block that is being disconnected: in the same
+    /// transaction its script filter and filter header are removed, and the
+    /// script filter height steps down to the parent when it named this block.
+    /// The filters of the blocks below stay.
+    [[nodiscard]]
+    result_code set_heights(transition_heights const& heights,
+                            hash_digest const& disconnected_block,
+                            uint32_t disconnected_height);
+
     /// Put every committed transaction on stable storage.
     ///
     /// The environment is opened MDB_NOSYNC, so a commit returns before
@@ -293,6 +316,17 @@ struct KD_API internal_database_basis {
 
     // Height tracking via properties table
     std::expected<heights_t, result_code> get_last_heights() const;
+
+    /// The stored script filter of a block: the bytes served for it.
+    /// `key_not_found` when none is stored for the block.
+    std::expected<data_chunk, result_code> get_script_filter(hash_digest const& block_hash) const;
+
+    /// The stored script filter header of a block.
+    std::expected<hash_digest, result_code> get_script_filter_header(hash_digest const& block_hash) const;
+
+    /// The highest height whose script filter is stored, with those of every
+    /// block below it. `key_not_found` when none is stored.
+    std::expected<uint32_t, result_code> get_script_filter_height() const;
 
     /// What the persisted transition record says (#600). Outside the read-only
     /// guard on purpose: a build that only reads still has to refuse a database
@@ -348,6 +382,10 @@ private:
     /// Remove a property. Absence is the answer this stores, so deleting a key
     /// that is not there is success, not a failure to report.
     result_code clear_property(property_code prop, KTH_DB_txn* db_txn);
+
+    /// The two rows of a block's script filter, inside the caller's transaction.
+    result_code put_script_filter(script_filter_record const& record, KTH_DB_txn* db_txn);
+    result_code delete_script_filter(hash_digest const& block_hash, KTH_DB_txn* db_txn);
 #endif
 
     bool open_internal();
@@ -408,6 +446,11 @@ private:
     KTH_DB_dbi dbi_block_header_by_hash_;
     KTH_DB_dbi dbi_properties_;
     std::optional<KTH_DB_dbi> dbi_rejected_blocks_;
+
+    // Absent only in a database opened read-only that was written before the
+    // script filters existed, where they read as empty.
+    std::optional<KTH_DB_dbi> dbi_script_filter_;
+    std::optional<KTH_DB_dbi> dbi_script_filter_header_;
 };
 
 template <typename Clock>
@@ -418,6 +461,12 @@ constexpr char internal_database_basis<Clock>::block_header_by_hash_db_name[];  
 
 template <typename Clock>
 constexpr char internal_database_basis<Clock>::db_properties_name[];             //key: propery, value: data
+
+template <typename Clock>
+constexpr char internal_database_basis<Clock>::script_filter_db_name[];          //key: block hash, value: served script filter
+
+template <typename Clock>
+constexpr char internal_database_basis<Clock>::script_filter_header_db_name[];   //key: block hash, value: script filter header
 
 using internal_database = internal_database_basis<std::chrono::system_clock>;
 

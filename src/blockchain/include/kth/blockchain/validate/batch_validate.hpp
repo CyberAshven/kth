@@ -16,6 +16,7 @@
 #include <kth/domain/config/network.hpp>
 
 #include <kth/blockchain/define.hpp>
+#include <kth/database/databases/script_filter_record.hpp>
 
 namespace kth::blockchain {
 
@@ -137,6 +138,22 @@ parse_block_batch(std::span<data_chunk const> raw_blocks);
 // One input's SigChecks contribution to a validated batch, in emission order
 // (block by block, then transaction by transaction, then input by input — so a
 // transaction's inputs are contiguous and each block's inputs form a run).
+// The script filter of a block that validate_block_batch has accepted, as it is
+// stored. The filter lists the script of every output the block spends, and
+// those outputs are the ones validation left on each input
+// (`validation.cache`), so this is called while the validated block is still at
+// hand. `parent_filter_header` is the filter header of the parent block, or the
+// null hash for the genesis block, which spends nothing.
+[[nodiscard]] KB_API
+std::expected<database::script_filter_record, code>
+script_filter_record_for(domain::chain::block const& block, hash_digest const& parent_filter_header);
+
+// The same for the blocks of a batch, in order, the filter header of each
+// committing to that of the block before it.
+[[nodiscard]] KB_API
+std::expected<std::vector<database::script_filter_record>, code>
+script_filter_records_for(std::span<block_const_ptr const> blocks, hash_digest const& parent_filter_header);
+
 struct sigcheck_entry {
     size_t block_index;   // index into block_limits; MUST be < block_limits.size()
     size_t tx_index;      // per-batch transaction ordinal; groups a tx's inputs

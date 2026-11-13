@@ -44,6 +44,7 @@
 #include <kth/blockchain/utxo_builder.hpp>
 #include <kth/blockchain/validate/batch_validate.hpp>
 #include <kth/network/protocols_coro.hpp>
+#include <kth/node/full_node.hpp>
 #include <kth/node/sync/reorg.hpp>
 
 namespace kth::node::sync {
@@ -2123,6 +2124,79 @@ uint32_t utxo_batch_len(uint32_t available, uint32_t batch_size, bool stale) {
 // Incremental UTXO Build Task
 // =============================================================================
 
+namespace {
+
+// The script filters a batch stores, and the height the stored run reaches with
+// them. Both empty when the batch stores none.
+struct batch_script_filters {
+    std::vector<database::script_filter_record> records;
+    std::optional<uint32_t> height;
+};
+
+// The script filters of a batch the validator has accepted, the filter header
+// of each committing to the one below it.
+//
+// A filter header commits to the header of the parent block, so the stored
+// filters are one run from the genesis block up, and a batch extends it only
+// when the run reaches the block right below the batch. A node that connected
+// its history without validating it, below the trusted checkpoint, has no run
+// to extend: those blocks never had the outputs they spend at hand. Then
+// nothing is stored, and no filter is served.
+batch_script_filters script_filters_for_batch(blockchain::block_chain const& chain,
+                                              domain::config::network net,
+                                              std::vector<kth::block_const_ptr> const& blocks,
+                                              uint32_t batch_start) {
+    batch_script_filters out;
+    if (blocks.empty()) {
+        return out;
+    }
+
+    hash_digest parent_header = null_hash;
+    auto const stored = chain.script_filter_height();
+    if (stored) {
+        if (*stored + 1 != batch_start) {
+            return out;
+        }
+
+        auto const header = chain.script_filter_header(blocks.front()->header().previous_block_hash());
+        if ( ! header) {
+            spdlog::warn("[utxo_build] No script filter header for the block below {}; "
+                "the script filters stop there", batch_start);
+            return out;
+        }
+        parent_header = *header;
+    } else if (stored.error() != database::result_code::key_not_found || batch_start != 1) {
+        return out;
+    } else {
+        // Nothing is stored yet and the batch starts right above the genesis
+        // block, whose filter opens the run. It spends nothing, so its filter
+        // comes from the block alone.
+        auto genesis = blockchain::script_filter_record_for(
+            full_node::get_genesis_block(net), null_hash);
+        if ( ! genesis) {
+            return out;
+        }
+        parent_header = genesis->header;
+        out.records.push_back(std::move(*genesis));
+    }
+
+    auto built = blockchain::script_filter_records_for(blocks, parent_header);
+    if ( ! built) {
+        spdlog::warn("[utxo_build] Could not build the script filters of blocks {}-{}; "
+            "the script filters stop below them", batch_start,
+            batch_start + blocks.size() - 1);
+        out.records.clear();
+        return out;
+    }
+
+    out.records.insert(out.records.end(),
+        std::make_move_iterator(built->begin()), std::make_move_iterator(built->end()));
+    out.height = batch_start + uint32_t(blocks.size()) - 1;
+    return out;
+}
+
+} // namespace
+
 ::asio::awaitable<void> utxo_build_task(
     blockchain::block_chain& chain,
     std::atomic<uint32_t> const& contiguous_height,
@@ -2995,11 +3069,17 @@ uint32_t utxo_batch_len(uint32_t available, uint32_t batch_size, bool stale) {
         // record, so the marker cannot outrun the data it describes: either both
         // heights and the cleared record commit, or none of them do.
 #if defined(KTH_CURRENCY_BCH)
+        // The script filters of the blocks this batch validated, stored in the
+        // same transaction: a filter is there exactly when its block is
+        // connected.
+        auto const script_filters = chain_cfg.script_filters
+            ? script_filters_for_batch(chain, network, validated_blocks, batch_start)
+            : batch_script_filters{};
         auto const published = chain.publish_transition(
                 database::transition_heights{
                     .last_block_height = utxo_built_height,
                     .utxo_built_height = utxo_built_height},
-                abla_records);
+                abla_records, script_filters.records, script_filters.height);
 #else
         auto const published = chain.publish_transition(
                 database::transition_heights{
