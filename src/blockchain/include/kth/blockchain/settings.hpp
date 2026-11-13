@@ -110,6 +110,14 @@ struct KB_API settings {
     // in full. Whether blocks may be skipped is `trusted_checkpoint_height()`,
     // never `max_checkpoint_height`.
     bool full_validation = false;
+    // Builds and keeps a script filter (compact filter type 1) and its header
+    // for each block as the block is connected, for light wallets that match
+    // blocks by their own scripts. The filter of a block lists the scripts of
+    // the outputs it spends, which are at hand only while the block is
+    // validated, so it is built for the blocks above the trusted checkpoint.
+    // Turning it off leaves the filters already stored in place and builds no
+    // more.
+    bool script_filters = true;
     // How many fully validated blocks are connected per batch. Each batch ends
     // with the UTXO store's durability barrier, and every page the batch touched
     // is written then; larger batches touch each page once for more blocks and

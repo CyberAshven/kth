@@ -482,6 +482,7 @@ if (ENABLE_TEST AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
           test/select_sync.cpp
           test/configuration.cpp
           test/full_validation.cpp
+          test/script_filter_index.cpp
           test/in_place_directory.cpp
         test/full_node_network.cpp
           test/template_prevout_refresh.cpp

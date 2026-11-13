@@ -246,6 +246,8 @@ void add_settings(CLI::App& app, configuration& cfg) {
         "A hash:height checkpoint.");
     app.add_option("--chain.fix_checkpoints", cfg.chain.fix_checkpoints);
     app.add_option("--chain.full_validation", cfg.chain.full_validation);
+    app.add_option("--chain.script_filters", cfg.chain.script_filters,
+        "Build and keep a script filter for each block as it is connected (default true).");
     app.add_option("--chain.validation_batch_blocks", cfg.chain.validation_batch_blocks,
         "Fully validated blocks connected per batch, 1..1000 (default 500; about 1 GB of memory per 100).")
         ->check(CLI::Range(1u, 1000u));
