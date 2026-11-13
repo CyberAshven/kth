@@ -2984,6 +2984,123 @@ block_chain::fetch_block(hash_digest const& hash) const {
     co_return co_await read_stored_block(hash, size_t(header_index_.get_height(idx)), pos);
 }
 
+namespace {
+
+// The output an undo entry stands for.
+std::expected<domain::chain::output, result_code>
+read_undo_output(block_store const& store, spent_output const& entry) {
+#ifdef KTH_UTXOZ_REFERENCE_MODE
+    // The entry is {file_number(4 LE), tx_offset(4 LE)}: where the transaction
+    // that created the output starts in the block files. The index of the
+    // output is the last four bytes of the key.
+    if (entry.value.size() != 8) {
+        return std::unexpected(result_code::other);
+    }
+    uint32_t file_number = 0;
+    uint32_t offset = 0;
+    std::memcpy(&file_number, entry.value.data(), 4);
+    std::memcpy(&offset, entry.value.data() + 4, 4);
+
+    auto const raw = store.read_tx_raw(flat_file_pos{int32_t(file_number), offset});
+    if ( ! raw) {
+        return std::unexpected(raw.error());
+    }
+    auto tx = kth::from_data_chunk<domain::chain::transaction>(*raw, true);
+    if ( ! tx) {
+        return std::unexpected(result_code::other);
+    }
+    auto const index = utxoz_database::key_to_point(entry.key).index();
+    if (index >= tx->outputs().size()) {
+        return std::unexpected(result_code::other);
+    }
+    return tx->outputs()[index];
+#else
+    (void)store;
+    return output_of_stored_entry(entry.value);
+#endif
+}
+
+} // namespace
+
+awaitable_expected<script_filter_const_ptr>
+block_chain::fetch_script_filter(size_t height) const {
+    if (stopped() || ! block_store_) {
+        co_return kth::fail(error::service_stopped);
+    }
+    if (height > size_t(max_int32)) {
+        co_return kth::fail(error::not_found);
+    }
+
+    auto const idx = header_index_.active_at(int32_t(height));
+    if (idx == header_index::null_index) {
+        co_return kth::fail(error::not_found);
+    }
+    auto const hash = header_index_.get_hash(idx);
+    if (auto cached = script_filters_.find(hash)) {
+        co_return cached;
+    }
+
+    auto const pos = header_index_.get_block_pos(idx);
+    if (pos.is_null()) {
+        co_return kth::fail(error::not_found);
+    }
+
+    // Everything the index says about the block is read here, before the reads
+    // of the files run on the pool.
+    std::optional<flat_file_pos> undo_pos;
+    if (header_index_.has_undo_data(idx)) {
+        undo_pos = flat_file_pos{header_index_.get_file_number(idx), header_index_.get_undo_pos(idx)};
+    }
+    auto const prev_hash = header_index_.get_prev_block_hash(idx);
+
+    auto stored = co_await read_stored_block(hash, height, pos);
+    if ( ! stored) {
+        co_return std::unexpected(stored.error());
+    }
+
+    // The undo record is read and the filter is built on the pool as well: for
+    // a large block this is the costly part.
+    auto built = co_await ::asio::co_spawn(executor(),
+        [this, blk = stored->first, hash, prev_hash, undo_pos]() -> awaitable_expected<script_filter_const_ptr> {
+            block_undo undo;
+            // A block of one transaction spends nothing, so it needs no record.
+            if (blk->transactions().size() > 1) {
+                if ( ! undo_pos) {
+                    co_return kth::fail(error::not_found);
+                }
+                auto record = block_store_->read_undo(*undo_pos, hash, prev_hash);
+                if ( ! record) {
+                    spdlog::error("[blockchain] cannot read the undo record of block {} at {}",
+                        encode_hash(hash), undo_pos->to_string());
+                    co_return kth::fail(error::operation_failed);
+                }
+                undo = std::move(*record);
+            }
+
+            auto const spent = spent_outputs(*blk, undo, [this](spent_output const& entry) {
+                return read_undo_output(*block_store_, entry);
+            });
+            if ( ! spent) {
+                spdlog::error("[blockchain] the undo record of block {} does not give the outputs "
+                    "the block spends: {}", encode_hash(hash), result_code_name(spent.error()));
+                co_return kth::fail(error::operation_failed);
+            }
+
+            auto filter = domain::chain::build_script_filter(*blk, *spent);
+            if ( ! filter) {
+                spdlog::error("[blockchain] cannot build the script filter of block {}", encode_hash(hash));
+                co_return kth::fail(error::operation_failed);
+            }
+            co_return std::make_shared<domain::chain::script_filter const>(std::move(*filter));
+        },
+        ::asio::use_awaitable);
+
+    if (built) {
+        script_filters_.insert(hash, *built);
+    }
+    co_return built;
+}
+
 std::expected<domain::chain::block::list, database::result_code>
 block_chain::fetch_blocks(uint32_t from, uint32_t to) const {
     // LMDB block storage removed - blocks now in flat files

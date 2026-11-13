@@ -38,6 +38,7 @@
 #include <kth/blockchain/define.hpp>
 #include <kth/blockchain/header_index.hpp>
 #include <kth/blockchain/local_block_admission.hpp>
+#include <kth/blockchain/script_filter_source.hpp>
 #include <kth/blockchain/utxo_gate.hpp>
 #include <kth/blockchain/pools/block_organizer.hpp>
 #include <kth/blockchain/pools/branch.hpp>
@@ -984,6 +985,19 @@ struct KB_API block_chain {
     [[nodiscard]] awaitable_expected<std::pair<block_const_ptr, size_t>>
     fetch_block(hash_digest const& hash) const;
 
+    // The script filter of the block on the active chain at `height`, built
+    // from the stored block and its undo record, which holds the outputs the
+    // block spent. Nothing is stored for it: the filters built most recently
+    // are kept in memory, and any other is built again when asked for.
+    //
+    // not_found when the node cannot build it: it does not hold the block, or
+    // the block spends outputs and was connected without an undo record, as
+    // the blocks at or below the highest checkpoint are unless
+    // chain.full_validation is set. operation_failed when a stored record
+    // cannot be read or does not give the outputs the block spends.
+    [[nodiscard]] awaitable_expected<script_filter_const_ptr>
+    fetch_script_filter(size_t height) const;
+
     // Batch fetch: single LMDB transaction for multiple blocks (optimized for UTXO building)
     [[nodiscard]] std::expected<domain::chain::block::list, database::result_code>
     fetch_blocks(uint32_t from, uint32_t to) const;
@@ -1246,6 +1260,9 @@ private:
     // constructed with a reference to this store.
     mutable block_validation_store block_validations_;
     mutable transaction_validation_store transaction_validations_;
+
+    // The script filters built most recently. See fetch_script_filter.
+    mutable script_filter_cache script_filters_{script_filter_cache_bytes};
 
     blockchain::mempool mempool_;
     // The size limit's state. Read and written only under validation_mutex_,

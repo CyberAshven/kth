@@ -13,7 +13,12 @@
 
 #include <unistd.h>
 
+#include <asio/co_spawn.hpp>
+#include <asio/io_context.hpp>
+#include <asio/use_future.hpp>
+
 #include <kth/blockchain/validate/batch_validate.hpp>
+#include <kth/domain/chain/script_filter_builder.hpp>
 #include <kth/node.hpp>
 
 #include "sync_harness.hpp"
@@ -414,4 +419,116 @@ TEST_CASE("full mode checks header work version and time below a retained anchor
     REQUIRE(expected != error::success);
     CHECK(added.error == expected);
     CHECK(added.headers_added == 0);
+}
+
+// -----------------------------------------------------------------------------
+// Script filters: built when asked for, from the block and its undo record
+// -----------------------------------------------------------------------------
+//
+// The script filter of a block lists the scripts of the outputs the block
+// spends. The node keeps those already, in the undo record it writes when it
+// connects a block, so the filter is built from the two stored records and
+// nothing is stored for it.
+
+namespace {
+
+template <typename Awaitable>
+auto run_on_own_context(Awaitable&& operation) {
+    ::asio::io_context io;
+    auto result = ::asio::co_spawn(io, std::forward<Awaitable>(operation), ::asio::use_future);
+    io.run();
+    return result.get();
+}
+
+// Headers into the index, then the node's connect path over the bodies, on a
+// fixture the caller keeps to read the chain afterwards.
+void connect_on(chain_fixture& fixture, scenario const& sc) {
+    REQUIRE(fixture.created());
+    REQUIRE(fixture.start());
+    REQUIRE( ! fixture.organizer().add_headers(headers_of(sc.blocks)).error);
+    persist_headers(fixture, sc.blocks, 1);
+    run_connect_tasks(fixture, sc.blocks, 1);
+}
+
+// The filter the builder gives for the block at `h` and the outputs it spends.
+// The one spend of the chain is of the coinbase output of block 1.
+domain::chain::script_filter expected_filter(scenario const& sc, uint32_t h) {
+    std::vector<domain::chain::output> spent;
+    if (h == spend_height) {
+        spent.push_back(sc.blocks.front().transactions().front().outputs()[0]);
+    }
+    auto const& block = sc.blocks[h - 1];
+    auto filter = domain::chain::build_script_filter(block, spent);
+    REQUIRE(filter);
+    return std::move(*filter);
+}
+
+} // namespace
+
+TEST_CASE("the script filter of every connected block is built from the block and its undo record",
+          "[node][full_validation][script_filters]") {
+    auto const sc = build_scenario(/*tampered*/ false, 0);
+    node::parser parser(domain::config::network::regtest);
+    std::ostringstream error;
+    REQUIRE(parse_options(parser, {"--chain.full_validation=true", anchor_option(sc)}, error));
+
+    chain_fixture fixture("fv_filters_demand", parser.configured.chain);
+    connect_on(fixture, sc);
+    auto const& chain = fixture.chain();
+
+    // The spending block has the one record with an entry, and its filter has
+    // the script the spent output paid to.
+    for (uint32_t h = 1; h <= trunk_len; ++h) {
+        CAPTURE(h);
+        auto const built = run_on_own_context(chain.fetch_script_filter(size_t(h)));
+        REQUIRE(built);
+        REQUIRE(*built);
+        CHECK(**built == expected_filter(sc, h));
+
+        // Asked for again, it is the same object: it was not built twice.
+        auto const again = run_on_own_context(chain.fetch_script_filter(size_t(h)));
+        REQUIRE(again);
+        CHECK(again->get() == built->get());
+    }
+
+    // The builder refuses the spending block without the output it spends, so
+    // the filter above came from the record and not from the block alone.
+    auto const without = domain::chain::build_script_filter(sc.blocks[spend_height - 1], {});
+    CHECK( ! without);
+
+    auto const above = run_on_own_context(chain.fetch_script_filter(size_t(trunk_len) + 1));
+    REQUIRE( ! above);
+    CHECK(above.error() == error::not_found);
+}
+
+TEST_CASE("a block connected without an undo record has a script filter only when it spends nothing",
+          "[node][full_validation][optimized][script_filters]") {
+    auto const sc = build_scenario(/*tampered*/ false, 0);
+
+    chain_fixture fixture("fv_filters_demand_opt", optimized_settings(sc));
+    connect_on(fixture, sc);
+    auto const& chain = fixture.chain();
+
+    auto const undo = [&](uint32_t h) {
+        return chain.headers().has_undo_data(chain.headers().active_at(int32_t(h)));
+    };
+    REQUIRE( ! undo(spend_height));
+    REQUIRE( ! undo(spend_height - 1));
+    REQUIRE(undo(anchor_height + 1));
+
+    // Below the anchor the node wrote no record. The outputs the spending block
+    // spent are not kept anywhere, so its filter cannot be built.
+    auto const spending = run_on_own_context(chain.fetch_script_filter(size_t(spend_height)));
+    REQUIRE( ! spending);
+    CHECK(spending.error() == error::not_found);
+
+    // A block of one transaction spends nothing, and needs no record.
+    auto const below = run_on_own_context(chain.fetch_script_filter(size_t(spend_height) - 1));
+    REQUIRE(below);
+    CHECK(**below == expected_filter(sc, spend_height - 1));
+
+    // Above the anchor the block was validated and has its record.
+    auto const above = run_on_own_context(chain.fetch_script_filter(size_t(anchor_height) + 1));
+    REQUIRE(above);
+    CHECK(**above == expected_filter(sc, anchor_height + 1));
 }
