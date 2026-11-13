@@ -2355,7 +2355,7 @@ TEST_CASE("sv2 JD declares the tip again when the pool's payouts move under the 
     client_fixture fixture;
     auto const configuration = settings(fixture.pool, fixture.jds);
     provider_run provider(fixture, configuration, chain);
-    handshake_upstreams(fixture, true, nullptr, true);
+    handshake_upstreams(fixture, true, nullptr, false, true);
     miner_link miner(fixture, provider.port);
     auto const tip = chain->chain().chain_view();
     REQUIRE(tip);
