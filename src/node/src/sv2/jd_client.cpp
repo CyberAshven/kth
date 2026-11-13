@@ -685,6 +685,15 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
         return true;
     }
     if (result.deferred) {
+        // With another pool configured, an entry that keeps answering for
+        // another block is passed over like any failing entry once its wait
+        // has grown to the longest: the next entry can pay meanwhile, and this
+        // one is tried again after its retry delay. Alone, it is cheaper to
+        // keep the pair and wait.
+        if (value.payout_wait >= payout_retry_longest && upstreams_.size() > 1) {
+            fail(value, jd_failure::transient, "upstream stays on another block than this node");
+            return false;
+        }
         // The pair stays. Until the pool answers for this tip the downstream
         // work pays the solo address, as before the first declaration. It is
         // not a failure of the entry: the pool's node hears of a block after
