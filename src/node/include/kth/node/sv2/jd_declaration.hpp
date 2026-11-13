@@ -26,6 +26,14 @@ struct jd_declaration {
         data_chunk declaration;
         bool progress = false;
         bool accepted = false;
+        // The pool has no payout outputs for this template now: its own node
+        // is on another tip than this one. Nothing is in flight and nothing
+        // failed. The owner starts the declaration again after a wait.
+        bool deferred = false;
+        // The pool's payouts moved while nothing was in flight: the outputs of
+        // the installed job, or the answer this object waits for, rest on
+        // what the pool has left. The owner declares the template again.
+        bool outdated = false;
         std::string error;
     };
 
@@ -61,6 +69,7 @@ private:
     [[nodiscard]] result install(data_chunk token);
     [[nodiscard]] result send_allocation();
     [[nodiscard]] result retry_allocation();
+    [[nodiscard]] result defer();
     [[nodiscard]] result request_payout(data_chunk token, size_t reservation);
     [[nodiscard]] result declare_work(data_chunk token);
     [[nodiscard]] result note_stale(byte_span payload);
@@ -83,7 +92,6 @@ private:
     std::deque<uint32_t> retired_request_ids_;
     uint32_t notice_epoch_ = 0;
     uint32_t token_epoch_ = 0;
-    uint32_t unexplained_stale_ = 0;
     uint32_t restarts_ = 0;
     size_t reservation_ = 0;
     blockchain::mining_template template_{};

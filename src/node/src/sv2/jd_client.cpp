@@ -5,6 +5,7 @@
 #include <kth/node/sv2/jd_client.hpp>
 
 #include <algorithm>
+#include <string_view>
 #include <chrono>
 #include <deque>
 #include <exception>
@@ -105,6 +106,27 @@ constexpr size_t max_pending_solutions = 2;
 // of downstream opens, updates and closes reaches the pool as one latest sum.
 constexpr auto hash_rate_hold = std::chrono::seconds(1);
 
+// How long to leave a pool whose node is on another tip before asking it for
+// payout outputs again. A node is behind a new block for less than the first
+// wait. Each further wait on the same tip is twice the one before, up to the
+// longest: every request takes a token, and a pool keeps a token for minutes
+// and closes a connection that holds too many. At the longest wait a pool
+// that stays behind sees two requests a minute.
+constexpr auto payout_retry_delay = std::chrono::seconds(1);
+constexpr auto payout_retry_longest = std::chrono::seconds(30);
+
+// The least time between two declarations of one tip that follow the pool's
+// payouts. A pool whose payouts move every few seconds says so each time,
+// and every declaration takes a token the pool keeps for minutes.
+constexpr auto payout_refresh_spacing = std::chrono::seconds(4);
+
+// Shares in a row a pool may answer as stale on the job it accepted. The
+// pool drops a job once enough newer ones follow it, so one such answer is
+// the race with its job stream and the job is declared again. A pool that
+// answers every share that way is not counting them.
+constexpr uint32_t max_stale_share_run = 8;
+constexpr std::string_view error_stale_share = "stale-share";
+
 } // namespace
 
 struct jd_client::attempt {
@@ -142,6 +164,14 @@ struct jd_client::attempt {
     void wake_declarations() {
         declaration_changed = true;
         declaration_wake.cancel();
+    }
+
+    // Declare the current tip again, no sooner than the spacing allows.
+    // Several requests inside one spacing are one declaration.
+    void request_refresh() {
+        auto const now = std::chrono::steady_clock::now();
+        if ( ! refresh_at) refresh_at = std::max(now, last_declared + payout_refresh_spacing);
+        wake_declarations();
     }
 
     void wake_hash_rate() {
@@ -187,6 +217,18 @@ struct jd_client::attempt {
     bool hash_rate_held = false;
     std::optional<std::chrono::steady_clock::time_point> job_sent;
     std::optional<std::chrono::steady_clock::time_point> job_deadline;
+    // When to declare the current tip again after the pool had no payout
+    // outputs for it, how long the next such wait is, and whether the wait
+    // has been logged.
+    std::optional<std::chrono::steady_clock::time_point> payout_retry;
+    std::chrono::seconds payout_wait{1};
+    bool payout_waiting = false;
+    // When to declare the current tip again because the pool's payouts moved,
+    // when the last declaration started, and how many shares in a row the
+    // pool has answered as stale on the job it had accepted.
+    std::optional<std::chrono::steady_clock::time_point> refresh_at;
+    std::chrono::steady_clock::time_point last_declared{};
+    uint32_t stale_share_run = 0;
     std::vector<mining::pool_proof> cached;
     std::deque<submitted_share> submitted;
     // sequence and declared_work::generation of each share this attempt sent.
@@ -634,6 +676,33 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
         return false;
     }
     auto const now = std::chrono::steady_clock::now();
+    if (result.outdated) {
+        // While the pool's node is on another tip its notices say nothing
+        // about that tip, and the wait already set decides when to ask.
+        // Otherwise the installed job stays in use until the next one is
+        // accepted.
+        if ( ! value.payout_retry) value.request_refresh();
+        return true;
+    }
+    if (result.deferred) {
+        // The pair stays. Until the pool answers for this tip the downstream
+        // work pays the solo address, as before the first declaration. It is
+        // not a failure of the entry: the pool's node hears of a block after
+        // this one as often as before it.
+        if ( ! value.payout_waiting) {
+            value.payout_waiting = true;
+            spdlog::info("[sv2 jd] Entry {} has no payout outputs for this node's tip yet; asking again",
+                value.index + 1);
+        }
+        value.job_sent.reset();
+        value.job_deadline.reset();
+        value.payout_retry = now + value.payout_wait;
+        value.payout_wait = std::min(value.payout_wait * 2, std::chrono::seconds(payout_retry_longest));
+        retire_cached(value);
+        if (active_.get() == &value) publish_solo(value);
+        value.wake_declarations();
+        return true;
+    }
     if (result.progress) {
         if (value.job_sent && now - *value.job_sent
             > std::chrono::milliseconds(settings_.jd.max_latency_milliseconds)) {
@@ -656,6 +725,9 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
     }
     if (active_.get() == &value && value.jobs.work()) publish_pool(value);
     if (result.accepted) {
+        value.payout_waiting = false;
+        value.payout_wait = payout_retry_delay;
+        value.stale_share_run = 0;
         if ( ! value.healthy) {
             value.healthy = true;
             policy_.healthy(value.index, now);
@@ -698,7 +770,18 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
         }
         if (chain_ && value.ready && ! value.jobs.pending()) {
             auto const view = chain_->chain_view();
-            if (view && previous != view->tip_hash && value.mining_session.channel()) {
+            // The pool had no payout outputs for this tip a moment ago, or its
+            // payouts moved under the job installed for it. The tip is the
+            // same, so nothing else would declare it again.
+            auto const retrying = value.payout_retry && now >= *value.payout_retry;
+            auto const refreshing = value.refresh_at && now >= *value.refresh_at;
+            if (view && (previous != view->tip_hash || retrying || refreshing)
+                && value.mining_session.channel()) {
+                value.payout_retry.reset();
+                value.refresh_at.reset();
+                // Another tip is another race: the pool's node is behind it
+                // for a moment at most, unless it is behind for good.
+                if (previous != view->tip_hash) value.payout_wait = payout_retry_delay;
                 // Allocation outputs fit B0_64K. Reserve their maximum size
                 // before selecting transactions; the builder checks the exact
                 // completed coinbase against the returned block limit.
@@ -717,7 +800,12 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
                     // token exists. A cached share or early block from that
                     // coinbase must not be flushed under the next job.
                     retire_cached(value);
+                    value.last_declared = std::chrono::steady_clock::now();
                     if ( ! dispatch(value, value.jobs.start(std::move(*tmpl), *value.mining_session.channel()))) co_return;
+                } else if ((retrying || refreshing) && ! value.jobs.pending()) {
+                    // No template to declare this time. Keep the wait, or the
+                    // same tip is never declared.
+                    value.payout_retry = std::chrono::steady_clock::now() + value.payout_wait;
                 }
             }
         }
@@ -728,6 +816,8 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
         if ( ! value.submitted.empty()) {
             wake_at = std::min(wake_at, value.submitted.front().sent + response_timeout_);
         }
+        if (value.payout_retry) wake_at = std::min(wake_at, *value.payout_retry);
+        if (value.refresh_at) wake_at = std::min(wake_at, *value.refresh_at);
         value.declaration_wake.expires_at(wake_at);
         (void)co_await value.declaration_wake.async_wait(::asio::as_tuple(::asio::use_awaitable));
     }
@@ -804,6 +894,7 @@ bool jd_client::share_response(attempt& value, message_header const& header, byt
             }
             value.submitted.pop_front();
         }
+        value.stale_share_run = 0;
         value.wake_declarations();
         return true;
     }
@@ -855,6 +946,25 @@ bool jd_client::share_response(attempt& value, message_header const& header, byt
     // answer the share as an old job. That is the stale race below, not a
     // refusal of current work.
     if ( ! block && ( ! view || view->tip_hash == previous)) {
+        // The pool no longer holds the job it accepted: enough newer jobs of
+        // its own have followed on this channel. The share is lost, counts as
+        // stale for the entry's health, and the template is declared again.
+        // Any other code, and this one share after share with none counted
+        // in between, is a pool that does not count valid work.
+        if (message->error_code == error_stale_share
+            && value.stale_share_run < max_stale_share_run) {
+            ++value.stale_share_run;
+            spdlog::info("[sv2 jd] Pool no longer holds job {}; declaring the template again",
+                work->upstream_job_id);
+            auto const latency = std::chrono::duration_cast<std::chrono::milliseconds>(now - sent);
+            if (auto const reason = value.health.sample(true, true, latency)) {
+                fail(value, jd_failure::transient, *reason);
+                return false;
+            }
+            consume();
+            value.request_refresh();
+            return true;
+        }
         fail(value, jd_failure::dishonest,
             "pool refused a valid share on an accepted job (" + code + ")");
         return false;
