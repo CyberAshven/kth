@@ -1893,7 +1893,8 @@ TEST_CASE("sv2 JD stale payout answers keep both upstreams and the pool is asked
 
     // The pool's node is on another tip than this one: every request for this
     // tip is answered stale, with no notice. Twice here, which used to end the
-    // session.
+    // session. The second wait is twice the first: every request takes one of
+    // the pool's tokens.
     auto const reserved = output_bytes(paid_split(false));
     uint32_t previous_id = 0;
     for (int round = 0; round < 2; ++round) {
@@ -1916,7 +1917,7 @@ TEST_CASE("sv2 JD stale payout answers keep both upstreams and the pool is asked
         };
         CHECK_FALSE(fixture.wait_until(arrived, 400ms));
         REQUIRE(fixture.wait_until(arrived));
-        CHECK(std::chrono::steady_clock::now() - asked >= 800ms);
+        CHECK(std::chrono::steady_clock::now() - asked >= (round == 0 ? 800ms : 1800ms));
     }
 
     // The pool's node reaches the tip, and the same session declares on it:

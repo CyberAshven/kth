@@ -96,8 +96,13 @@ constexpr size_t max_pending_solutions = 2;
 constexpr auto hash_rate_hold = std::chrono::seconds(1);
 
 // How long to leave a pool whose node is on another tip before asking it for
-// payout outputs again. A node is behind a new block for less than this.
+// payout outputs again. A node is behind a new block for less than the first
+// wait. Each further wait on the same tip is twice the one before, up to the
+// longest: every request takes a token, and a pool keeps a token for minutes
+// and closes a connection that holds too many. At the longest wait a pool
+// that stays behind sees two requests a minute.
 constexpr auto payout_retry_delay = std::chrono::seconds(1);
+constexpr auto payout_retry_longest = std::chrono::seconds(30);
 
 } // namespace
 
@@ -390,7 +395,8 @@ bool jd_client::dispatch(jd_declaration::result result) {
             spdlog::info("[sv2 jd] Pool has no payout outputs for this node's tip yet; asking again");
         }
         job_deadline_.reset();
-        payout_retry_ = std::chrono::steady_clock::now() + payout_retry_delay;
+        payout_retry_ = std::chrono::steady_clock::now() + payout_wait_;
+        payout_wait_ = std::min(payout_wait_ * 2, std::chrono::seconds(payout_retry_longest));
         retire_cached();
         publish_solo();
         wake_declarations();
@@ -412,6 +418,7 @@ bool jd_client::dispatch(jd_declaration::result result) {
     if (jobs_.work()) publish_pool();
     if (result.accepted) {
         payout_waiting_ = false;
+        payout_wait_ = payout_retry_delay;
         spdlog::info("[sv2 jd] Pool accepted local template as job {}",
             jobs_.work()->upstream_job_id);
         flush_cached();
@@ -453,6 +460,9 @@ bool jd_client::dispatch(jd_declaration::result result) {
                 && std::chrono::steady_clock::now() >= *payout_retry_;
             if (view && (previous != view->tip_hash || retrying) && mining_session_.channel()) {
                 payout_retry_.reset();
+                // Another tip is another race: the pool's node is behind it
+                // for a moment at most, unless it is behind for good.
+                if (previous != view->tip_hash) payout_wait_ = payout_retry_delay;
                 // Allocation outputs fit B0_64K. Reserve their maximum size
                 // before selecting transactions; the builder checks the exact
                 // completed coinbase against the returned block limit.
@@ -473,7 +483,7 @@ bool jd_client::dispatch(jd_declaration::result result) {
                 } else if (retrying && ! jobs_.pending()) {
                     // No template to declare this time. Keep the wait, or the
                     // same tip is never declared.
-                    payout_retry_ = std::chrono::steady_clock::now() + payout_retry_delay;
+                    payout_retry_ = std::chrono::steady_clock::now() + payout_wait_;
                 }
             }
         }
