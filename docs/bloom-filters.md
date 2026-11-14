@@ -13,7 +13,7 @@ It is off by default. When on, the node sets the bloom filter service bit
 
 A bloom filter tells the node roughly what the wallet watches: the wallet
 chooses how many false positives to hide among. A wallet that wants the node to
-learn nothing uses [compact block filters](compact-filters.md) instead.
+learn nothing uses compact block filters instead.
 
 ## The peer's filter
 
