@@ -60,7 +60,7 @@ hash_digest previous_second() {
 }
 
 auto const key_hash = "2222222222222222222222222222222222222222";
-auto const public_key = "03bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+auto const public_key = "03bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 auto const input_key = "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 bloom_filter with(std::string const& element, uint8_t flags) {
