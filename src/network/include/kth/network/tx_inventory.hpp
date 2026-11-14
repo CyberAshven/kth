@@ -101,29 +101,32 @@ public:
     [[nodiscard]]
     std::optional<uint64_t> mempool_answered() const { return mempool_answered_; }
 
-    /// The filter the peer loaded with `filterload` (BIP37), replacing any
-    /// before it. From then on it is announced transactions, whatever its
-    /// version message asked for (BCHN fRelayTxes).
+    /// The peer's bloom filter (BIP37). Every peer has one from the start, as
+    /// on BCHN: a filter of no bytes, which holds everything, until the peer
+    /// loads its own. It is the peer's: a match adds to it.
+    [[nodiscard]]
+    domain::chain::bloom_filter& filter() { return filter_; }
+
+    /// `filterload`: the peer's filter, replacing the one before it. From
+    /// then on it is announced transactions, whatever its version message
+    /// asked for (BCHN fRelayTxes).
     void load_filter(domain::chain::bloom_filter filter) {
         filter_ = std::move(filter);
         relay_requested_ = true;
     }
 
-    /// `filterclear`: no filter, and every transaction is announced.
+    /// `filterclear`: the filter that holds everything again, and
+    /// announcements on.
     void clear_filter() {
-        filter_.reset();
+        filter_ = domain::chain::bloom_filter{};
         relay_requested_ = true;
     }
 
-    /// The loaded filter, or null. It is the peer's: a match adds to it.
-    [[nodiscard]]
-    domain::chain::bloom_filter* filter() { return filter_ ? &*filter_ : nullptr; }
-
-    /// Whether the peer wants this transaction: every one without a filter,
-    /// and with one those it matches, each match adding to the filter.
+    /// Whether the peer wants this transaction: those its filter matches,
+    /// each match adding to the filter.
     [[nodiscard]]
     bool wants(domain::chain::transaction const& tx) {
-        return ! filter_ || filter_->is_relevant_and_update(tx);
+        return filter_.bits().empty() || filter_.is_relevant_and_update(tx);
     }
 
     /// Whether a filter message asked for announcements since the session began.
@@ -135,7 +138,7 @@ private:
     rolling_bloom_filter announced_;
     uint64_t fee_filter_{0};
     std::optional<uint64_t> mempool_answered_;
-    std::optional<domain::chain::bloom_filter> filter_;
+    domain::chain::bloom_filter filter_;
     bool relay_requested_{false};
 };
 

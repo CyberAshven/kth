@@ -33,11 +33,11 @@ filter_change apply_filter_message(network::tx_inventory& inventory, std::string
         if ( ! parsed) {
             return parsed.error() == error::invalid_filter_add ? filter_change::refused : filter_change::none;
         }
-        auto* const filter = inventory.filter();
-        if (filter == nullptr || parsed->data().size() > domain::chain::bloom_filter::max_element_size) {
+        if (parsed->data().size() > domain::chain::bloom_filter::max_element_size) {
             return filter_change::refused;
         }
-        filter->insert(parsed->data());
+        // Into the filter of no bytes this adds nothing: it holds everything.
+        inventory.filter().insert(parsed->data());
         return filter_change::added;
     }
     if (command == domain::message::filter_clear::command) {

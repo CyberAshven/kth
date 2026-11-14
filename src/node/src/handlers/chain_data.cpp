@@ -152,17 +152,15 @@ bool block_request_allowed(blockchain::header_index const& index, hash_digest co
         }
         if (item.type() == type_id::filtered_block) {
             // BIP37: the proof that the transactions matching the peer's
-            // filter are in the block, then those transactions. Without a
-            // filter loaded there is no answer at all (BCHN).
-            if (peer.tx_inventory().filter() == nullptr) {
-                continue;
-            }
+            // filter are in the block, then those transactions. A peer that
+            // loaded no filter has the one that holds everything, and gets
+            // every transaction of the block (BCHN).
             if (view && block_request_allowed(chain.headers(), view->tip_hash, item.hash())) {
                 auto const block = co_await chain.fetch_block(item.hash());
-                // Read again: the peer may have replaced its filter meanwhile.
-                auto* const filter = peer.tx_inventory().filter();
-                if (block && filter != nullptr) {
-                    auto const answer = detail::filter_block(*block->first, *filter);
+                if (block) {
+                    // The filter as it is now: the peer may have replaced it
+                    // while the block was read.
+                    auto const answer = detail::filter_block(*block->first, peer.tx_inventory().filter());
                     if (co_await peer.send_data(answer.proof)) {
                         co_return message_result::handled;
                     }

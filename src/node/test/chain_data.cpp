@@ -333,11 +333,24 @@ TEST_CASE("getdata for a filtered block sends the proof and the matched transact
         {type_id::filtered_block, unknown_hash()}});
     REQUIRE(request);
 
-    SECTION("with no filter loaded there is no answer at all") {
+    SECTION("with no filter loaded: every transaction of each block held, as BCHN answers") {
         loopback_peer peer;
         CHECK(serve(peer, node::handlers::chain_data::handle_get_data(c.fixture.chain(), *peer.session, *request)) ==
             node::message_result::handled);
-        CHECK(peer.received(std::chrono::milliseconds(300)).empty());
+        auto const sent = peer.received();
+        // A proof and the one transaction for each of the two blocks, then
+        // what is not served.
+        REQUIRE(sent.size() == 5);
+        CHECK(sent[0].command == domain::message::merkle_block::command);
+        CHECK(sent[1].command == domain::message::transaction::command);
+        CHECK(sent[2].command == domain::message::merkle_block::command);
+        CHECK(sent[3].command == domain::message::transaction::command);
+        CHECK(sent[4].command == domain::message::not_found::command);
+        byte_reader reader(sent[0].payload);
+        auto const first = domain::message::merkle_block::from_data(reader, peer.session->negotiated_version());
+        REQUIRE(first);
+        CHECK(first->hashes() == hash_list{coinbase});
+        CHECK(first->flags() == data_chunk{0x01});
     }
     SECTION("with a filter: a merkleblock for each block held, and what it matched") {
         loopback_peer peer;

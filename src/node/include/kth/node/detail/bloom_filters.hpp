@@ -31,8 +31,8 @@ enum class filter_change {
     added,
     cleared,
     /// It broke a limit, which a wallet never does: a filter over 36,000
-    /// bytes or 50 hash functions, an element over 520 bytes, or an element
-    /// for a filter that was never loaded. The peer is scored for it (BCHN).
+    /// bytes or 50 hash functions, or an element over 520 bytes. The peer is
+    /// scored for it (BCHN).
     refused
 };
 

@@ -1067,9 +1067,13 @@ bool p2p_node::observe_transaction_message(peer_session::ptr const& peer, raw_me
         if ((settings_.services & service::node_bloom) == 0) {
             // Not offered: the service bit says so, and a peer that loads or
             // extends a filter anyway is disconnected, and scored when it is
-            // new enough to read that bit. A `filterclear` asks for nothing.
-            if (command == domain::message::filter_clear::command
-                || peer->has_permission(network::permission_flags::noban)) {
+            // new enough to read that bit. A `filterclear` still turns the
+            // peer's announcements on (BCHN).
+            if (command == domain::message::filter_clear::command) {
+                peer->tx_inventory().clear_filter();
+                return true;
+            }
+            if (peer->has_permission(network::permission_flags::noban)) {
                 return true;
             }
             spdlog::debug("[p2p_node] {} from [{}] with bloom filters not offered; disconnecting",
