@@ -51,6 +51,8 @@ struct jd_notice {
 
 // Own each Mining/JDS pair together. Only the active pair publishes payouts;
 // one higher-priority pair may recover without disturbing downstream work.
+// A JDS that leaves RequestExtensions unanswered is replaced once within its
+// pair, without closing that pair's pool connection.
 struct jd_client {
     // settings have passed validate_jd_settings and solo payout validation.
     // route is how every upstream connection leaves the node.
@@ -95,8 +97,15 @@ private:
     struct attempt;
     ::asio::awaitable<void> run_owned();
     ::asio::awaitable<void> run_attempt(std::shared_ptr<attempt> value);
+    // negotiation_timeout is set only when this JDS socket was closed because
+    // RequestExtensions went unanswered. The caller then opens one replacement.
+    // A null pointer means a later deadline is terminal, so the replacement
+    // itself cannot open a third connection.
     ::asio::awaitable<void> serve(attempt& value, jd_connection& connection,
-        jd_session& session, jd_peer peer);
+        jd_session& session, jd_peer peer, bool* negotiation_timeout = nullptr);
+    // The pair's JDS: the first connection negotiates Requested Payout Outputs,
+    // and its silence opens the one replacement that does not.
+    ::asio::awaitable<void> serve_declaration(attempt& value);
     ::asio::awaitable<void> declare_templates(attempt& value);
     // The only sender of this pair's UpdateChannel. Ends once the pair stops.
     ::asio::awaitable<void> report_hash_rate(attempt& value);
@@ -112,6 +121,9 @@ private:
     // Always false: the attempt ends, and the entry starts again at the new
     // address now or, before the pair was healthy, after its retry hold.
     bool follow_reconnect(attempt& value, jd_peer peer, byte_span payload);
+    // The pool left RequestExtensions unanswered. The entry starts again at
+    // once with a pair that does not ask (extension 0x0001, section 4).
+    void restart_without_extensions(attempt& value);
     void publish_pool(attempt& value);
     void publish_solo(attempt const& value);
     void note_share(attempt& value, mining::pool_proof const& proof);
@@ -138,6 +150,9 @@ private:
         std::optional<jd_endpoint> declaration;
     };
     std::vector<redirect> redirects_;
+    // Entries whose last pair got no RequestExtensions answer. Their next pair
+    // opens its channel without asking; starting it clears the mark.
+    std::vector<bool> unanswered_;
     std::shared_ptr<attempt> active_;
     std::shared_ptr<attempt> probe_;
     blockchain::block_chain* const chain_;

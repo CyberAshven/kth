@@ -20,6 +20,7 @@
 #include <kth/node/mining/block_submit.hpp>
 #include <kth/node/mining/work.hpp>
 #include <kth/node/sv2/connection.hpp>
+#include <kth/node/sv2/extensions.hpp>
 #include <kth/node/sv2/mining_messages.hpp>
 #include <kth/node/sv2/mining_session.hpp>
 
@@ -95,11 +96,8 @@ sv2::mining_session::result mining_process(sv2::mining_session& session,
 
 template <typename Message>
 sv2::mining_session::result mining_process(sv2::mining_session& session, Message const& message) {
-    uint16_t extension = 0;
-    if constexpr (requires { Message::channel_message; }) {
-        if (Message::channel_message) extension = sv2::message_header::channel_msg_flag;
-    }
-    return mining_process(session, extension, Message::message_type, to_data_chunk(message));
+    return mining_process(session, sv2::framed_extension_type<Message>(), Message::message_type,
+        to_data_chunk(message));
 }
 
 sv2::mining_session mining_ready(std::shared_ptr<uint64_t> allocations) {
@@ -126,6 +124,26 @@ Message first_message(data_chunk const& bytes) {
     REQUIRE(message);
     REQUIRE(message_source.is_exhausted());
     return *message;
+}
+
+// The first frame of this type among several.
+template <typename Message>
+Message find_message(data_chunk const& bytes) {
+    byte_reader source(bytes);
+    while ( ! source.is_exhausted()) {
+        auto const header = sv2::message_header::from_data(source);
+        REQUIRE(header);
+        auto const payload = source.read_bytes(header->msg_length);
+        REQUIRE(payload);
+        if (header->msg_type != Message::message_type) continue;
+        byte_reader message_source(*payload);
+        auto const message = Message::from_data(message_source);
+        REQUIRE(message);
+        REQUIRE(message_source.is_exhausted());
+        return *message;
+    }
+    FAIL("no frame of type " << static_cast<unsigned>(Message::message_type));
+    return {};
 }
 
 } // namespace
@@ -449,6 +467,109 @@ TEST_CASE("sv2 JD pool work nests in the upstream extranonce and solo work resto
     REQUIRE_FALSE(engine.submit(restored_share).pool);
 }
 
+TEST_CASE("sv2 JD payout work accepts more than 65535 transactions", "[sv2 jd]") {
+    // Coinbase-only sends the merkle path, and full-template pages a longer
+    // list with BCH large templates, so payout work has no count limit.
+    auto tmpl = mining_template();
+    constexpr uint32_t tx_count = 65536;
+    tmpl.selection.txs.reserve(tx_count);
+    for (uint32_t i = 0; i < tx_count; ++i) {
+        tmpl.selection.txs.push_back(std::make_shared<domain::message::transaction>(
+            domain::chain::transaction{1, i, {}, {}}));
+    }
+    domain::chain::output::list const split{
+        {1, domain::chain::script(data_chunk{0x51}, false), std::nullopt},
+        {tmpl.coinbase_value - 1, domain::chain::script(data_chunk{0x52}, false), std::nullopt}};
+    auto const script_prefix = payout_coinbase_prefix(tmpl.height, 7, 0, 24);
+    REQUIRE(script_prefix);
+    auto const work = make_payout_work(tmpl, split, 7, {}, 24, *script_prefix, 2, 0xfffffffeu, 99);
+    REQUIRE(work.has_value());
+    REQUIRE(work->merkle_path.size() == 17);
+}
+
+TEST_CASE("sv2 JD payout work keeps a split coinbase and the committed script", "[sv2 jd]") {
+    auto const tmpl = mining_template();
+    domain::chain::output::list const split{
+        {1, domain::chain::script(data_chunk{0x51}, false), std::nullopt},
+        {tmpl.coinbase_value - 1, domain::chain::script(data_chunk{0x52}, false), std::nullopt}};
+    data_chunk const pool_prefix(8, 0x12);
+    REQUIRE_FALSE(make_declared_work(tmpl, split, 7, pool_prefix, 24));
+    auto const script_prefix = payout_coinbase_prefix(tmpl.height, 7, pool_prefix.size(), 24);
+    REQUIRE(script_prefix);
+    auto const declared = make_payout_work(tmpl, split, 7, pool_prefix, 24, *script_prefix,
+        2, 0xfffffffeu, 99);
+    REQUIRE(declared);
+    REQUIRE(declared->fixed_script);
+    REQUIRE(declared->coinbase_prefix == *script_prefix);
+    REQUIRE(declared->coinbase_version == 2);
+    REQUIRE(declared->coinbase_input_sequence == 0xfffffffeu);
+    REQUIRE(declared->coinbase_locktime == 99);
+    REQUIRE(declared->outputs == split);
+    REQUIRE(declared->outputs.front().value() != tmpl.coinbase_value);
+
+    hash_digest const target = [] {
+        hash_digest value;
+        value.fill(0xff);
+        return value;
+    }();
+    open_request request;
+    request.request_id = 1;
+    request.kind = channel_kind::extended;
+    request.max_target = target;
+    request.min_extranonce_size = 12;
+    work_engine engine(0x0102030405060708ull);
+    auto const opened = engine.open(request);
+    REQUIRE(opened.status == open_status::opened);
+    short_hash solo_hash{};
+    solo_hash.fill(0x43);
+    domain::chain::output::list const solo{{tmpl.coinbase_value,
+        domain::chain::script(domain::chain::script::to_pay_public_key_hash_pattern(solo_hash)),
+        std::nullopt}};
+    pool_binding plain{pool_prefix, 24, 7};
+    REQUIRE_FALSE(engine.on_pool_template(tmpl, split, solo, plain));
+    plain.fixed_script = true;
+    plain.script_prefix = *script_prefix;
+    plain.coinbase_version = 2;
+    plain.coinbase_input_sequence = 0xfffffffeu;
+    plain.coinbase_locktime = 99;
+    auto const jobs = engine.on_pool_template(tmpl, split, solo, plain);
+    REQUIRE(jobs);
+    REQUIRE(jobs->size() == 1);
+    auto const& nested = jobs->front();
+    REQUIRE(nested.channel_id == opened.channel_id);
+    REQUIRE(nested.coinbase_tx_prefix == declared->coinbase_tx_prefix);
+    REQUIRE(nested.coinbase_tx_suffix == declared->coinbase_tx_suffix);
+    REQUIRE(nested.extranonce_prefix_update);
+    auto raw = nested.coinbase_tx_prefix;
+    raw.insert(raw.end(), nested.extranonce_prefix_update->begin(),
+        nested.extranonce_prefix_update->end());
+    raw.insert(raw.end(), opened.extranonce_size, uint8_t{0});
+    raw.insert(raw.end(), nested.coinbase_tx_suffix.begin(), nested.coinbase_tx_suffix.end());
+    byte_reader source(raw);
+    auto const tx = domain::chain::transaction::from_data(source, true);
+    REQUIRE(tx);
+    REQUIRE(source.is_exhausted());
+    REQUIRE(tx->version() == 2);
+    REQUIRE(tx->locktime() == 99);
+    REQUIRE(tx->inputs().size() == 1);
+    REQUIRE(tx->inputs().front().sequence() == 0xfffffffeu);
+    REQUIRE(tx->outputs() == split);
+    auto const& script = tx->inputs().front().script().bytes();
+    REQUIRE(script.size() >= script_prefix->size());
+    REQUIRE(std::equal(script_prefix->begin(), script_prefix->end(), script.begin()));
+
+    share_request share;
+    share.extended = true;
+    share.channel_id = nested.channel_id;
+    share.job_id = nested.job_id;
+    share.ntime = nested.ntime_start;
+    share.version = nested.version;
+    share.extranonce.assign(opened.extranonce_size, 0x44);
+    auto const proof = engine.submit(share);
+    REQUIRE(proof.status != share_status::rejected);
+    REQUIRE(proof.pool);
+}
+
 TEST_CASE("sv2 JD downstream reserve fits an eight-byte pool grant", "[sv2 jd]") {
     // Four pool-prefix bytes plus an eight-byte grant, as P2Pool sends, leave
     // four bytes of shared allocation and four bytes for the miner to roll.
@@ -711,4 +832,64 @@ TEST_CASE("sv2 JD mining session serves the four-byte downstream reserve", "[sv2
     auto const error = first_message<sv2::open_mining_channel_error>(refused.response);
     REQUIRE(error.request_id == request.request_id);
     REQUIRE(error.error_code == error_extranonce_too_large);
+}
+
+TEST_CASE("sv2 JD pool shares name the worker from its TLV or from its channel", "[sv2 jd]") {
+    // A downstream proxy that negotiated 0x0002 names each share's worker.
+    // Otherwise the pool proof carries the channel's user_identity, which is
+    // what the JD client tags upstream shares with.
+    for (bool const tracking : {false, true}) {
+        CAPTURE(tracking);
+        auto const counter = std::make_shared<uint64_t>(0);
+        auto session = mining_ready(counter);
+        if (tracking) {
+            auto const granted = mining_process(session,
+                sv2::request_extensions{1, {sv2::worker_hashrate_tracking_extension}});
+            REQUIRE(first_message<sv2::request_extensions_success>(granted.response).request_id == 1);
+        }
+        auto const tmpl = mining_template();
+        auto const declared = make_declared_work(tmpl, outputs(tmpl.coinbase_value), 7,
+            data_chunk(8, 0x12), 8);
+        REQUIRE(declared);
+        REQUIRE_FALSE(session.apply_pool(*declared).close);
+
+        sv2::open_extended_mining_channel request;
+        request.request_id = 1;
+        request.user_identity = "proxy";
+        request.max_target = maximum_target();
+        auto const opened = mining_process(session, request);
+        REQUIRE_FALSE(opened.close);
+        auto const success = first_message<sv2::open_extended_mining_channel_success>(opened.response);
+        auto const job = find_message<sv2::new_extended_mining_job>(opened.response);
+        auto const prev = find_message<sv2::mining_set_new_prev_hash>(opened.response);
+        sv2::submit_shares_extended const share{success.channel_id, 1, job.job_id, 0,
+            prev.ntime_start, job.version, data_chunk(success.extranonce_size, 0x44)};
+        auto payload = to_data_chunk(share);
+        if (tracking) {
+            auto const field = to_data_chunk(sv2::user_identity_tlv("rig-7"));
+            payload.insert(payload.end(), field.begin(), field.end());
+        }
+        auto const named = mining_process(session, sv2::message_header::channel_msg_flag,
+            sv2::submit_shares_extended::message_type, payload);
+        REQUIRE_FALSE(named.close);
+        REQUIRE(named.pool);
+        REQUIRE(named.pool->worker == (tracking ? "rig-7" : "proxy"));
+
+        // A share without the field, and a standard channel, use the channel's name.
+        auto unnamed = share;
+        unnamed.sequence_number = 2;
+        unnamed.nonce = 1;
+        auto const plain = mining_process(session, unnamed);
+        REQUIRE(plain.pool);
+        REQUIRE(plain.pool->worker == "proxy");
+        auto const standard_open = mining_process(session,
+            sv2::open_standard_mining_channel{2, "worker", 0.f, maximum_target()});
+        auto const standard = first_message<sv2::open_standard_mining_channel_success>(standard_open.response);
+        auto const standard_job = find_message<sv2::new_mining_job>(standard_open.response);
+        auto const standard_prev = find_message<sv2::mining_set_new_prev_hash>(standard_open.response);
+        auto const standard_share = mining_process(session, sv2::submit_shares_standard{
+            standard.channel_id, 3, standard_job.job_id, 0, standard_prev.ntime_start, standard_job.version});
+        REQUIRE(standard_share.pool);
+        REQUIRE(standard_share.pool->worker == "worker");
+    }
 }

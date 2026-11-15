@@ -20,12 +20,14 @@ namespace kth::node::sv2 {
 
 namespace {
 
+// A stale notice on every reply must not allocate forever.
+constexpr uint32_t max_payout_restarts = 8;
+
 template <typename Message>
 data_chunk frame(Message const& message) {
     auto const payload = to_data_chunk(message);
-    auto bytes = to_data_chunk(message_header{Message::channel_message
-        ? message_header::channel_msg_flag : uint16_t{0}, Message::message_type,
-        static_cast<uint32_t>(payload.size())});
+    auto bytes = to_data_chunk(message_header{framed_extension_type<Message>(),
+        Message::message_type, static_cast<uint32_t>(payload.size())});
     bytes.insert(bytes.end(), payload.begin(), payload.end());
     return bytes;
 }
@@ -43,6 +45,24 @@ std::optional<Message> parse(byte_span payload) {
 // caller then applies the ordinary state checks.
 std::optional<uint32_t> reply_request_id(jd_peer peer, message_header const& header,
     byte_span payload) {
+    if (header.extension() == requested_payout_outputs_extension) {
+        if (peer != jd_peer::declaration || header.channel_msg()) return std::nullopt;
+        switch (header.msg_type) {
+            case request_payout_outputs_success::message_type:
+                if (auto message = parse<request_payout_outputs_success>(payload)) {
+                    return message->request_id;
+                }
+                return std::nullopt;
+            case request_payout_outputs_error::message_type:
+                if (auto message = parse<request_payout_outputs_error>(payload)) {
+                    return message->request_id;
+                }
+                return std::nullopt;
+            default:
+                return std::nullopt;
+        }
+    }
+    if (header.extension() != 0) return std::nullopt;
     if (peer == jd_peer::declaration && ! header.channel_msg()) {
         switch (header.msg_type) {
             case allocate_mining_job_token_success::message_type:
@@ -108,6 +128,28 @@ std::optional<domain::chain::output::list> pool_outputs(byte_span bytes, uint64_
     return outputs;
 }
 
+// The returned outputs already sum to the template revenue. Do not move that
+// revenue into the first output or keep the allocation placeholders.
+std::optional<domain::chain::output::list> payout_outputs(byte_span bytes, uint64_t revenue) {
+    byte_reader source(bytes);
+    auto const count = source.read_variable_little_endian();
+    if ( ! count || *count == 0 || *count > 256 || *count > source.remaining_size() / 9) {
+        return std::nullopt;
+    }
+    domain::chain::output::list outputs;
+    outputs.reserve(static_cast<size_t>(*count));
+    uint64_t sum = 0;
+    for (size_t i = 0; i < *count; ++i) {
+        auto output = domain::chain::output::from_data(source, true);
+        if ( ! output || output->token_data()) return std::nullopt;
+        if (sum > std::numeric_limits<uint64_t>::max() - output->value()) return std::nullopt;
+        sum += output->value();
+        outputs.push_back(std::move(*output));
+    }
+    if ( ! source.is_exhausted() || sum != revenue) return std::nullopt;
+    return outputs;
+}
+
 } // namespace
 
 jd_declaration::jd_declaration(std::string identity, bool full_template)
@@ -116,7 +158,13 @@ jd_declaration::jd_declaration(std::string identity, bool full_template)
 {}
 
 bool jd_declaration::pending() const {
-    return state_ == state::allocating || state_ == state::declaring || state_ == state::installing;
+    return state_ == state::allocating || state_ == state::requesting
+        || state_ == state::declaring || state_ == state::installing;
+}
+
+void jd_declaration::use_payout_outputs(bool enabled) {
+    if (pending()) return;
+    payout_outputs_ = enabled;
 }
 
 std::optional<mining::declared_work> const& jd_declaration::work() const {
@@ -218,16 +266,108 @@ jd_declaration::result jd_declaration::start(blockchain::mining_template value,
             transactions_.push_back(to_data_chunk(transaction, true));
         }
     }
-    ++request_id_;
     channel_ = channel;
     template_ = std::move(value);
     has_template_ = true;
-    // The replacement is a new declaration. It stays unaccepted until
-    // SetCustomMiningJob.Success, whose job id may be zero.
+    restarts_ = 0;
+    restart_ = false;
+    return send_allocation();
+}
+
+jd_declaration::result jd_declaration::send_allocation() {
+    if (request_id_ == std::numeric_limits<uint32_t>::max()) {
+        return fail("invalid declaration identity or exhausted request ids");
+    }
+    ++request_id_;
+    restart_ = false;
+    token_.clear();
+    script_prefix_.clear();
+    reservation_ = 0;
     work_.reset();
     state_ = state::allocating;
     result out;
     out.declaration = frame(allocate_mining_job_token{identity_, request_id_});
+    out.progress = true;
+    return out;
+}
+
+jd_declaration::result jd_declaration::retry_allocation() {
+    if (restarts_ >= max_payout_restarts) return fail("payout output request was not settled");
+    ++restarts_;
+    return send_allocation();
+}
+
+bool jd_declaration::later(std::string_view code) const {
+    // The pool's node is on another block than this one, or the pool could not
+    // check the job at the moment. Both pass by themselves, and neither is a
+    // judgement of the job.
+    return code == error_stale_chain_tip || code == error_template_unavailable
+        || (payout_outputs_ && code == error_stale_payout_outputs);
+}
+
+jd_declaration::result jd_declaration::defer() {
+    // The same end as supersede(): the request is over, and a late reply to it
+    // must not be applied to the declaration that follows.
+    if (retired_request_ids_.size() == max_retired_request_ids) {
+        retired_request_ids_.pop_front();
+    }
+    retired_request_ids_.push_back(request_id_);
+    state_ = state::idle;
+    restart_ = false;
+    work_.reset();
+    transactions_.clear();
+    // template_ stays, as after fail(): the solo payout keeps that selection.
+    result out;
+    out.deferred = true;
+    return out;
+}
+
+jd_declaration::result jd_declaration::declare_work(data_chunk token) {
+    if ( ! full_template_) return install(std::move(token));
+    declare_mining_job message;
+    message.request_id = request_id_;
+    message.mining_job_token = std::move(token);
+    message.version = template_.version;
+    message.coinbase_tx_prefix = work_->coinbase_tx_prefix;
+    message.coinbase_tx_suffix = work_->coinbase_tx_suffix;
+    // BCH has no SegWit: the spec's wtxid list carries ordinary transaction
+    // ids in the Template Provider's CTOR order, with no witness commitment.
+    for (auto const& tx : template_.selection.txs) message.wtxid_list.push_back(tx->hash());
+    if (message.serialized_size() > jd_frame_max_payload) {
+        return fail("DeclareMiningJob exceeds the SV2 frame maximum");
+    }
+    state_ = state::declaring;
+    result out;
+    out.declaration = frame(message);
+    out.progress = true;
+    return out;
+}
+
+jd_declaration::result jd_declaration::request_payout(data_chunk token, size_t reservation) {
+    if (template_.height > std::numeric_limits<uint32_t>::max()) {
+        return fail("template height does not fit the payout request");
+    }
+    auto prefix = mining::payout_coinbase_prefix(template_.height, request_id_,
+        channel_.extranonce_prefix.size(), channel_.extranonce_size);
+    if ( ! prefix) return fail("coinbase prefix does not fit the payout request");
+    token_ = std::move(token);
+    reservation_ = reservation;
+    script_prefix_ = std::move(*prefix);
+    token_epoch_ = notice_epoch_;
+    request_payout_outputs message;
+    message.request_id = request_id_;
+    message.mining_job_token = token_;
+    message.available_payout_value = template_.coinbase_value;
+    message.height = static_cast<uint32_t>(template_.height);
+    message.prev_hash = template_.previous_block_hash;
+    message.nbits = template_.bits;
+    message.coinbase_prefix = script_prefix_;
+    if (message.serialized_size() > jd_message_max_payload) {
+        return fail("payout request exceeds the local frame limit");
+    }
+    state_ = state::requesting;
+    result out;
+    out.declaration = frame(message);
     out.progress = true;
     return out;
 }
@@ -241,17 +381,117 @@ jd_declaration::result jd_declaration::install(data_chunk token) {
     message.prev_hash = template_.previous_block_hash;
     message.ntime_start = template_.current_time;
     message.nbits = template_.bits;
-    message.coinbase_tx_version = 1;
+    message.coinbase_tx_version = work_->coinbase_version;
     message.coinbase_prefix = work_->coinbase_prefix;
-    message.coinbase_tx_input_sequence = 0xffffffffu;
+    message.coinbase_tx_input_sequence = work_->coinbase_input_sequence;
     message.coinbase_tx_outputs = work_->coinbase_tx_outputs;
-    message.coinbase_tx_locktime = 0;
+    message.coinbase_tx_locktime = work_->coinbase_locktime;
     message.merkle_path = work_->merkle_path;
     state_ = state::installing;
     result out;
     out.mining = frame(message);
     out.progress = true;
     return out;
+}
+
+jd_declaration::result jd_declaration::note_stale(byte_span payload) {
+    if ( ! parse<payout_outputs_stale>(payload)) return fail("malformed payout stale notice");
+    if (state_ == state::failed) return {};
+    ++notice_epoch_;
+    // One request stays in flight. The reply that is already owed is consumed,
+    // then a new token is allocated. A second request is not sent early.
+    if (pending()) {
+        restart_ = true;
+        return {};
+    }
+    // Nothing is in flight. An installed job keeps the outputs of the token
+    // it was declared with, and the pool counts shares on it only for as
+    // long as it keeps that job. A declaration that ended on a stale answer
+    // waits for exactly this. Either way the template is declared again.
+    if ( ! has_template_) return {};
+    result out;
+    out.outdated = true;
+    return out;
+}
+
+jd_declaration::result jd_declaration::accept_payout(request_payout_outputs_success const& success) {
+    if ((success.flags & ~exact_outputs_flag) != 0) return fail("payout outputs set unknown flags");
+    bool const exact = (success.flags & exact_outputs_flag) != 0;
+    uint32_t version = 1;
+    uint32_t sequence = 0xffffffffu;
+    uint32_t locktime = 0;
+    if (exact) {
+        version = success.coinbase_tx_version;
+        sequence = success.coinbase_tx_input_sequence;
+        locktime = success.coinbase_tx_locktime;
+        // Any other version makes the block's coinbase invalid under BCH consensus.
+        if (version < kth::transaction_version_min || version > kth::transaction_version_max) {
+            return fail("coinbase_tx_version is outside 1..2");
+        }
+        // is_final's time is the previous block's median time past. min_time
+        // is that median plus one. One input is required: an empty input list
+        // would be vacuously final and would hide a non-final sequence.
+        domain::chain::transaction const coinbase{
+            version, locktime,
+            domain::chain::input::list{domain::chain::input{
+                domain::chain::output_point{}, domain::chain::script{}, sequence}},
+            domain::chain::output::list{}};
+        if ( ! coinbase.is_final(template_.height, template_.min_time - 1)) {
+            return fail("coinbase_tx_locktime and coinbase_tx_input_sequence are not final");
+        }
+    } else if (success.coinbase_tx_version != 0 || success.coinbase_tx_input_sequence != 0
+        || success.coinbase_tx_locktime != 0) {
+        return fail("payout coinbase fields are not zero");
+    }
+    if (success.coinbase_tx_outputs.size() > reservation_) {
+        return fail("payout outputs exceed the token reservation");
+    }
+    auto const outputs = payout_outputs(success.coinbase_tx_outputs, template_.coinbase_value);
+    if ( ! outputs) return fail("invalid payout outputs");
+    work_ = mining::make_payout_work(template_, *outputs, request_id_,
+        channel_.extranonce_prefix, channel_.extranonce_size, script_prefix_,
+        version, sequence, locktime);
+    if ( ! work_) return fail("payout coinbase or template exceeds mining limits");
+    work_->upstream_channel_id = channel_.channel_id;
+    work_->upstream_target = channel_.target;
+    return declare_work(token_);
+}
+
+jd_declaration::result jd_declaration::refuse_payout(request_payout_outputs_error const& error) {
+    // A token allocated before the latest notice is the race that notice describes.
+    if (error.error_code == error_stale_payout_outputs) {
+        if (token_epoch_ < notice_epoch_) return retry_allocation();
+        // With no notice, the token is on the pool's current share and the
+        // request names another block than the pool's own template: the
+        // pool's node and this one are not on the same tip. That happens at
+        // every new block, to whichever of the two hears of it last, and it
+        // ends when that one catches up. Asking again at once gets the same
+        // answer, and it is not a refusal of this client, so the attempt
+        // ends here and the owner starts another after a wait.
+        return defer();
+    }
+    return fail("payout outputs refused: " + error.error_code);
+}
+
+jd_declaration::result jd_declaration::process_payout(jd_peer peer,
+    message_header const& header, byte_span payload) {
+    if (peer != jd_peer::declaration || header.channel_msg()) {
+        return fail("unexpected payout message or direction");
+    }
+    if (state_ != state::requesting) return fail("unexpected payout response");
+    if (header.msg_type == request_payout_outputs_success::message_type) {
+        auto const message = parse<request_payout_outputs_success>(payload);
+        if ( ! message || message->request_id != request_id_) return fail("invalid payout outputs success");
+        if (restart_) return retry_allocation();
+        return accept_payout(*message);
+    }
+    if (header.msg_type == request_payout_outputs_error::message_type) {
+        auto const message = parse<request_payout_outputs_error>(payload);
+        if ( ! message || message->request_id != request_id_) return fail("invalid payout outputs error");
+        if (restart_) return retry_allocation();
+        return refuse_payout(*message);
+    }
+    return fail("unexpected payout message");
 }
 
 jd_declaration::result jd_declaration::process(jd_peer peer,
@@ -261,7 +501,6 @@ jd_declaration::result jd_declaration::process(jd_peer peer,
     if (header.msg_length != payload.size() || payload.size() > jd_message_max_payload) {
         return fail("invalid declaration frame length");
     }
-    if (header.extension() != 0) return {};
     // A replaced declaration's reply can arrive after the next start().
     // Ignore it and leave the declaration now in flight alone.
     if (auto const id = reply_request_id(peer, header, payload); id && retired(*id)) {
@@ -269,12 +508,27 @@ jd_declaration::result jd_declaration::process(jd_peer peer,
             static_cast<unsigned>(header.msg_type), *id);
         return {};
     }
+    if (header.extension() == requested_payout_outputs_extension) {
+        if ( ! payout_outputs_) return {};
+        if (header.channel_msg() || peer != jd_peer::declaration) {
+            return fail("unexpected payout message or direction");
+        }
+        if (header.msg_type == payout_outputs_stale::message_type) return note_stale(payload);
+        return process_payout(peer, header, payload);
+    }
+    if (header.extension() != 0) return {};
     if (state_ == state::failed || ! pending()) return fail("unexpected declaration response");
     if (state_ == state::allocating && peer == jd_peer::declaration && ! header.channel_msg()
         && header.msg_type == allocate_mining_job_token_success::message_type) {
         auto const allocation = parse<allocate_mining_job_token_success>(payload);
         if ( ! allocation || allocation->request_id != request_id_ || allocation->mining_job_token.empty()) {
             return fail("invalid token allocation response");
+        }
+        // The notice arrived while this token was being allocated, so the token
+        // is already stale. Ask for another before requesting outputs.
+        if (restart_) return retry_allocation();
+        if (payout_outputs_) {
+            return request_payout(allocation->mining_job_token, allocation->coinbase_tx_outputs.size());
         }
         auto const outputs = pool_outputs(allocation->coinbase_tx_outputs, template_.coinbase_value);
         if ( ! outputs) return fail("invalid pool coinbase outputs");
@@ -283,33 +537,17 @@ jd_declaration::result jd_declaration::process(jd_peer peer,
         if ( ! work_) return fail("declared coinbase or template exceeds mining limits");
         work_->upstream_channel_id = channel_.channel_id;
         work_->upstream_target = channel_.target;
-        // This coinbase is not accepted yet. Success is the only place that
-        // records the pool job id, and that id may be zero.
-        work_->upstream_accepted = false;
-        if ( ! full_template_) return install(allocation->mining_job_token);
-
-        declare_mining_job message;
-        message.request_id = request_id_;
-        message.mining_job_token = allocation->mining_job_token;
-        message.version = template_.version;
-        message.coinbase_tx_prefix = work_->coinbase_tx_prefix;
-        message.coinbase_tx_suffix = work_->coinbase_tx_suffix;
-        // BCH has no SegWit: the spec's wtxid list carries ordinary transaction
-        // ids in the Template Provider's CTOR order, with no witness commitment.
-        for (auto const& tx : template_.selection.txs) message.wtxid_list.push_back(tx->hash());
-        if (message.serialized_size() > jd_frame_max_payload) {
-            return fail("DeclareMiningJob exceeds the SV2 frame maximum");
-        }
-        state_ = state::declaring;
-        result out;
-        out.declaration = frame(message);
-        out.progress = true;
-        return out;
+        return declare_work(allocation->mining_job_token);
     }
     if (state_ == state::declaring && peer == jd_peer::declaration && ! header.channel_msg()) {
         if (header.msg_type == declare_mining_job_error::message_type) {
             auto const message = parse<declare_mining_job_error>(payload);
             if ( ! message || message->request_id != request_id_) return fail("invalid declaration refusal");
+            if (restart_) return retry_allocation();
+            // The pool's node left this tip between its payout answer and
+            // the declaration, or could not check the template just now.
+            // The same race as a stale payout answer.
+            if (later(message->error_code)) return defer();
             return fail("JDS refused the local template: " + message->error_code);
         }
         if (header.msg_type == declare_mining_job_success::message_type) {
@@ -317,6 +555,7 @@ jd_declaration::result jd_declaration::process(jd_peer peer,
             if ( ! message || message->request_id != request_id_ || message->new_mining_job_token.empty()) {
                 return fail("invalid declaration success");
             }
+            if (restart_) return retry_allocation();
             return install(message->new_mining_job_token);
         }
         if (header.msg_type == provide_missing_transactions::message_type) {
@@ -324,6 +563,10 @@ jd_declaration::result jd_declaration::process(jd_peer peer,
             if ( ! message || message->request_id != request_id_) {
                 return fail("invalid missing transaction request");
             }
+            // A stale notice can set restart_ while this declaration is still
+            // open on the JDS, which is waiting for these transactions. The
+            // reply is sent anyway. DeclareMiningJob.Success and .Error are
+            // what call retry_allocation() when restart_ is set.
             provide_missing_transactions_success response;
             response.request_id = request_id_;
             std::vector<bool> supplied(transactions_.size(), false);
@@ -352,6 +595,8 @@ jd_declaration::result jd_declaration::process(jd_peer peer,
             if ( ! message || message->request_id != request_id_ || message->channel_id != channel_.channel_id) {
                 return fail("invalid custom job refusal");
             }
+            if (restart_) return retry_allocation();
+            if (later(message->error_code)) return defer();
             return fail("pool refused the local custom job: " + message->error_code);
         }
         if (header.msg_type == set_custom_mining_job_success::message_type) {
@@ -359,6 +604,7 @@ jd_declaration::result jd_declaration::process(jd_peer peer,
             if ( ! message || message->request_id != request_id_ || message->channel_id != channel_.channel_id) {
                 return fail("invalid custom job success");
             }
+            if (restart_) return retry_allocation();
             work_->upstream_job_id = message->job_id;
             work_->upstream_accepted = true;
             state_ = state::accepted;
