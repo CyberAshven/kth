@@ -1088,7 +1088,10 @@ bool p2p_node::observe_transaction_message(peer_session::ptr const& peer, raw_me
             peer->negotiated_version());
         if (change == detail::filter_change::refused) {
             spdlog::debug("[p2p_node] {} from [{}] breaks a bloom filter limit", command, peer->authority());
-            if (report_misbehavior(peer, 100, "invalid-bloom-filter")) {
+            // The reasons other Bitcoin Cash nodes give.
+            auto const reason = command == domain::message::filter_add::command
+                ? "invalid-filteradd" : "oversized-bloom-filter";
+            if (report_misbehavior(peer, 100, reason)) {
                 peer->stop(error::channel_stopped);
             }
         } else if (change != detail::filter_change::none) {

@@ -4,12 +4,12 @@ A light wallet can load a bloom filter into a node. The node then sends it only
 the transactions that match the filter, and for a block a proof that those
 transactions are in it.
 
-```ini
-node.bloom_filters = true
-```
+It is on unless turned off, as on other Bitcoin Cash nodes, and the node sets
+the bloom filter service bit (bit 2) in its version message. To turn it off:
 
-It is off by default. When on, the node sets the bloom filter service bit
-(bit 2) in its version message.
+```ini
+node.bloom_filters = false
+```
 
 A bloom filter tells the node roughly what the wallet watches: the wallet
 chooses how many false positives to hide among. A wallet that wants the node to
