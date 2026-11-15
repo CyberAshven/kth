@@ -42,6 +42,16 @@ output_of_stored_entry(std::span<uint8_t const> value) {
 std::expected<std::vector<domain::chain::output>, database::result_code>
 spent_outputs(domain::chain::block const& blk, database::block_undo const& undo,
               undo_output_reader const& read) {
+    auto spent = spent_outputs_with_heights(blk, 0, undo, read);
+    if ( ! spent) {
+        return std::unexpected(spent.error());
+    }
+    return std::move(spent->outputs);
+}
+
+std::expected<spent_output_list, database::result_code>
+spent_outputs_with_heights(domain::chain::block const& blk, uint32_t height,
+                           database::block_undo const& undo, undo_output_reader const& read) {
     auto const& txs = blk.transactions();
 
     size_t inputs = 0;
@@ -49,8 +59,9 @@ spent_outputs(domain::chain::block const& blk, database::block_undo const& undo,
         inputs += txs[i].inputs().size();
     }
 
-    std::vector<domain::chain::output> spent;
-    spent.reserve(inputs);
+    spent_output_list spent;
+    spent.outputs.reserve(inputs);
+    spent.heights.reserve(inputs);
     if (inputs == 0) {
         return spent;
     }
@@ -75,7 +86,8 @@ spent_outputs(domain::chain::block const& blk, database::block_undo const& undo,
                 if ( ! output) {
                     return std::unexpected(output.error());
                 }
-                spent.push_back(std::move(*output));
+                spent.outputs.push_back(std::move(*output));
+                spent.heights.push_back(it->second->height);
                 continue;
             }
 
@@ -89,7 +101,8 @@ spent_outputs(domain::chain::block const& blk, database::block_undo const& undo,
             if (it == created->end() || point.index() >= txs[it->second].outputs().size()) {
                 return std::unexpected(database::result_code::key_not_found);
             }
-            spent.push_back(txs[it->second].outputs()[point.index()]);
+            spent.outputs.push_back(txs[it->second].outputs()[point.index()]);
+            spent.heights.push_back(height);
         }
     }
     return spent;

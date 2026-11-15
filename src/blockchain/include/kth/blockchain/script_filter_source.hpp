@@ -66,6 +66,30 @@ std::expected<std::vector<domain::chain::output>, database::result_code>
 spent_outputs(domain::chain::block const& blk, database::block_undo const& undo,
               undo_output_reader const& read);
 
+// The same outputs with the height each one was created at, which is where a
+// light client finds the transaction that created it. An output created and
+// spent in the same block was created at `height`, the block's own.
+struct KB_API spent_output_list {
+    std::vector<domain::chain::output> outputs;
+    std::vector<uint32_t> heights;
+};
+
+[[nodiscard]]
+KB_API
+std::expected<spent_output_list, database::result_code>
+spent_outputs_with_heights(domain::chain::block const& blk, uint32_t height,
+                           database::block_undo const& undo, undo_output_reader const& read);
+
+// What the script filter of a block, and the leaves of its entry tree, are
+// built from: the block, and the outputs it spends in the order of its inputs.
+struct KB_API script_filter_source {
+    std::shared_ptr<domain::chain::block const> block;
+    size_t height{0};
+    spent_output_list spent;
+};
+
+using script_filter_source_const_ptr = std::shared_ptr<script_filter_source const>;
+
 // The script filters built most recently, by block hash, within a budget of
 // bytes. A wallet that follows the tip asks for the filters of the last blocks,
 // and so does every other wallet, so these are built once.

@@ -3060,6 +3060,40 @@ block_chain::fetch_script_filter(size_t height) const {
         co_return cached;
     }
 
+    auto const source = co_await fetch_script_filter_source(hash);
+    if ( ! source) {
+        co_return std::unexpected(source.error());
+    }
+
+    // Built on the pool: for a large block this is the costly part.
+    auto built = co_await ::asio::co_spawn(executor(),
+        [source = *source, hash]() -> awaitable_expected<script_filter_const_ptr> {
+            auto filter = domain::chain::build_script_filter(*source->block, source->spent.outputs);
+            if ( ! filter) {
+                spdlog::error("[blockchain] cannot build the script filter of block {}", encode_hash(hash));
+                co_return kth::fail(error::operation_failed);
+            }
+            co_return std::make_shared<domain::chain::script_filter const>(std::move(*filter));
+        },
+        ::asio::use_awaitable);
+
+    if (built) {
+        script_filters_.insert(hash, *built);
+    }
+    co_return built;
+}
+
+awaitable_expected<script_filter_source_const_ptr>
+block_chain::fetch_script_filter_source(hash_digest const& hash) const {
+    if (stopped() || ! block_store_) {
+        co_return kth::fail(error::service_stopped);
+    }
+
+    auto const idx = header_index_.find(hash);
+    if (idx == header_index::null_index) {
+        co_return kth::fail(error::not_found);
+    }
+    auto const height = size_t(header_index_.get_height(idx));
     auto const pos = header_index_.get_block_pos(idx);
     if (pos.is_null()) {
         co_return kth::fail(error::not_found);
@@ -3078,10 +3112,10 @@ block_chain::fetch_script_filter(size_t height) const {
         co_return std::unexpected(stored.error());
     }
 
-    // The undo record is read and the filter is built on the pool as well: for
-    // a large block this is the costly part.
-    auto built = co_await ::asio::co_spawn(executor(),
-        [this, blk = stored->first, hash, prev_hash, undo_pos]() -> awaitable_expected<script_filter_const_ptr> {
+    // The undo record is read on the pool as well.
+    co_return co_await ::asio::co_spawn(executor(),
+        [this, blk = stored->first, hash, height, prev_hash, undo_pos]()
+            -> awaitable_expected<script_filter_source_const_ptr> {
             block_undo undo;
             // A block of one transaction spends nothing, so it needs no record.
             if (blk->transactions().size() > 1) {
@@ -3097,28 +3131,19 @@ block_chain::fetch_script_filter(size_t height) const {
                 undo = std::move(*record);
             }
 
-            auto const spent = spent_outputs(*blk, undo, [this](spent_output const& entry) {
-                return read_undo_output(*block_store_, entry);
-            });
+            auto spent = spent_outputs_with_heights(*blk, uint32_t(height), undo,
+                [this](spent_output const& entry) {
+                    return read_undo_output(*block_store_, entry);
+                });
             if ( ! spent) {
                 spdlog::error("[blockchain] the undo record of block {} does not give the outputs "
                     "the block spends: {}", encode_hash(hash), result_code_name(spent.error()));
                 co_return kth::fail(error::operation_failed);
             }
-
-            auto filter = domain::chain::build_script_filter(*blk, *spent);
-            if ( ! filter) {
-                spdlog::error("[blockchain] cannot build the script filter of block {}", encode_hash(hash));
-                co_return kth::fail(error::operation_failed);
-            }
-            co_return std::make_shared<domain::chain::script_filter const>(std::move(*filter));
+            co_return std::make_shared<script_filter_source const>(
+                script_filter_source{blk, height, std::move(*spent)});
         },
         ::asio::use_awaitable);
-
-    if (built) {
-        script_filters_.insert(hash, *built);
-    }
-    co_return built;
 }
 
 std::expected<domain::chain::block::list, database::result_code>

@@ -20,6 +20,7 @@ using blockchain::output_of_stored_entry;
 using blockchain::script_filter_cache;
 using blockchain::script_filter_const_ptr;
 using blockchain::spent_outputs;
+using blockchain::spent_outputs_with_heights;
 using database::block_undo;
 using database::result_code;
 using database::spent_output;
@@ -163,6 +164,13 @@ TEST_CASE("the spent outputs follow the inputs of the block, whatever the order 
     CHECK((*spent)[1] == second);
     CHECK((*spent)[2] == third);
 
+    // With the height each one was created at, in the same order: the height
+    // the record holds, not the block's.
+    auto const located = spent_outputs_with_heights(block, 77, undo, read_full);
+    REQUIRE(located);
+    CHECK(located->outputs == *spent);
+    CHECK(located->heights == std::vector<uint32_t>{10, 20, 30});
+
     // And the filter built from them is the one built from the outputs in
     // input order.
     auto const from_record = chain::build_script_filter(block, *spent);
@@ -200,6 +208,12 @@ TEST_CASE("an output created and spent in the same block is taken from the block
         REQUIRE(spent->size() == 2);
         CHECK((*spent)[0] == old);
         CHECK((*spent)[1] == creator.outputs()[1]);
+
+        // The one the block created itself was created at the block's height.
+        auto const located = spent_outputs_with_heights(block, 77, undo, read_full);
+        REQUIRE(located);
+        CHECK(located->outputs == *spent);
+        CHECK(located->heights == std::vector<uint32_t>{10, 77});
     }
 
     SECTION("the creating transaction stands after the one that spends its output") {
@@ -209,6 +223,10 @@ TEST_CASE("an output created and spent in the same block is taken from the block
         REQUIRE(spent->size() == 2);
         CHECK((*spent)[0] == creator.outputs()[1]);
         CHECK((*spent)[1] == old);
+
+        auto const located = spent_outputs_with_heights(block, 77, undo, read_full);
+        REQUIRE(located);
+        CHECK(located->heights == std::vector<uint32_t>{77, 10});
     }
 }
 

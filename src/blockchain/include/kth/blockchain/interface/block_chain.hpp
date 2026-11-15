@@ -1027,6 +1027,16 @@ struct KB_API block_chain {
     [[nodiscard]] awaitable_expected<script_filter_const_ptr>
     fetch_script_filter(size_t height) const;
 
+    // What that filter is built from, for a block the node holds: the block
+    // and the outputs it spends, in the order of its inputs, each with the
+    // height it was created at. The leaves of the filter's entry tree are
+    // built from the same, and a proof of one names the block an output was
+    // created in. Nothing is kept: both stored records are read again.
+    //
+    // The errors are the ones of fetch_script_filter.
+    [[nodiscard]] awaitable_expected<script_filter_source_const_ptr>
+    fetch_script_filter_source(hash_digest const& hash) const;
+
     // Batch fetch: single LMDB transaction for multiple blocks (optimized for UTXO building)
     [[nodiscard]] std::expected<domain::chain::block::list, database::result_code>
     fetch_blocks(uint32_t from, uint32_t to) const;
