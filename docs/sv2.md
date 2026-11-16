@@ -158,9 +158,9 @@ Plaintext still requires the explicit `sv2.noise=false` setting.
   open. Template Distribution connections have no channels and no such deadline.
 - `sv2.coinbase_tag` (default empty, at most 40 bytes) is written into the
   scriptSig of every coinbase the node builds, for its own Mining channels and
-  for jobs it declares to a pool, right after the BIP34 height and the job's
-  four generation bytes and before the extranonce. A longer tag stops the node
-  at startup.
+  for jobs it declares to a pool, right after the BIP34 height and before the
+  job's four generation bytes and the extranonce, where pools put their text.
+  A longer tag stops the node at startup.
 - Standard channels receive `NewMiningJob` with a merkle root computed by the
   node. Extended channels receive `NewExtendedMiningJob` with coinbase prefix
   and suffix, the merkle branch, a unique extranonce prefix and 12 to 32 bytes

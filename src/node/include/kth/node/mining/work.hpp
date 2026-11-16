@@ -225,7 +225,7 @@ std::optional<declared_work> make_declared_work(blockchain::mining_template cons
     data_chunk const& coinbase_tag = {});
 
 // ScriptSig bytes before the extranonce for a payout request. BIP34, the
-// generation, the coinbase tag, and enough padding that the smallest
+// coinbase tag, the generation, and enough padding that the smallest
 // one-output coinbase is 100 bytes. The same bytes are declared after the
 // outputs come back.
 [[nodiscard]]

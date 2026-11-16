@@ -141,9 +141,11 @@ std::optional<coinbase_parts> split_coinbase(size_t height, uint32_t job_id,
     if (bip34.empty() || bip34.size() > bip34_reserve) return std::nullopt;
     // A replacement on the same tip must give the miner new hash space even
     // when its payout and channel extranonce have not changed.
+    // The tag follows the height, where pools and explorers expect a
+    // coinbase's text.
+    bip34.insert(bip34.end(), coinbase_tag.begin(), coinbase_tag.end());
     auto const generation = to_little_endian(job_id);
     bip34.insert(bip34.end(), generation.begin(), generation.end());
-    bip34.insert(bip34.end(), coinbase_tag.begin(), coinbase_tag.end());
     // BCH required 100-byte transactions before CashTokens reduced the
     // minimum to 65. Keep these coinbases valid on both sides of activation.
     auto const fixed_size = 4 + 1 + 36 + 1 + 4 + (outputs.size() < 253 ? 1 : 3)
@@ -249,8 +251,8 @@ std::optional<data_chunk> script_prefix_for(size_t height, uint32_t generation,
     data_chunk prefix;
     prefix.reserve(bip34.size() + job.size() + coinbase_tag.size() + pad);
     prefix.insert(prefix.end(), bip34.begin(), bip34.end());
-    prefix.insert(prefix.end(), job.begin(), job.end());
     prefix.insert(prefix.end(), coinbase_tag.begin(), coinbase_tag.end());
+    prefix.insert(prefix.end(), job.begin(), job.end());
     prefix.insert(prefix.end(), pad, uint8_t{0});
     return prefix;
 }

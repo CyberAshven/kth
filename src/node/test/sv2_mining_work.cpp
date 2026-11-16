@@ -272,7 +272,7 @@ TEST_CASE("Mining targets track nominal hashes at all finite scales", "[sv2 mini
     REQUIRE(engine.update(0, 1, maximum_target()).unknown);
 }
 
-TEST_CASE("Mining coinbase carries the configured tag after the height and generation", "[sv2 mining]") {
+TEST_CASE("Mining coinbase carries the configured tag right after the height", "[sv2 mining]") {
     std::string_view const text = "/CyberAshven Knuth/";
     data_chunk const tag(text.begin(), text.end());
     work_engine engine(0x1234, {}, tag);
@@ -285,10 +285,10 @@ TEST_CASE("Mining coinbase carries the configured tag after the height and gener
     auto const& script = tx.inputs().front().script().bytes();
     REQUIRE(script.size() <= coinbase_script_limit);
     REQUIRE(tx.serialized_size(true) >= 100);
-    // One BIP34 byte for height 1, the four generation bytes, then the tag.
+    // One BIP34 byte for height 1, then the tag, then the four generation bytes.
     REQUIRE(script.front() == 0x51);
     REQUIRE(script.size() >= 5 + tag.size());
-    REQUIRE(std::equal(tag.begin(), tag.end(), script.begin() + 5));
+    REQUIRE(std::equal(tag.begin(), tag.end(), script.begin() + 1));
     auto const raw = to_data_chunk(tx, true);
     auto const& prefix = jobs.front().coinbase_tx_prefix;
     REQUIRE(std::equal(channel.extranonce_prefix.begin(), channel.extranonce_prefix.end(),
@@ -298,7 +298,8 @@ TEST_CASE("Mining coinbase carries the configured tag after the height and gener
     auto const payout_prefix = payout_coinbase_prefix(1, 7, 12, 8, tag);
     REQUIRE(payout_prefix);
     REQUIRE(payout_prefix->size() >= 5 + tag.size());
-    REQUIRE(std::equal(tag.begin(), tag.end(), payout_prefix->begin() + 5));
+    REQUIRE(payout_prefix->front() == 0x51);
+    REQUIRE(std::equal(tag.begin(), tag.end(), payout_prefix->begin() + 1));
     REQUIRE(payout_coinbase_prefix(1, 7, 12, 8) != payout_prefix);
 
     // A tag one byte past the limit builds no work and stops the node at startup.
