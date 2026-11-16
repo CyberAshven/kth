@@ -254,6 +254,155 @@ TEST_CASE("render_transaction_verbose says whether the block it was read from is
     CHECK(contains(stale, quoted + R"(,"confirmations":0,"in_active_chain":false})"));
 }
 
+namespace {
+
+domain::chain::script script_of(std::string_view hex) {
+    auto const bytes = decode_base16(hex);
+    REQUIRE(bytes.has_value());
+    return domain::chain::script{*bytes, false};
+}
+
+spent_prevout prevout_of(uint64_t value, std::string_view script, size_t height, bool coinbase) {
+    return spent_prevout{domain::chain::output{value, script_of(script), domain::chain::token_data_opt{}},
+        height, coinbase};
+}
+
+// The fingerprint of a byte code pattern given as hex.
+std::string fingerprint_of(std::string_view pattern) {
+    auto const bytes = decode_base16(pattern);
+    REQUIRE(bytes.has_value());
+    return encode_base16(sha256_hash(*bytes));
+}
+
+size_t count_of(std::string const& text, std::string_view what) {
+    size_t n = 0;
+    for (auto at = text.find(what); at != std::string::npos; at = text.find(what, at + 1)) {
+        ++n;
+    }
+    return n;
+}
+
+constexpr auto spend_hex =
+    "02000000013cd49214320f36fd78fd8ed5daf9c25c95d392fbfd9c5e3d1b2da4fa6f7927f0000000006441a51a5935eb9d2b"
+    "2c36aa9d1d1d855ee54fac0a1e8e3ef507a2f52eb4afa28997722a551b5449824e7a9cd30a4630881969ad5cb0612a5a8a16"
+    "d8db0451581a2f4121028cffeaef2d58730ff8f558425a0fd37d37db7b7bf0679c4990581c4ea84389a6feffffff0280d1f0"
+    "08000000001976a914ff5e8c6fe7e2dd7918232f05a4db1fe1239bb07d88aca51f1521010000001976a9147050b925878deb"
+    "85c4713fc84b0a165dcde4bf8288ac6e000000";
+
+} // namespace
+
+TEST_CASE("render_transaction_verbose gives each input its prevout and the transaction its fee", "[rpc query]") {
+    auto const tx = parse_tx(spend_hex);
+
+    // The one input spends 50 BCH that a coinbase paid to 4423cfd2...0fc3 at
+    // height 7; the outputs pay 1.5 and 48.49999781.
+    std::vector<spent_prevout> const prevouts{prevout_of(5'000'000'000u, pkh_script, 7, true)};
+    auto const json = render_transaction_verbose(tx, regtest, flags, std::nullopt, prevouts);
+    CHECK(contains(json, R"(7bf0679c4990581c4ea84389a6"},"prevout":{"generated":true,"height":7,"value":50,)"
+        R"("scriptPubKey":{"asm":")"));
+    CHECK(contains(json, std::string(R"(","hex":")") + pkh_script +
+        R"(","type":"pubkeyhash","address":"bchreg:qpzz8n7jp6847yyx8t33matrgcsdx6c0cv99t2zdvc"}},)"
+        R"("sequence":4294967294}],)"));
+    // The fee, 219 satoshis, between the outputs and the hex.
+    CHECK(contains(json, R"(}],"fee":0.00000219,"hex":"02000000)"));
+    CHECK_FALSE(contains(json, R"("byteCodePattern":)"));
+
+    // Without prevouts, or with a list that is not one for each input: neither.
+    for (auto const& wrong : {std::vector<spent_prevout>{}, std::vector<spent_prevout>{prevouts[0], prevouts[0]}}) {
+        auto const without = render_transaction_verbose(tx, regtest, flags, std::nullopt, wrong);
+        CHECK_FALSE(contains(without, R"("prevout":)"));
+        CHECK_FALSE(contains(without, R"("fee":)"));
+    }
+
+    // Outputs that would pay more than the input spends: the prevout, no fee.
+    std::vector<spent_prevout> const short_of{prevout_of(4'999'999'780u, pkh_script, 7, true)};
+    auto const overpaid = render_transaction_verbose(tx, regtest, flags, std::nullopt, short_of);
+    CHECK(contains(overpaid, R"("prevout":{"generated":true,"height":7,"value":49.9999978,)"));
+    CHECK_FALSE(contains(overpaid, R"("fee":)"));
+
+    // A coinbase spends nothing, whatever it is given.
+    auto const coinbase = parse_tx(
+        "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0b016f0101062f"
+        "41424c412fffffffff01dbf2052a010000001976a9146cafb31b9a10a61a992bf94af8db42bdb3a23b1488ac00000000");
+    auto const generated = render_transaction_verbose(coinbase, regtest, flags, std::nullopt, prevouts);
+    CHECK_FALSE(contains(generated, R"("prevout":)"));
+    CHECK_FALSE(contains(generated, R"("fee":)"));
+}
+
+TEST_CASE("render_transaction_verbose with patterns decodes the redeem script of a pay-to-script-hash spend",
+          "[rpc query][byte code pattern]") {
+    using domain::chain::input;
+    using domain::chain::output_point;
+    constexpr auto mainnet = domain::config::network::mainnet;
+    constexpr auto key_hash = "4423cfd20e8f5f10863ae31df5634620d36b0fc3";
+    constexpr auto sh32_script = "aa20000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f87";
+
+    // The redeem script pays a key hash; each scriptSig but one pushes it.
+    auto const redeem = script_of(pkh_script).bytes();
+    data_chunk pushes_redeem{uint8_t(redeem.size())};
+    pushes_redeem.insert(pushes_redeem.end(), redeem.begin(), redeem.end());
+    auto const funding = domain::chain::block::genesis_regtest().hash();
+    auto const unlock = [&](uint32_t index, data_chunk bytes) {
+        return input{output_point{funding, index}, domain::chain::script{std::move(bytes), false}, 0xffffffffu};
+    };
+    domain::chain::transaction const tx{2u, 0u,
+        input::list{unlock(0, pushes_redeem), unlock(1, pushes_redeem), unlock(2, data_chunk{0x4c}),
+                    unlock(3, pushes_redeem)},
+        domain::chain::output::list{domain::chain::output{1000u, script_of(pkh_script), domain::chain::token_data_opt{}}}};
+    // A 20-byte script hash, a 32-byte one, a 20-byte one again under a
+    // scriptSig that ends in the middle of a push, and a key hash.
+    std::vector<spent_prevout> const prevouts{prevout_of(2000u, sh_script, 3, false), prevout_of(2000u, sh32_script, 4, false),
+                                              prevout_of(2000u, sh_script, 5, false), prevout_of(2000u, pkh_script, 6, true)};
+
+    auto const json = render_transaction_verbose(tx, mainnet, flags, std::nullopt, prevouts, true);
+    auto const redeem_hex = encode_base16(redeem);
+    auto const redeem_pattern = std::string(R"("redeemScript":{"asm":")");
+    auto const redeem_tail = std::string(R"(","hex":")") + redeem_hex + R"(","byteCodePattern":{"fingerprint":")" +
+        fingerprint_of("76a95188ac") + R"(","pattern":"76a95188ac","patternAsm":")";
+
+    // The scriptSig's own pattern, one push, then its redeem script, with the
+    // kind of output it unlocks after its pattern's data.
+    CHECK(contains(json, std::string(R"("byteCodePattern":{"fingerprint":")") + fingerprint_of("51") +
+        R"(","pattern":"51","patternAsm":")"));
+    CHECK(contains(json, std::string(R"(","data":[")") + redeem_hex + R"("]},)" + redeem_pattern));
+    CHECK(count_of(json, redeem_tail) == 2);
+    CHECK(contains(json, std::string(R"(","data":[")") + key_hash +
+        R"("],"p2shType":"p2sh20"}}},"prevout":{"generated":false,"height":3,"value":0.00002,)"));
+    CHECK(contains(json, std::string(R"(","data":[")") + key_hash +
+        R"("],"p2shType":"p2sh32"}}},"prevout":{"generated":false,"height":4,"value":0.00002,)"));
+
+    // The spent scripts carry their patterns, after the one address they pay.
+    CHECK(contains(json, std::string(R"("type":"scripthash","address":"bitcoincash:ppzz8n7jp6847yyx8t33matrgcsdx6c0cvvwyry2nl",)")
+        + R"("byteCodePattern":{"fingerprint":")" + fingerprint_of("a95187") + R"(","pattern":"a95187","patternAsm":")"));
+    CHECK(contains(json, std::string(R"("type":"scripthash",)") +
+        R"("address":"bitcoincash:pvqqzqsrqszsvpcgpy9qkrqdpc83qygjzv2p29shrqv35xcur50p7h2c7ctj5",)" +
+        R"("byteCodePattern":{"fingerprint":")" + fingerprint_of("aa5187") + R"(","pattern":"aa5187","patternAsm":")"));
+    CHECK(contains(json, std::string(R"("type":"pubkeyhash","address":"bitcoincash:qpzz8n7jp6847yyx8t33matrgcsdx6c0cvmtevrfgz",)")
+        + R"("byteCodePattern":{"fingerprint":")" + fingerprint_of("76a95188ac") + R"(","pattern":"76a95188ac",)"));
+
+    // No redeem script from a scriptSig that cannot be read to its end, nor for
+    // an output that is not a script hash.
+    CHECK(contains(json, R"("error":true}},"prevout":{"generated":false,"height":5,)"));
+    CHECK(contains(json, std::string(R"(","data":[")") + redeem_hex +
+        R"("]}},"prevout":{"generated":true,"height":6,)"));
+    CHECK(count_of(json, R"("redeemScript":)") == 2);
+    CHECK(count_of(json, R"("p2shType":)") == 2);
+    // Four scriptSigs, two redeem scripts, four spent scripts and one output script.
+    CHECK(count_of(json, R"("byteCodePattern":)") == 11);
+
+    // Without prevouts the patterns stay, the redeem scripts do not.
+    auto const unknown = render_transaction_verbose(tx, mainnet, flags, std::nullopt, {}, true);
+    CHECK(count_of(unknown, R"("byteCodePattern":)") == 5);
+    CHECK_FALSE(contains(unknown, R"("redeemScript":)"));
+    CHECK_FALSE(contains(unknown, R"("prevout":)"));
+
+    // Without patterns, none of them.
+    auto const plain = render_transaction_verbose(tx, mainnet, flags, std::nullopt, prevouts);
+    CHECK_FALSE(contains(plain, R"("byteCodePattern":)"));
+    CHECK_FALSE(contains(plain, R"("redeemScript":)"));
+    CHECK(count_of(plain, R"("prevout":)") == 4);
+}
+
 TEST_CASE("render_transaction decodes a spend with its inputs and outputs", "[rpc query]") {
     auto const tx = parse_tx(
         "02000000013cd49214320f36fd78fd8ed5daf9c25c95d392fbfd9c5e3d1b2da4fa6f7927f0000000006441a51a5935eb9d2b"

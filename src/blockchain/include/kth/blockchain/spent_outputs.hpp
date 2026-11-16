@@ -23,23 +23,31 @@ namespace kth::blockchain {
 // block spent that existed before it. What follows reads them back in the
 // order of the block's inputs, and nothing is stored for it.
 
+// The output an undo entry stands for, and whether a coinbase created it.
+struct KB_API undo_output {
+    domain::chain::output output;
+    bool coinbase = false;
+};
+
 // Reads the output an undo entry stands for. In full mode the entry holds the
 // output; in reference mode it points at the transaction in the block files.
 using undo_output_reader = std::function<
-    std::expected<domain::chain::output, database::result_code>(database::spent_output const&)>;
+    std::expected<undo_output, database::result_code>(database::spent_output const&)>;
 
 // The output held by a full-mode undo entry: the stored UTXO entry opens with
-// the output in wire form.
+// the output in wire form and ends with the coinbase flag.
 [[nodiscard]]
 KB_API
-std::expected<domain::chain::output, database::result_code>
+std::expected<undo_output, database::result_code>
 output_of_stored_entry(std::span<uint8_t const> value);
 
 // The outputs a block spends, one for each input of each transaction after the
-// coinbase, in the order of the inputs, and the height each was created at.
+// coinbase, in the order of the inputs, the height each was created at, and
+// whether a coinbase created it.
 struct KB_API spent_output_list {
     std::vector<domain::chain::output> outputs;
     std::vector<uint32_t> heights;
+    std::vector<bool> coinbase;
 };
 
 // An undo record is not in the order of the inputs and does not cover every

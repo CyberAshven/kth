@@ -30,14 +30,21 @@ utxoz::raw_outpoint key_of(domain::chain::output_point const& point) {
 
 } // namespace
 
-std::expected<domain::chain::output, database::result_code>
+std::expected<undo_output, database::result_code>
 output_of_stored_entry(std::span<uint8_t const> value) {
+    // utxo_entry's layout: the output, its height and median time past (4
+    // bytes each, not needed here), then the coinbase flag. Read in place, so
+    // the output is not copied out of a whole entry.
     byte_reader reader(value);
     auto output = domain::chain::output::from_data(reader, true);
-    if ( ! output) {
+    if ( ! output || ! reader.skip(2 * sizeof(uint32_t))) {
         return std::unexpected(database::result_code::other);
     }
-    return std::move(*output);
+    auto const coinbase = reader.read_byte();
+    if ( ! coinbase) {
+        return std::unexpected(database::result_code::other);
+    }
+    return undo_output{std::move(*output), *coinbase != 0};
 }
 
 std::expected<spent_output_list, database::result_code>
@@ -52,6 +59,7 @@ spent_outputs_with_heights(domain::chain::block const& blk, uint32_t height,
     spent_output_list spent;
     spent.outputs.reserve(inputs);
     spent.heights.reserve(inputs);
+    spent.coinbase.reserve(inputs);
     if (inputs == 0) {
         return spent;
     }
@@ -71,12 +79,13 @@ spent_outputs_with_heights(domain::chain::block const& blk, uint32_t height,
         for (auto const& input : txs[i].inputs()) {
             auto const& point = input.previous_output();
             if (auto const it = recorded.find(key_of(point)); it != recorded.end()) {
-                auto output = read(*it->second);
-                if ( ! output) {
-                    return std::unexpected(output.error());
+                auto stored = read(*it->second);
+                if ( ! stored) {
+                    return std::unexpected(stored.error());
                 }
-                spent.outputs.push_back(std::move(*output));
+                spent.outputs.push_back(std::move(stored->output));
                 spent.heights.push_back(it->second->height);
+                spent.coinbase.push_back(stored->coinbase);
                 continue;
             }
             if ( ! created) {
@@ -91,6 +100,7 @@ spent_outputs_with_heights(domain::chain::block const& blk, uint32_t height,
             }
             spent.outputs.push_back(txs[it->second].outputs()[point.index()]);
             spent.heights.push_back(height);
+            spent.coinbase.push_back(txs[it->second].is_coinbase());
         }
     }
     return spent;

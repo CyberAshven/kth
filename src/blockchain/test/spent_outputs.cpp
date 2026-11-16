@@ -19,6 +19,7 @@ using namespace kth;
 namespace chain = kth::domain::chain;
 using blockchain::output_of_stored_entry;
 using blockchain::spent_outputs_with_heights;
+using blockchain::undo_output;
 using database::block_undo;
 using database::result_code;
 using database::spent_output;
@@ -74,12 +75,13 @@ utxoz::raw_outpoint key_of(hash_digest const& hash, uint32_t index) {
 }
 
 // The entry a full-mode undo record keeps for an output: the stored UTXO entry.
-spent_output recorded(hash_digest const& hash, uint32_t index, chain::output const& output, uint32_t height) {
-    auto const data = database::utxo_entry{output, height, 1293620000, false}.to_data();
+spent_output recorded(hash_digest const& hash, uint32_t index, chain::output const& output, uint32_t height,
+                      bool coinbase = false) {
+    auto const data = database::utxo_entry{output, height, 1293620000, coinbase}.to_data();
     return spent_output{key_of(hash, index), std::vector<uint8_t>(data.begin(), data.end()), height};
 }
 
-std::expected<chain::output, result_code> read_full(spent_output const& entry) {
+std::expected<undo_output, result_code> read_full(spent_output const& entry) {
     return output_of_stored_entry(entry.value);
 }
 
@@ -97,14 +99,22 @@ TEST_CASE("the output of a full-mode undo entry is read from the stored UTXO ent
 
     auto const plain_entry = recorded(leading_byte(1), 0, plain, 700000);
     auto const token_entry = recorded(leading_byte(1), 1, tokens, 700001);
+    auto const generated_entry = recorded(leading_byte(2), 0, plain, 700002, /*coinbase*/ true);
 
     auto const read_plain = output_of_stored_entry(plain_entry.value);
     REQUIRE(read_plain);
-    CHECK(*read_plain == plain);
+    CHECK(read_plain->output == plain);
+    CHECK_FALSE(read_plain->coinbase);
 
     auto const read_tokens = output_of_stored_entry(token_entry.value);
     REQUIRE(read_tokens);
-    CHECK(*read_tokens == tokens);
+    CHECK(read_tokens->output == tokens);
+
+    // The entry ends with whether a coinbase created the output.
+    auto const read_generated = output_of_stored_entry(generated_entry.value);
+    REQUIRE(read_generated);
+    CHECK(read_generated->output == plain);
+    CHECK(read_generated->coinbase);
 
     // Cut inside the script: not an output.
     auto const cut = std::span<uint8_t const>(plain_entry.value).first(12);
@@ -133,14 +143,16 @@ TEST_CASE("the spent outputs follow the inputs of the block, whatever the order 
     block_undo undo;
     undo.spent.push_back(recorded(funding, 2, third, 30));
     undo.spent.push_back(recorded(leading_byte(0x77), 0, unrelated, 5));
-    undo.spent.push_back(recorded(funding, 1, second, 20));
+    undo.spent.push_back(recorded(funding, 1, second, 20, /*coinbase*/ true));
     undo.spent.push_back(recorded(funding, 0, first, 10));
 
     auto const spent = spent_outputs_with_heights(block, block_height, undo, read_full);
     REQUIRE(spent);
     CHECK(spent->outputs == chain::output::list{first, second, third});
-    // The height each was created at is the one its entry holds, not the block's.
+    // The height each was created at is the one its entry holds, not the block's,
+    // and so is whether a coinbase created it.
     CHECK(spent->heights == std::vector<uint32_t>{10, 20, 30});
+    CHECK(spent->coinbase == std::vector<bool>{false, true, false});
 }
 
 TEST_CASE("an output created and spent in the same block is taken from the block", "[spent_outputs]") {
@@ -163,8 +175,10 @@ TEST_CASE("an output created and spent in the same block is taken from the block
             undo, read_full);
         REQUIRE(spent);
         CHECK(spent->outputs == chain::output::list{old, creator.outputs()[1]});
-        // The one the block created itself was created at the block's height.
+        // The one the block created itself was created at the block's height,
+        // by a transaction that is not its coinbase.
         CHECK(spent->heights == std::vector<uint32_t>{10, block_height});
+        CHECK(spent->coinbase == std::vector<bool>{false, false});
     }
 
     SECTION("the creating transaction stands after the one that spends its output") {
@@ -225,7 +239,7 @@ TEST_CASE("an entry that cannot be read fails the whole block", "[spent_outputs]
 
     size_t reads = 0;
     auto const spent = spent_outputs_with_heights(block_of({coinbase_tx(), tx}), block_height, undo,
-        [&](spent_output const& entry) -> std::expected<chain::output, result_code> {
+        [&](spent_output const& entry) -> std::expected<undo_output, result_code> {
             ++reads;
             if (entry.height == 11) {
                 return std::unexpected(result_code::db_corrupt);
@@ -244,12 +258,13 @@ TEST_CASE("a block of one transaction spends nothing and reads no entry", "[spen
 
     size_t reads = 0;
     auto const spent = spent_outputs_with_heights(block_of({coinbase_tx()}), block_height, undo,
-        [&](spent_output const&) -> std::expected<chain::output, result_code> {
+        [&](spent_output const&) -> std::expected<undo_output, result_code> {
             ++reads;
             return std::unexpected(result_code::other);
         });
     REQUIRE(spent);
     CHECK(spent->outputs.empty());
     CHECK(spent->heights.empty());
+    CHECK(spent->coinbase.empty());
     CHECK(reads == 0);
 }

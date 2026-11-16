@@ -3006,8 +3006,8 @@ block_chain::fetch_block(hash_digest const& hash) const {
 
 namespace {
 
-// The output an undo entry stands for.
-std::expected<domain::chain::output, result_code>
+// The output an undo entry stands for, and whether a coinbase created it.
+std::expected<undo_output, result_code>
 read_undo_output(block_store const& store, spent_output const& entry) {
 #ifdef KTH_UTXOZ_REFERENCE_MODE
     // The entry is {file_number(4 LE), tx_offset(4 LE)}: where the transaction
@@ -3033,7 +3033,7 @@ read_undo_output(block_store const& store, spent_output const& entry) {
     if (index >= tx->outputs().size()) {
         return std::unexpected(result_code::other);
     }
-    return tx->outputs()[index];
+    return undo_output{tx->outputs()[index], tx->is_coinbase()};
 #else
     (void)store;
     return output_of_stored_entry(entry.value);

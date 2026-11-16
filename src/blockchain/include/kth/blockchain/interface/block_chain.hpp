@@ -1016,8 +1016,9 @@ struct KB_API block_chain {
 
     // The outputs `block`, the stored block `hash`, spends: one for each input
     // of each transaction after the coinbase, in the order of the inputs, each
-    // with the height it was created at. They are read from the undo record
-    // written when the block was connected; nothing is stored for this.
+    // with the height it was created at and whether a coinbase created it.
+    // They are read from the undo record written when the block was connected;
+    // nothing is stored for this.
     //
     // not_found when the node has no such record for a block that spends
     // outputs: the blocks at or below the highest checkpoint are connected

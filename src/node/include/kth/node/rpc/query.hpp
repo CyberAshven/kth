@@ -142,13 +142,30 @@ struct transaction_location {
     std::optional<int64_t> confirmations_ticks = std::nullopt;
 };
 
+// An output a transaction spends, for getrawtransaction with verbosity 2: the
+// height it was created at, and whether a coinbase created it.
+struct spent_prevout {
+    domain::chain::output output;
+    size_t height;
+    bool coinbase;
+};
+
 // The verbose getrawtransaction object: the decoderawtransaction fields, `hex`,
 // and for a transaction read from a block its `blockhash`, `confirmations`,
 // `time`, `blocktime` and `in_active_chain`. A block off the connected chain
 // gives `confirmations` 0, no times and `in_active_chain` false.
+//
+// `prevouts`, when it holds the output each input spends, in the order of the
+// inputs, gives each input a `prevout` object before its `sequence`, and the
+// transaction its `fee`, in BCH, between its outputs and its `hex`. Otherwise,
+// and for a coinbase, neither is there. With `patterns`, every script carries
+// its byteCodePattern object, and an input that spends a pay-to-script-hash
+// output its `redeemScript`, when its prevout is known.
 std::string render_transaction_verbose(domain::chain::transaction const& tx,
                                        domain::config::network net, domain::script_flags_t flags,
-                                       std::optional<transaction_location> const& location);
+                                       std::optional<transaction_location> const& location,
+                                       std::span<spent_prevout const> prevouts = {},
+                                       bool patterns = false);
 
 // What getblock reports about a block beyond the block itself.
 struct block_location {
