@@ -155,7 +155,8 @@ struct jd_client::attempt {
             upstream.user_identity, upstream.mode == "full-template", jd_sends_worker_names(upstream))
         , declaration_session(jd_peer::declaration, declaration_at.host, declaration_at.port,
             upstream.user_identity, upstream.mode == "full-template")
-        , jobs(upstream.user_identity, upstream.mode == "full-template")
+        , jobs(upstream.user_identity, upstream.mode == "full-template",
+            data_chunk(settings.coinbase_tag.begin(), settings.coinbase_tag.end()))
         , health(settings.jd)
         , declaration_wake(executor)
         , hash_rate_wake(executor)
