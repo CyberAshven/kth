@@ -22,6 +22,9 @@
 
 #if ! defined(__EMSCRIPTEN__)
 #include <kth/network.hpp>
+#if ! defined(__EMSCRIPTEN__)
+#include <kth/node/wallet/electrum.hpp>
+#endif
 #endif
 
 #include <kth/infrastructure/config/authority.hpp>
@@ -308,8 +311,12 @@ void add_settings(CLI::App& app, configuration& cfg) {
     app.add_option("--node.ds_proofs",                      cfg.node.ds_proofs_enabled);
 #if ! defined(__EMSCRIPTEN__)
     app.add_option("--node.wallet_electrum",                cfg.node.wallet_electrum,
-        "ADDRESS:PORT of a local Electrum listener answering from this node's own chain, "
-        "for wallets that do not speak P2P (off by default).");
+        "LOOPBACK:PORT of a local Electrum listener answering this machine's wallets from this node's own "
+        "chain, for wallets that do not speak P2P (off by default). Only loopback addresses (127.0.0.0/8, "
+        "[::1]) are accepted: the node must not learn what other people's wallets watch.")
+        ->check(CLI::Validator([](std::string& value) -> std::string {
+            return node::wallet::electrum_bind_refusal(value).value_or(std::string{});
+        }, "LOOPBACK:PORT"));
 #endif
     add_enum_option(app, "--node.display",
         cfg.node.display, parse_display_mode,

@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -17,7 +18,9 @@
 #include <kth/domain/chain/golomb_set.hpp>
 #include <kth/domain/chain/input_prefix_filter.hpp>
 #include <kth/domain/chain/script_filter_builder.hpp>
+#include <kth/node/parser.hpp>
 #include <kth/node/wallet/blocks.hpp>
+#include <kth/node/wallet/electrum.hpp>
 #include <kth/node/wallet/filter_store.hpp>
 #include <kth/node/wallet/history.hpp>
 #include <kth/node/wallet/scan.hpp>
@@ -626,4 +629,36 @@ TEST_CASE("wallet block check against its input prefix filter, and the inputs of
     auto const matched = wallet::prefix_inputs(wide, last, 16);
     REQUIRE(std::ranges::find(matched, 30u) == matched.end());
     REQUIRE(wallet::prefix_inputs(wide, 0, 0).size() == 30u);
+}
+
+// The node's own wallet listener
+// ----------------------------------------------------------------------------
+
+TEST_CASE("wallet listener of the node accepts loopback addresses only", "[wallet]") {
+    for (auto const* accepted : {"127.0.0.1:50001", "127.5.6.7:0", "[::1]:50001"}) {
+        CAPTURE(accepted);
+        REQUIRE( ! node::wallet::electrum_bind_refusal(accepted));
+    }
+    for (auto const* refused : {"0.0.0.0:50001", "192.168.1.10:50001", "10.0.0.1:1", "[::]:50001",
+                                "[2001:db8::1]:50001", "localhost:50001", "127.0.0.1", "127.0.0.1:", "127.0.0.1:65536",
+                                "127.0.0.1:port"}) {
+        CAPTURE(refused);
+        REQUIRE(node::wallet::electrum_bind_refusal(refused));
+    }
+    REQUIRE(node::wallet::electrum_bind_refusal("0.0.0.0:50001")->find("loopback") != std::string::npos);
+
+    // The option refuses the same at startup.
+    auto const parse = [](std::string const& value) {
+        node::parser parser(domain::config::network::regtest);
+        std::vector<std::string> args{"kth", "--network", "regtest", "--node.wallet_electrum", value};
+        std::vector<char const*> argv;
+        for (auto const& arg : args) argv.push_back(arg.c_str());
+        std::ostringstream error;
+        auto const ok = parser.parse(int(argv.size()), argv.data(), error);
+        return std::pair{ok, parser.configured.node.wallet_electrum};
+    };
+    REQUIRE(parse("127.0.0.1:50001") == std::pair{true, std::string("127.0.0.1:50001")});
+    REQUIRE(parse("[::1]:50001").first);
+    REQUIRE( ! parse("0.0.0.0:50001").first);
+    REQUIRE( ! parse("192.168.0.160:50001").first);
 }

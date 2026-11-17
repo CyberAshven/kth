@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -26,6 +27,15 @@ namespace kth::node::wallet {
 // same process. It listens on the loopback address unless the embedding
 // application binds it elsewhere on purpose; the node itself serves no
 // Electrum to the network, and a wallet that can should talk P2P instead.
+/// Why `bind` cannot be where the node's own wallet listener listens, or
+/// none. It must be ADDRESS:PORT ([ADDRESS]:PORT for IPv6) with a loopback
+/// address (127.0.0.0/8 or ::1): the listener is for the node owner's wallets
+/// on the same machine. A node answering Electrum on any other address would
+/// be a server that learns what other people's wallets watch.
+[[nodiscard]]
+KND_API
+std::optional<std::string> electrum_bind_refusal(std::string const& bind);
+
 class KND_API electrum_server {
 public:
     electrum_server(service& wallet, domain::config::network network);

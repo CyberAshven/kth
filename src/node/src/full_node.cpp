@@ -124,6 +124,16 @@ full_node::~full_node() {
     }
 #endif
 
+#if ! defined(__EMSCRIPTEN__)
+    // The node's own wallet listener answers only wallets on this machine.
+    if ( ! node_settings_.wallet_electrum.empty()) {
+        if (auto const refusal = wallet::electrum_bind_refusal(node_settings_.wallet_electrum)) {
+            spdlog::error("[node] node.wallet_electrum is refused: {}", *refusal);
+            co_return error::operation_failed;
+        }
+    }
+#endif
+
     // Start the blockchain (pass disk magic for block file storage)
     if (!chain_.start(get_disk_magic(network_type_))) {
         spdlog::error("[node] Failure starting blockchain.");
@@ -356,13 +366,10 @@ full_node::~full_node() {
 // executor; nothing of it is reachable unless node.wallet_electrum names it.
 void full_node::start_wallet() {
     auto const& bind = node_settings_.wallet_electrum;
-    if (bind.empty()) return;
+    if (bind.empty() || wallet::electrum_bind_refusal(bind)) return;
     auto const colon = bind.rfind(':');
-    if (colon == std::string::npos) {
-        spdlog::error("[node] node.wallet_electrum is not ADDRESS:PORT: {}", bind);
-        return;
-    }
-    auto const address = bind.substr(0, colon);
+    auto address = bind.substr(0, colon);
+    if (address.size() >= 2 && address.front() == '[' && address.back() == ']') address = address.substr(1, address.size() - 2);
     auto const port = uint16_t(std::strtoul(bind.substr(colon + 1).c_str(), nullptr, 10));
     wallet_ = wallet::service::from_chain(chain_, network_type_);
     wallet_electrum_ = std::make_unique<wallet::electrum_server>(*wallet_, network_type_);
