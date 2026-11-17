@@ -153,6 +153,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     src/wallet/electrum.cpp
     src/wallet/filter_store.cpp
     src/wallet/history.cpp
+    src/wallet/peer_source.cpp
     src/wallet/scan.cpp
     src/wallet/service.cpp
     src/detail/local_admission_tasks.cpp
@@ -199,6 +200,7 @@ if(KTH_BROWSER_NODE)
     src/wallet/blocks.cpp
     src/wallet/filter_store.cpp
     src/wallet/history.cpp
+    src/wallet/peer_source.cpp
     src/wallet/scan.cpp
     src/wallet/service.cpp
   )
