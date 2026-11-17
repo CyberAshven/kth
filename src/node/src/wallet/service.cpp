@@ -1156,7 +1156,7 @@ struct peer_impl final : service::impl {
         for (auto height = start; height <= tip; ++height) heights.push_back(height);
         co_return co_await each_block(heights, [this](uint32_t height, block_ptr const& blk) -> std::error_code {
             if ( ! pool.remove_for_block(blk->transactions()).empty()) {
-                resolve_dsproofs();
+                resolve_dsproofs(true);
                 changes.bump();
             }
             std::vector<point> created;
@@ -1207,7 +1207,7 @@ struct peer_impl final : service::impl {
 
     void on_mempool_tx(domain::chain::transaction tx) {
         if (pool.insert(std::move(tx), [this](point const& outpoint) { return known_value(outpoint); })) {
-            resolve_dsproofs();
+            resolve_dsproofs(false);
             changes.bump();
         }
     }
@@ -1244,10 +1244,10 @@ struct peer_impl final : service::impl {
 
     // Proofs follow the mempool: descendants that arrive later join, proofs
     // whose transaction left it go.
-    void resolve_dsproofs() {
+    void resolve_dsproofs(bool drop_unknown) {
         for (auto it = dsproofs.begin(); it != dsproofs.end();) {
             describe(it->second);
-            if (it->second.txid == null_hash) {
+            if (drop_unknown && it->second.txid == null_hash) {
                 it = dsproofs.erase(it);
             } else {
                 ++it;

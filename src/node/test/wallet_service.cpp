@@ -112,6 +112,9 @@ struct served_chain {
     std::array<std::vector<data_chunk>, 3> filters;
     std::array<std::vector<hash_digest>, 3> hashes;
     std::array<std::vector<hash_digest>, 3> headers;
+    // Announced to every client after the handshake, and served on request.
+    std::vector<chain::transaction> pooled;
+    std::vector<message::double_spend_proof> proofs;
     uint32_t base_time = uint32_t(std::time(nullptr)) - 4000u * 600u;
 
     served_chain() {
@@ -244,6 +247,13 @@ struct test_peer {
         }
         ::asio::co_spawn(io, [peer]() -> ::asio::awaitable<void> { (void)co_await peer->run(); }, ::asio::detached);
         auto const version = peer->negotiated_version();
+        if ( ! chain.pooled.empty() || ! chain.proofs.empty()) {
+            message::inventory_vector::list items;
+            for (auto const& tx : chain.pooled) items.emplace_back(message::inventory_vector::type_id::transaction, tx.hash());
+            for (auto const& proof : chain.proofs) items.emplace_back(message::inventory_vector::type_id::double_spend_proof, proof.hash());
+            auto const announced = message::inventory::create(std::move(items));
+            if (announced) (void)co_await peer->send(*announced);
+        }
         for (;;) {
             auto received = co_await peer->receive(std::chrono::steady_clock::now() + 120s);
             if ( ! received) break;
@@ -306,6 +316,16 @@ struct test_peer {
                     auto const at = height_of(item.hash());
                     if (item.type() == message::inventory_vector::type_id::block && at) {
                         (void)co_await peer->send(message::block(chain.blocks[*at]));
+                    }
+                    if (item.type() == message::inventory_vector::type_id::transaction) {
+                        for (auto const& tx : chain.pooled) {
+                            if (tx.hash() == item.hash()) (void)co_await peer->send(message::transaction(tx));
+                        }
+                    }
+                    if (item.type() == message::inventory_vector::type_id::double_spend_proof) {
+                        for (auto const& proof : chain.proofs) {
+                            if (proof.hash() == item.hash()) (void)co_await peer->send(proof);
+                        }
                     }
                 }
             }
@@ -769,4 +789,76 @@ TEST_CASE("wallet from the node's own chain: direct parse and filters built on t
         "a script in none: direct %.3f s, filters %.3f s\n", length, direct_dense_seconds, filters_dense_seconds,
         direct_sparse_seconds, filters_sparse_seconds);
     std::fflush(stdout);
+}
+
+TEST_CASE("wallet double-spend proofs: the full node lists its own as the peer path lists those relayed", "[wallet][wallet_chain]") {
+    auto const flags = blockchain::settings(domain::config::network::regtest).enabled_flags();
+    auto const base_time = uint32_t(zulu_time()) - 140 * test::block_spacing;
+    std::vector<chain::block> blocks;
+    auto previous = chain::block::genesis_regtest().hash();
+    for (uint32_t height = 1; height <= 110; ++height) {
+        blocks.push_back(test::mine_block(previous, height, base_time + height * test::block_spacing, 9, {}, 0));
+        previous = blocks.back().hash();
+    }
+    test::chain_fixture fixture("wallet_dsproofs");
+    REQUIRE(fixture.created());
+    REQUIRE(fixture.start());
+    REQUIRE(fixture.organizer().add_headers(test::headers_of(blocks)).headers_added == blocks.size());
+    test::persist_headers(fixture, blocks, 1);
+    test::connect_bodies(fixture, blocks, 1);
+    auto& node_chain = fixture.chain();
+
+    // A mempool transaction spending block 1's coinbase, and a proof that the
+    // same output was spent twice.
+    auto const& coinbase = blocks.front().transactions().front();
+    auto const pending = test::spend_p2pkh(coinbase, 0, coinbase.outputs()[0].value() - 1000, flags);
+    auto const pooled = std::make_shared<message::transaction const>(pending);
+    auto submitted = ::asio::co_spawn(node_chain.executor(), [&node_chain, pooled]() -> ::asio::awaitable<code> {
+        co_return co_await node_chain.submit_transaction(pooled);
+    }, ::asio::use_future);
+    REQUIRE(submitted.get() == error::success);
+    message::double_spend_proof::spender first{};
+    first.out_sequence = 1;
+    first.push_data = data_chunk{0x01, 0x02};
+    message::double_spend_proof::spender second{};
+    second.out_sequence = 2;
+    second.push_data = data_chunk{0x03, 0x04};
+    auto const proof = std::make_shared<message::double_spend_proof const>(chain::output_point{coinbase.hash(), 0}, first, second);
+    auto organized = ::asio::co_spawn(node_chain.executor(), [&node_chain, proof]() -> ::asio::awaitable<code> {
+        co_return co_await node_chain.organize(proof);
+    }, ::asio::use_future);
+    REQUIRE(organized.get() == error::success);
+
+    auto own = wallet::service::from_chain(node_chain, domain::config::network::regtest);
+    auto const own_list = wait_for(*own, own->dsproof_transactions());
+    REQUIRE(own_list == std::vector<hash_digest>{pending.hash()});
+    auto const own_proof = wait_for(*own, own->dsproof(pending.hash()));
+    REQUIRE(own_proof);
+    REQUIRE(own_proof->dspid == proof->hash());
+    REQUIRE(own_proof->txid == pending.hash());
+    auto const by_hash = wait_for(*own, own->dsproof(proof->hash()));
+    REQUIRE(by_hash);
+
+    // The same chain, mempool transaction and proof, relayed by a peer.
+    served_chain served;
+    for (auto const& blk : blocks) served.append(blk);
+    served.pooled.push_back(pending);
+    served.proofs.push_back(*proof);
+    test_peer peer(served);
+    temporary_directory dir("dsproofs");
+    running_service running(settings_for(dir.path, {peer.endpoint()}));
+    auto& from_peers = *running.service;
+    REQUIRE(wait_for(from_peers, from_peers.wait_synced(30s)));
+    std::vector<hash_digest> peer_list;
+    auto const deadline = std::chrono::steady_clock::now() + 30s;
+    while (peer_list.empty() && std::chrono::steady_clock::now() < deadline) {
+        peer_list = wait_for(from_peers, from_peers.dsproof_transactions());
+        if (peer_list.empty()) std::this_thread::sleep_for(50ms);
+    }
+    REQUIRE(peer_list == own_list);
+    auto const peer_proof = wait_for(from_peers, from_peers.dsproof(pending.hash()));
+    REQUIRE(peer_proof);
+    REQUIRE(peer_proof->dspid == own_proof->dspid);
+    REQUIRE(peer_proof->raw == own_proof->raw);
+    REQUIRE(peer_proof->outpoint == own_proof->outpoint);
 }

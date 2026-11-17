@@ -1089,6 +1089,11 @@ struct KB_API block_chain {
     [[nodiscard]] awaitable_expected<double_spend_proof_const_ptr>
     fetch_ds_proof(hash_digest const& hash) const;
 
+    // Every double-spend proof the node holds, for a wallet of the node's own
+    // to list the mempool transactions they are about.
+    [[nodiscard]] awaitable_expected<std::vector<double_spend_proof_const_ptr>>
+    fetch_ds_proofs() const;
+
     // =========================================================================
     // MEMPOOL / TRANSACTION POOL
     // =========================================================================

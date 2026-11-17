@@ -3449,6 +3449,14 @@ block_chain::fetch_ds_proof(hash_digest const& hash) const {
     co_return co_await transaction_organizer_.fetch_ds_proof(hash);
 }
 
+awaitable_expected<std::vector<double_spend_proof_const_ptr>>
+block_chain::fetch_ds_proofs() const {
+    if (stopped()) {
+        co_return std::unexpected(error::service_stopped);
+    }
+    co_return co_await transaction_organizer_.fetch_ds_proofs();
+}
+
 // =============================================================================
 // MEMPOOL / TRANSACTION POOL
 // =============================================================================

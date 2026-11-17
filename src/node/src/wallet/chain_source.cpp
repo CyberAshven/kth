@@ -509,26 +509,59 @@ struct chain_impl final : service::impl {
         co_return std::optional<utxo>{result};
     }
 
-    ::asio::awaitable<std::optional<dsproof_info>> dsproof(hash_digest id) override {
-        auto const proof = co_await chain.fetch_ds_proof(id);
-        if ( ! proof || ! *proof) co_return std::nullopt;
-        data_chunk raw((*proof)->serialized_size(0));
-        byte_writer writer(raw);
-        if ( ! (*proof)->to_data(writer, 0)) co_return std::nullopt;
-        dsproof_info info{id, null_hash, std::move(raw),
-            point((*proof)->out_point().hash(), (*proof)->out_point().index()), {}};
-        co_await refresh_pool();
-        if (auto const spender = pool.spender(info.outpoint)) {
-            info.txid = *spender;
-            info.descendants.push_back(*spender);
+    // The mempool transaction a proof is about, and its descendants.
+    void describe(dsproof_info& info) const {
+        info.descendants.clear();
+        auto const spender = pool.spender(info.outpoint);
+        info.txid = spender.value_or(null_hash);
+        if ( ! spender) return;
+        std::vector<hash_digest> pending{*spender};
+        std::set<hash_digest> seen;
+        while ( ! pending.empty()) {
+            auto const txid = pending.back();
+            pending.pop_back();
+            if ( ! seen.insert(txid).second) continue;
+            info.descendants.push_back(txid);
+            auto const* entry = pool.find(txid);
+            if (entry == nullptr) continue;
+            for (uint32_t vout = 0; vout < entry->tx.outputs().size(); ++vout) {
+                if (auto const child = pool.spender(point(txid, vout))) pending.push_back(*child);
+            }
         }
-        co_return info;
     }
 
-    // The node keeps its proofs by their hash: the transactions they are
-    // about are not listed from here.
+    // The proofs the node holds that are about a transaction of its mempool.
+    ::asio::awaitable<std::vector<dsproof_info>> own_dsproofs() {
+        co_await refresh_pool();
+        std::vector<dsproof_info> out;
+        auto const proofs = co_await chain.fetch_ds_proofs();
+        if ( ! proofs) co_return out;
+        for (auto const& proof : *proofs) {
+            if ( ! proof) continue;
+            data_chunk raw(proof->serialized_size(0));
+            byte_writer writer(raw);
+            if ( ! proof->to_data(writer, 0)) continue;
+            dsproof_info info{proof->hash(), null_hash, std::move(raw),
+                point(proof->out_point().hash(), proof->out_point().index()), {}};
+            describe(info);
+            if (info.txid != null_hash) out.push_back(std::move(info));
+        }
+        co_return out;
+    }
+
+    ::asio::awaitable<std::optional<dsproof_info>> dsproof(hash_digest id) override {
+        auto proofs = co_await own_dsproofs();
+        for (auto& info : proofs) {
+            if (info.dspid == id || std::ranges::find(info.descendants, id) != info.descendants.end()) co_return std::move(info);
+        }
+        co_return std::nullopt;
+    }
+
     ::asio::awaitable<std::vector<hash_digest>> dsproof_transactions() override {
-        co_return std::vector<hash_digest>{};
+        std::set<hash_digest> all;
+        auto const proofs = co_await own_dsproofs();
+        for (auto const& info : proofs) all.insert(info.descendants.begin(), info.descendants.end());
+        co_return std::vector<hash_digest>(all.begin(), all.end());
     }
 
     ::asio::awaitable<uint64_t> changed(uint64_t seen, std::chrono::steady_clock::time_point deadline) override {
