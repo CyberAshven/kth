@@ -120,9 +120,15 @@ std::vector<wallet::filter_entry> chain_of_filters(std::vector<hash_digest> cons
     return entries;
 }
 
-data_chunk const p2pkh_a = chunk_of("76a914000102030405060708090a0b0c0d0e0f1011121388ac");
-data_chunk const p2pkh_b = chunk_of("76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac");
-data_chunk const p2sh_c = chunk_of("a914cccccccccccccccccccccccccccccccccccccccc87");
+// Static data: decoded without assertions, which belong to test cases.
+data_chunk decoded(std::string_view hex) {
+    auto bytes = decode_base16(hex);
+    return bytes ? std::move(*bytes) : data_chunk{};
+}
+
+data_chunk const p2pkh_a = decoded("76a914000102030405060708090a0b0c0d0e0f1011121388ac");
+data_chunk const p2pkh_b = decoded("76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac");
+data_chunk const p2sh_c = decoded("a914cccccccccccccccccccccccccccccccccccccccc87");
 
 } // namespace
 
