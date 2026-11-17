@@ -28,6 +28,10 @@
 #include <kth/node/define.hpp>
 #include <kth/node/wallet/history.hpp>
 
+namespace kth::blockchain {
+struct block_chain;
+} // namespace kth::blockchain
+
 namespace kth::node::wallet {
 
 // Wallet support in the node. One set of calls, answered from the node's own
@@ -169,8 +173,23 @@ struct peer_settings {
     std::string user_agent;
 };
 
+/// How a full node answers its wallet from its own chain.
+struct chain_settings {
+    /// The first height a target is read from when it is watched without one.
+    uint32_t birthday = 0;
+    /// Blocks read at once during a scan.
+    size_t parallel_reads = 8;
+    size_t mempool_bytes = size_t(256) << 20;
+};
+
 class KND_API service {
 public:
+    /// Answers from the node's own chain: its stored blocks, its chain state
+    /// and its mempool. Nothing is sent to any peer and nothing is stored.
+    [[nodiscard]]
+    static std::unique_ptr<service> from_chain(blockchain::block_chain& chain, domain::config::network network,
+        chain_settings settings = {});
+
     /// Answers from peers. operation_failed without peers or with an
     /// unreadable peer address; file_system when the folder or a store cannot
     /// be opened.

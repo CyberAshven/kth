@@ -149,6 +149,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
 
     # Wallet support: answers from the node's own chain, or from peers.
     src/wallet/blocks.cpp
+    src/wallet/chain_source.cpp
     src/wallet/electrum.cpp
     src/wallet/filter_store.cpp
     src/wallet/history.cpp
@@ -317,6 +318,7 @@ set(kth_headers
 
   # Wallet support.
   include/kth/node/wallet/blocks.hpp
+  include/kth/node/wallet/detail/service_impl.hpp
   include/kth/node/wallet/electrum.hpp
   include/kth/node/wallet/filter_store.hpp
   include/kth/node/wallet/history.hpp

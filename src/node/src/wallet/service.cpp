@@ -42,6 +42,7 @@
 #include <kth/network/protocols_coro.hpp>
 #include <kth/node/user_agent.hpp>
 #include <kth/node/wallet/blocks.hpp>
+#include <kth/node/wallet/detail/service_impl.hpp>
 #include <kth/node/wallet/filter_store.hpp>
 #include <kth/node/wallet/scan.hpp>
 
@@ -197,11 +198,102 @@ std::optional<domain::chain::transaction> transaction_in(domain::chain::block co
 
 } // namespace
 
+
+namespace detail {
+
+namespace {
+
+unconfirmed_tx new_entry(mempool_tx const& entry, mempool_copy const& pool) {
+    return unconfirmed_tx{entry.txid, pool.has_unconfirmed_parent(entry.tx), entry.fee, {}, {}};
+}
+
+} // namespace
+
+std::vector<unconfirmed_tx> unconfirmed_of(target_state const& state, mempool_copy const& pool) {
+    std::map<point, std::pair<uint64_t, domain::chain::token_data_opt>> owned;
+    std::map<hash_digest, unconfirmed_tx> entries;
+    for (auto const& [txid, entry] : pool.transactions()) {
+        auto const& outputs = entry.tx.outputs();
+        for (uint32_t vout = 0; vout < outputs.size(); ++vout) {
+            if ( ! state.watched().owns(outputs[vout])) continue;
+            owned.insert_or_assign(point(txid, vout), std::pair{outputs[vout].value(), outputs[vout].token_data()});
+            auto [found, inserted] = entries.try_emplace(txid, new_entry(entry, pool));
+            (void)inserted;
+            found->second.outputs.push_back(received{vout, outputs[vout].value(), outputs[vout].token_data(), outputs[vout].script().bytes()});
+        }
+    }
+    for (auto const& [txid, entry] : pool.transactions()) {
+        auto const& inputs = entry.tx.inputs();
+        for (uint32_t vin = 0; vin < inputs.size(); ++vin) {
+            point const outpoint(inputs[vin].previous_output().hash(), inputs[vin].previous_output().index());
+            std::optional<std::pair<uint64_t, domain::chain::token_data_opt>> coin_of;
+            if (auto const confirmed = state.coins().find(outpoint); confirmed != state.coins().end()) {
+                coin_of = std::pair{confirmed->second.value, confirmed->second.token};
+            } else if (auto const pending = owned.find(outpoint); pending != owned.end()) {
+                coin_of = pending->second;
+            }
+            if ( ! coin_of) continue;
+            auto [found, inserted] = entries.try_emplace(txid, new_entry(entry, pool));
+            (void)inserted;
+            found->second.inputs.push_back(spent{vin, outpoint, coin_of->first, coin_of->second});
+        }
+    }
+    std::vector<unconfirmed_tx> out;
+    for (auto& [txid, entry] : entries) out.push_back(std::move(entry));
+    std::ranges::sort(out, [](unconfirmed_tx const& a, unconfirmed_tx const& b) {
+        if (a.unconfirmed_parent != b.unconfirmed_parent) return ! a.unconfirmed_parent;
+        return encode_hash(a.txid) < encode_hash(b.txid);
+    });
+    return out;
+}
+
+balance balance_of(target_state const& state, mempool_copy const& pool, token_filter tokens) {
+    balance result{0, 0};
+    for (auto const& owned : state.unspent()) {
+        if (keeps(tokens, owned.token)) result.confirmed += owned.value;
+    }
+    for (auto const& entry : unconfirmed_of(state, pool)) {
+        for (auto const& out : entry.outputs) {
+            if (keeps(tokens, out.token)) result.unconfirmed += int64_t(out.value);
+        }
+        for (auto const& in : entry.inputs) {
+            if (keeps(tokens, in.token)) result.unconfirmed -= int64_t(in.value);
+        }
+    }
+    return result;
+}
+
+std::vector<utxo> unspent_of(target_state const& state, mempool_copy const& pool, token_filter tokens) {
+    std::vector<utxo> out;
+    for (auto const& owned : state.unspent()) {
+        if (keeps(tokens, owned.token) && ! pool.spender(owned.outpoint)) {
+            out.push_back(utxo{owned.outpoint, owned.value, owned.token, owned.script, owned.height});
+        }
+    }
+    for (auto const& entry : unconfirmed_of(state, pool)) {
+        for (auto const& received_output : entry.outputs) {
+            point const outpoint(entry.txid, received_output.vout);
+            if (keeps(tokens, received_output.token) && ! pool.spender(outpoint)) {
+                out.push_back(utxo{outpoint, received_output.value, received_output.token, received_output.script, std::nullopt});
+            }
+        }
+    }
+    return out;
+}
+
+domain::chain::block genesis_of(domain::config::network network) {
+    return genesis_block(network);
+}
+
+} // namespace detail
+
+namespace {
+
 // ============================================================================
 // The peer path: headers and filters from peers, blocks where they match.
 // ============================================================================
 
-struct service::impl {
+struct peer_impl final : service::impl {
     peer_settings settings;
     network::settings transport;
     std::filesystem::path folder;
@@ -322,7 +414,7 @@ struct service::impl {
         thread = std::thread([this] { io->run(); });
     }
 
-    ::asio::any_io_executor executor() const { return io->get_executor(); }
+    ::asio::any_io_executor executor() const override { return io->get_executor(); }
 
     void ring() { (void)wake.try_send(0); }
 
@@ -423,7 +515,7 @@ struct service::impl {
         snapshot = std::move(next);
     }
 
-    status current() const {
+    status current() const override {
         std::lock_guard<std::mutex> guard(status_mutex);
         return snapshot;
     }
@@ -900,6 +992,8 @@ struct service::impl {
     }
 
     ::asio::awaitable<std::expected<block_ptr, std::error_code>> fetch_block(uint32_t height) {
+        // Peers serve no body for the genesis block; it is known.
+        if (height == 0) co_return std::make_shared<domain::chain::block const>(genesis_block(settings.network));
         auto const hash = hash_at(height);
         if ( ! hash) co_return std::unexpected(error::not_found);
         if (auto const cached = cache.find(*hash); cached != cache.end()) co_return cached->second;
@@ -1068,46 +1162,8 @@ struct service::impl {
         (void)pool.insert(std::move(tx), [this](point const& outpoint) { return known_value(outpoint); });
     }
 
-    unconfirmed_tx new_entry(mempool_tx const& entry) const {
-        return unconfirmed_tx{entry.txid, pool.has_unconfirmed_parent(entry.tx), entry.fee, {}, {}};
-    }
-
     std::vector<unconfirmed_tx> unconfirmed_of(target_state const& state) const {
-        std::map<point, std::pair<uint64_t, domain::chain::token_data_opt>> owned;
-        std::map<hash_digest, unconfirmed_tx> entries;
-        for (auto const& [txid, entry] : pool.transactions()) {
-            auto const& outputs = entry.tx.outputs();
-            for (uint32_t vout = 0; vout < outputs.size(); ++vout) {
-                if ( ! state.watched().owns(outputs[vout])) continue;
-                owned.insert_or_assign(point(txid, vout), std::pair{outputs[vout].value(), outputs[vout].token_data()});
-                auto [found, inserted] = entries.try_emplace(txid, new_entry(entry));
-                (void)inserted;
-                found->second.outputs.push_back(received{vout, outputs[vout].value(), outputs[vout].token_data(), outputs[vout].script().bytes()});
-            }
-        }
-        for (auto const& [txid, entry] : pool.transactions()) {
-            auto const& inputs = entry.tx.inputs();
-            for (uint32_t vin = 0; vin < inputs.size(); ++vin) {
-                point const outpoint(inputs[vin].previous_output().hash(), inputs[vin].previous_output().index());
-                std::optional<std::pair<uint64_t, domain::chain::token_data_opt>> coin_of;
-                if (auto const confirmed = state.coins().find(outpoint); confirmed != state.coins().end()) {
-                    coin_of = std::pair{confirmed->second.value, confirmed->second.token};
-                } else if (auto const pending = owned.find(outpoint); pending != owned.end()) {
-                    coin_of = pending->second;
-                }
-                if ( ! coin_of) continue;
-                auto [found, inserted] = entries.try_emplace(txid, new_entry(entry));
-                (void)inserted;
-                found->second.inputs.push_back(spent{vin, outpoint, coin_of->first, coin_of->second});
-            }
-        }
-        std::vector<unconfirmed_tx> out;
-        for (auto& [txid, entry] : entries) out.push_back(std::move(entry));
-        std::ranges::sort(out, [](unconfirmed_tx const& a, unconfirmed_tx const& b) {
-            if (a.unconfirmed_parent != b.unconfirmed_parent) return ! a.unconfirmed_parent;
-            return encode_hash(a.txid) < encode_hash(b.txid);
-        });
-        return out;
+        return detail::unconfirmed_of(state, pool);
     }
 
     // ------------------------------------------------------------------------
@@ -1193,7 +1249,7 @@ struct service::impl {
     // ------------------------------------------------------------------------
     // The loop that keeps everything current.
 
-    ::asio::awaitable<std::error_code> run() {
+    ::asio::awaitable<std::error_code> run() override {
         std::error_code result;
         while ( ! stopping) {
             co_await keep_peers();
@@ -1257,7 +1313,7 @@ struct service::impl {
         return found->second;
     }
 
-    ::asio::awaitable<std::error_code> watch(std::vector<target> watched, uint32_t birthday) {
+    ::asio::awaitable<std::error_code> watch(std::vector<target> watched, uint32_t birthday) override {
         for (auto const& one : watched) (void)watch_one(one, birthday);
         co_return co_await catch_up();
     }
@@ -1270,48 +1326,22 @@ struct service::impl {
         co_return &found->second;
     }
 
-    ::asio::awaitable<std::expected<target_history, std::error_code>> history(target watched) {
+    ::asio::awaitable<std::expected<target_history, std::error_code>> history(target watched) override {
         auto const state = co_await ready(watched);
         if ( ! state) co_return std::unexpected(state.error());
         co_return target_history{(*state)->synced(), (*state)->history(), unconfirmed_of(**state)};
     }
 
-    ::asio::awaitable<std::expected<balance, std::error_code>> get_balance(target watched, token_filter tokens) {
+    ::asio::awaitable<std::expected<balance, std::error_code>> get_balance(target watched, token_filter tokens) override {
         auto const state = co_await ready(watched);
         if ( ! state) co_return std::unexpected(state.error());
-        balance result{0, 0};
-        for (auto const& owned : (*state)->unspent()) {
-            if (keeps(tokens, owned.token)) result.confirmed += owned.value;
-        }
-        for (auto const& entry : unconfirmed_of(**state)) {
-            for (auto const& out : entry.outputs) {
-                if (keeps(tokens, out.token)) result.unconfirmed += int64_t(out.value);
-            }
-            for (auto const& in : entry.inputs) {
-                if (keeps(tokens, in.token)) result.unconfirmed -= int64_t(in.value);
-            }
-        }
-        co_return result;
+        co_return detail::balance_of(**state, pool, tokens);
     }
 
-    ::asio::awaitable<std::expected<std::vector<utxo>, std::error_code>> unspent(target watched, token_filter tokens) {
+    ::asio::awaitable<std::expected<std::vector<utxo>, std::error_code>> unspent(target watched, token_filter tokens) override {
         auto const state = co_await ready(watched);
         if ( ! state) co_return std::unexpected(state.error());
-        std::vector<utxo> out;
-        for (auto const& owned : (*state)->unspent()) {
-            if (keeps(tokens, owned.token) && ! pool.spender(owned.outpoint)) {
-                out.push_back(utxo{owned.outpoint, owned.value, owned.token, owned.script, owned.height});
-            }
-        }
-        for (auto const& entry : unconfirmed_of(**state)) {
-            for (auto const& received_output : entry.outputs) {
-                point const outpoint(entry.txid, received_output.vout);
-                if (keeps(tokens, received_output.token) && ! pool.spender(outpoint)) {
-                    out.push_back(utxo{outpoint, received_output.value, received_output.token, received_output.script, std::nullopt});
-                }
-            }
-        }
-        co_return out;
+        co_return detail::unspent_of(**state, pool, tokens);
     }
 
     // The block that holds `txid`, and its height and position.
@@ -1352,14 +1382,14 @@ struct service::impl {
         co_return std::unexpected(error::not_found);
     }
 
-    ::asio::awaitable<std::expected<transaction_info, std::error_code>> transaction(hash_digest txid, std::optional<uint32_t> hint) {
+    ::asio::awaitable<std::expected<transaction_info, std::error_code>> transaction(hash_digest txid, std::optional<uint32_t> hint) override {
         if (auto const pending = pool.find(txid)) co_return transaction_info{pending->tx, std::nullopt};
         auto found = co_await locate(txid, hint);
         if ( ! found) co_return std::unexpected(found.error());
         co_return transaction_info{std::move(found->tx), confirmation{found->height, found->blk->hash(), found->position}};
     }
 
-    ::asio::awaitable<std::expected<merkle_proof, std::error_code>> merkle(hash_digest txid, std::optional<uint32_t> hint) {
+    ::asio::awaitable<std::expected<merkle_proof, std::error_code>> merkle(hash_digest txid, std::optional<uint32_t> hint) override {
         auto found = co_await locate(txid, hint);
         if ( ! found) co_return std::unexpected(found.error());
         co_return merkle_proof{txid, confirmation{found->height, found->blk->hash(), found->position},
@@ -1367,7 +1397,7 @@ struct service::impl {
     }
 
     ::asio::awaitable<std::expected<std::pair<domain::chain::transaction, merkle_proof>, std::error_code>>
-    transaction_at(uint32_t height, uint32_t position) {
+    transaction_at(uint32_t height, uint32_t position) override {
         auto const blk = co_await fetch_block(height);
         if ( ! blk) co_return std::unexpected(blk.error());
         auto const& txs = (*blk)->transactions();
@@ -1378,7 +1408,7 @@ struct service::impl {
     }
 
     ::asio::awaitable<std::expected<std::vector<rpa_match>, std::error_code>>
-    rpa_history(uint16_t prefix, uint8_t bits, uint32_t from, std::optional<uint32_t> to) {
+    rpa_history(uint16_t prefix, uint8_t bits, uint32_t from, std::optional<uint32_t> to) override {
         if (bits > 16 || (bits < 16 && (uint32_t(prefix) >> bits) != 0)) co_return std::unexpected(error::operation_failed);
         if ( ! prefixes || ! prefixes->tip()) co_return std::unexpected(error::not_implemented);
         auto const last = std::min(to.value_or(*prefixes->tip()), *prefixes->tip());
@@ -1408,7 +1438,7 @@ struct service::impl {
         co_return out;
     }
 
-    std::vector<rpa_match> rpa_mempool(uint16_t prefix, uint8_t bits) const {
+    std::vector<rpa_match> rpa_mempool(uint16_t prefix, uint8_t bits) const override {
         std::vector<rpa_match> out;
         for (auto const& [txid, entry] : pool.transactions()) {
             auto inputs = prefix_inputs(entry.tx, prefix, bits);
@@ -1420,7 +1450,7 @@ struct service::impl {
     // Sends the transaction to one peer (over a connection of its own when
     // downloads are isolated) and waits: a reject fails it, another peer
     // announcing it proves it was accepted and relayed.
-    ::asio::awaitable<std::expected<hash_digest, std::error_code>> broadcast(domain::chain::transaction tx) {
+    ::asio::awaitable<std::expected<hash_digest, std::error_code>> broadcast(domain::chain::transaction tx) override {
         auto const txid = tx.hash();
         std::shared_ptr<peer_link> link;
         if (settings.isolate_downloads && ! endpoints.empty()) {
@@ -1471,7 +1501,7 @@ struct service::impl {
         co_return txid;
     }
 
-    fee_estimate fees() const {
+    fee_estimate fees() const override {
         uint64_t relay = default_relay_fee;
         if ( ! fee_filters.empty()) {
             relay = 0;
@@ -1487,7 +1517,7 @@ struct service::impl {
         return fee_estimate{relay, std::max(median, relay)};
     }
 
-    mempool_summary mempool() const {
+    mempool_summary mempool() const override {
         mempool_summary out{pool.size(), pool.bytes(), {}};
         for (auto const& [txid, entry] : pool.transactions()) {
             if (entry.fee) out.fee_rates.emplace_back(double(*entry.fee) / double(std::max<size_t>(1, entry.size)), entry.size);
@@ -1495,11 +1525,30 @@ struct service::impl {
         return out;
     }
 
+    void request_stop() override {
+        stopping = true;
+        ::asio::post(*io, [this] { shutdown(); });
+    }
+
+    bool stopped() const override {
+        return stopping;
+    }
+
+    bool unwatch(target const& watched) override {
+        return targets.erase(watched.key()) != 0;
+    }
+
+    ::asio::awaitable<std::optional<domain::chain::header>> header_at(uint32_t height) override {
+        co_return header(height);
+    }
+
     std::optional<domain::chain::header> header(uint32_t height) const {
         if (height > header_tip()) return std::nullopt;
         return index.get_header(index.active_at(int32_t(height)));
     }
 };
+
+} // namespace
 
 // ============================================================================
 // service
@@ -1514,7 +1563,7 @@ std::expected<std::unique_ptr<service>, std::error_code> service::from_peers(pee
     std::filesystem::create_directories(folder, ec);
     if (ec) return std::unexpected(error::file_system);
 
-    auto state = std::make_unique<impl>(std::move(settings), capacity);
+    auto state = std::make_unique<peer_impl>(std::move(settings), capacity);
     state->folder = folder;
     state->header_file = folder / "headers.dat";
     state->restore();
@@ -1533,7 +1582,12 @@ std::expected<std::unique_ptr<service>, std::error_code> service::from_peers(pee
     }
     state->update_status();
     state->start_thread();
-    return std::unique_ptr<service>(new service(std::move(state)));
+    return std::unique_ptr<service>(new service(std::unique_ptr<impl>(std::move(state))));
+}
+
+std::unique_ptr<service> service::from_chain(blockchain::block_chain& chain, domain::config::network network,
+        chain_settings settings) {
+    return std::unique_ptr<service>(new service(detail::make_chain_impl(chain, network, settings)));
 }
 
 service::service(std::unique_ptr<impl> state) : impl_(std::move(state)) {}
@@ -1549,8 +1603,7 @@ service::~service() = default;
 }
 
 void service::stop() {
-    impl_->stopping = true;
-    ::asio::post(*impl_->io, [state = impl_.get()] { state->shutdown(); });
+    impl_->request_stop();
 }
 
 status service::current() const {
@@ -1562,7 +1615,7 @@ status service::current() const {
     for (;;) {
         auto const now = impl_->current();
         if (now.synced) co_return now;
-        if (impl_->stopping) co_return std::unexpected(error::service_stopped);
+        if (impl_->stopped()) co_return std::unexpected(error::service_stopped);
         if (std::chrono::steady_clock::now() >= deadline) co_return std::unexpected(error::channel_timeout);
         co_await pause(100ms);
     }
@@ -1575,7 +1628,7 @@ status service::current() const {
 ::asio::awaitable<bool> service::unwatch(target watched) {
     auto* state = impl_.get();
     co_return co_await ::asio::co_spawn(impl_->executor(), [state, watched]() -> ::asio::awaitable<bool> {
-        co_return state->targets.erase(watched.key()) != 0;
+        co_return state->unwatch(watched);
     }, ::asio::use_awaitable);
 }
 
@@ -1637,7 +1690,7 @@ service::rpa_history(uint16_t prefix, uint8_t bits, uint32_t from, std::optional
 ::asio::awaitable<std::optional<domain::chain::header>> service::header(uint32_t height) {
     auto* state = impl_.get();
     co_return co_await ::asio::co_spawn(impl_->executor(), [state, height]() -> ::asio::awaitable<std::optional<domain::chain::header>> {
-        co_return state->header(height);
+        co_return co_await state->header_at(height);
     }, ::asio::use_awaitable);
 }
 

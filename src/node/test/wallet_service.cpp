@@ -42,6 +42,8 @@
 #include <kth/node/wallet/electrum.hpp>
 #include <kth/node/wallet/service.hpp>
 
+#include "sync_harness.hpp"
+#include "../../blockchain/test/reorg_chain_fixture.hpp"
 #include "../../blockchain/test/regtest_miner.hpp"
 
 using namespace kth;
@@ -145,15 +147,22 @@ struct served_chain {
     // Mines the next block with `txs` after its coinbase.
     void mine(std::vector<chain::transaction> txs) {
         auto const height = uint32_t(blocks.size());
+        append(test::mine_block(blocks.back().hash(), height, base_time + height * 600, height, std::move(txs), 0));
+    }
+
+    // A block made elsewhere; an output it spends that this chain did not
+    // make is taken for one of another script.
+    void append(chain::block blk) {
         std::vector<chain::output> spends;
-        for (auto const& tx : txs) {
-            for (auto const& in : tx.inputs()) {
+        auto const& txs = blk.transactions();
+        for (size_t at = 1; at < txs.size(); ++at) {
+            for (auto const& in : txs[at].inputs()) {
                 auto const found = created.find(chain::point(in.previous_output().hash(), in.previous_output().index()));
                 spends.push_back(found != created.end() ? found->second
                     : chain::output(1, script_of(other_script), chain::token_data_opt{}));
             }
         }
-        add(test::mine_block(blocks.back().hash(), height, base_time + height * 600, height, std::move(txs), 0), std::move(spends));
+        add(std::move(blk), std::move(spends));
     }
 
     // Replaces a block's served script filter: the filter header chain
@@ -582,4 +591,101 @@ TEST_CASE("wallet from peers: a birthday syncs only the filters after it, and pe
         REQUIRE(refused);
         REQUIRE( ! service.current().synced);
     }
+}
+
+TEST_CASE("wallet from the node's own chain answers as from peers", "[wallet][wallet_chain]") {
+    // Blocks 1 to 110 pay the miner's script; block 101 spends block 1's
+    // coinbase back to it, so that coinbase is fully spent.
+    auto const flags = blockchain::settings(domain::config::network::regtest).enabled_flags();
+    auto const base_time = uint32_t(zulu_time()) - 140 * test::block_spacing;
+    std::vector<chain::block> blocks;
+    auto previous = chain::block::genesis_regtest().hash();
+    std::optional<chain::transaction> spend;
+    for (uint32_t height = 1; height <= 110; ++height) {
+        std::vector<chain::transaction> txs;
+        uint64_t fees = 0;
+        if (height == 101) {
+            auto const& coinbase = blocks.front().transactions().front();
+            spend = test::spend_p2pkh(coinbase, 0, coinbase.outputs()[0].value() - 1000, flags);
+            txs.push_back(*spend);
+            fees = 1000;
+        }
+        blocks.push_back(test::mine_block(previous, height, base_time + height * test::block_spacing, 3, std::move(txs), fees));
+        previous = blocks.back().hash();
+    }
+    test::chain_fixture fixture("wallet_chain_source");
+    REQUIRE(fixture.created());
+    REQUIRE(fixture.start());
+    REQUIRE(fixture.organizer().add_headers(test::headers_of(blocks)).headers_added == blocks.size());
+    test::persist_headers(fixture, blocks, 1);
+    test::connect_bodies(fixture, blocks, 1);
+    REQUIRE(fixture.chain().chain_view()->connected_tip_height == 110u);
+
+    auto own = wallet::service::from_chain(fixture.chain(), domain::config::network::regtest);
+    REQUIRE(own->current().source == "chain");
+
+    // Found by its hash alone, before anything is watched: a coinbase whose
+    // only output is spent.
+    auto const coinbase_txid = blocks.front().transactions().front().hash();
+    auto const found = wait_for(*own, own->transaction(coinbase_txid, std::nullopt));
+    REQUIRE(found);
+    REQUIRE(found->confirmed);
+    REQUIRE(found->confirmed->height == 1u);
+    REQUIRE( ! wait_for(*own, own->transaction(digest_of(4242), std::nullopt)));
+
+    auto const miner = wallet::target::of_script(test::miner_script().bytes());
+    auto const own_history = wait_for(*own, own->history(miner));
+    REQUIRE(own_history);
+    REQUIRE(own_history->synced == 110u);
+    REQUIRE(own_history->confirmed.size() == 111u);
+    auto const own_balance = wait_for(*own, own->get_balance(miner, wallet::token_filter::include));
+    REQUIRE(own_balance);
+    auto const own_coins = wait_for(*own, own->unspent(miner, wallet::token_filter::include));
+    REQUIRE(own_coins);
+    REQUIRE(own_coins->size() == 110u);
+    auto const value = chain::input_prefix(spend->inputs()[0]);
+    auto const own_rpa = wait_for(*own, own->rpa_history(value, 16, 0, std::nullopt));
+    REQUIRE(own_rpa);
+    REQUIRE(std::ranges::any_of(*own_rpa, [&](auto const& match) { return match.txid == spend->hash() && match.height == 101u; }));
+
+    // The same blocks, served by a peer: the answers are the same.
+    served_chain served;
+    for (auto const& blk : blocks) served.append(blk);
+    test_peer peer(served);
+    temporary_directory dir("chain_equality");
+    running_service running(settings_for(dir.path, {peer.endpoint()}));
+    auto& from_peers = *running.service;
+    REQUIRE(wait_for(from_peers, from_peers.wait_synced(30s)));
+    auto const peer_history = wait_for(from_peers, from_peers.history(miner));
+    REQUIRE(peer_history);
+    auto const entries = [](wallet::target_history const& history) {
+        std::vector<std::pair<hash_digest, uint32_t>> out;
+        for (auto const& tx : history.confirmed) out.emplace_back(tx.txid, tx.height);
+        return out;
+    };
+    REQUIRE(entries(*peer_history) == entries(*own_history));
+    auto const peer_balance = wait_for(from_peers, from_peers.get_balance(miner, wallet::token_filter::include));
+    REQUIRE(peer_balance);
+    REQUIRE(peer_balance->confirmed == own_balance->confirmed);
+    auto const peer_coins = wait_for(from_peers, from_peers.unspent(miner, wallet::token_filter::include));
+    REQUIRE(peer_coins);
+    auto const outpoints = [](std::vector<wallet::utxo> const& coins) {
+        std::vector<chain::point> out;
+        for (auto const& coin : coins) out.push_back(coin.outpoint);
+        std::ranges::sort(out);
+        return out;
+    };
+    REQUIRE(outpoints(*peer_coins) == outpoints(*own_coins));
+    auto const peer_rpa = wait_for(from_peers, from_peers.rpa_history(value, 16, 0, std::nullopt));
+    REQUIRE(peer_rpa);
+    auto const matches = [](std::vector<wallet::rpa_match> const& listed) {
+        std::vector<std::pair<hash_digest, uint32_t>> out;
+        for (auto const& match : listed) out.emplace_back(match.txid, match.height.value_or(0));
+        std::ranges::sort(out);
+        return out;
+    };
+    REQUIRE(matches(*peer_rpa) == matches(*own_rpa));
+    auto const peer_found = wait_for(from_peers, from_peers.transaction(coinbase_txid, std::nullopt));
+    REQUIRE(peer_found);
+    REQUIRE(peer_found->confirmed->height == 1u);
 }
