@@ -498,6 +498,7 @@ if (ENABLE_TEST AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
           test/compact_filters.cpp
           test/wallet.cpp
           test/wallet_chain.cpp
+          test/wallet_electrum.cpp
           test/wallet_service.cpp
           test/tip_announcement.cpp
           test/reorg_deferred_sweep.cpp
