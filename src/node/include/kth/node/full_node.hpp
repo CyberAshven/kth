@@ -222,6 +222,7 @@ private:
 #if ! defined(__EMSCRIPTEN__)
     ::asio::awaitable<void> run_sync();
     ::asio::awaitable<void> run_compact_filters();
+    ::asio::awaitable<void> run_wallet();
     void start_wallet();
     void stop_wallet();
 #endif

@@ -277,7 +277,8 @@ struct test_peer {
                 for (auto height = from + 1; height <= chain.tip() && list.size() < 2000; ++height) {
                     list.emplace_back(chain.blocks[height].header());
                 }
-                (void)co_await peer->send(message::headers(std::move(list)));
+                auto const answer = message::headers::create(std::move(list));
+                if (answer) (void)co_await peer->send(*answer);
             } else if (command == message::get_compact_filter_checkpoint::command) {
                 auto const ask = message::get_compact_filter_checkpoint::from_data(reader, version);
                 if ( ! ask || ask->filter_type == 0 || ask->filter_type > 2) continue;

@@ -6,13 +6,6 @@
 
 #include <kth/node/full_node.hpp>
 
-#if ! defined(__EMSCRIPTEN__)
-#include <asio/co_spawn.hpp>
-#include <asio/detached.hpp>
-#include <kth/node/wallet/electrum.hpp>
-#include <kth/node/wallet/service.hpp>
-#endif
-
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -30,6 +23,11 @@
 #include <kth/node/sync/tip_announcement.hpp>
 #include <kth/node/user_agent.hpp>
 #include <kth/infrastructure/utility/pseudo_random.hpp>
+
+#if ! defined(__EMSCRIPTEN__)
+#include <kth/node/wallet/electrum.hpp>
+#include <kth/node/wallet/service.hpp>
+#endif
 
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
@@ -348,9 +346,11 @@ full_node::~full_node() {
 #if defined(KTH_WITH_CAPNPROTO_RPC)
         if (capnp_server_) capnp_server_->stop();
 #endif
+        stop_wallet();
     };
-    co_await (core() && run_rpc());
-    stop_wallet();
+    co_await (core() && run_rpc() && run_wallet());
+    wallet_electrum_.reset();
+    wallet_.reset();
     spdlog::debug("[full_node] All parallel tasks completed");
 #else
     // WASM: only blockchain subscriber (no network)
@@ -382,15 +382,21 @@ void full_node::start_wallet() {
     }
     spdlog::info("[node] Wallet support answered from this node's own chain; Electrum listener on {}:{}",
         address, *bound);
-    ::asio::co_spawn(wallet_->executor(), wallet_->run(), ::asio::detached);
-    ::asio::co_spawn(wallet_->executor(), wallet_electrum_->run(), ::asio::detached);
 }
 
+// Until stop_wallet(): the wallet's own executor runs it, and the node waits
+// for it as for its other tasks.
+::asio::awaitable<void> full_node::run_wallet() {
+    if ( ! wallet_) co_return;
+    auto const executor = wallet_->executor();
+    (void)co_await (::asio::co_spawn(executor, wallet_->run(), ::asio::use_awaitable) &&
+                    ::asio::co_spawn(executor, wallet_electrum_->run(), ::asio::use_awaitable));
+}
+
+// Ends run_wallet(). Thread safe.
 void full_node::stop_wallet() {
     if (wallet_electrum_) wallet_electrum_->stop();
     if (wallet_) wallet_->stop();
-    wallet_electrum_.reset();
-    wallet_.reset();
 }
 #endif
 

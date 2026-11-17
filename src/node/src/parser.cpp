@@ -22,9 +22,7 @@
 
 #if ! defined(__EMSCRIPTEN__)
 #include <kth/network.hpp>
-#if ! defined(__EMSCRIPTEN__)
 #include <kth/node/wallet/electrum.hpp>
-#endif
 #endif
 
 #include <kth/infrastructure/config/authority.hpp>

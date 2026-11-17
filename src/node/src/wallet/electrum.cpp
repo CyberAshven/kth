@@ -864,8 +864,6 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
         co_return ! ec;
     }
 
-    // Subscriptions are followed by asking again every second: a changed
-    // status or tip is sent as Fulcrum sends it.
     // What a client follows is sent when the wallet support reports a change
     // (a new tip, a reorganization, a mempool transaction in or out, a
     // double-spend proof), not found by asking again on a timer.
