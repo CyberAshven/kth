@@ -573,12 +573,16 @@ struct peer_impl final : service::impl {
         next.blocks_downloaded = blocks_downloaded;
         next.filter_bytes = (scripts ? scripts->data_bytes() : 0) + (prefixes ? prefixes->data_bytes() : 0);
         next.error = last_error;
-        if (next.tip != announced_tip) {
-            announced_tip = next.tip;
-            changes.bump();
+        // A new tip, or where the service stands (synced, its error), wakes
+        // whoever waits on changes.
+        auto moved = next.tip != announced_tip;
+        if (moved) announced_tip = next.tip;
+        {
+            std::lock_guard<std::mutex> guard(status_mutex);
+            moved = moved || next.synced != snapshot.synced || next.error != snapshot.error;
+            snapshot = std::move(next);
         }
-        std::lock_guard<std::mutex> guard(status_mutex);
-        snapshot = std::move(next);
+        if (moved) changes.bump();
     }
 
     status current() const override {
@@ -1828,14 +1832,17 @@ status service::current() const {
     return impl_->current();
 }
 
+// Woken by each change, not by asking again on a timer. The count is read
+// before the status, so a change between them is not missed.
 ::asio::awaitable<std::expected<status, std::error_code>> service::wait_synced(std::chrono::seconds timeout) {
     auto const deadline = std::chrono::steady_clock::now() + timeout;
+    uint64_t seen = co_await ::asio::co_spawn(impl_->executor(), impl_->changed(0, std::chrono::steady_clock::now()), ::asio::use_awaitable);
     for (;;) {
         auto const now = impl_->current();
         if (now.synced) co_return now;
         if (impl_->stopped()) co_return std::unexpected(error::service_stopped);
         if (std::chrono::steady_clock::now() >= deadline) co_return std::unexpected(error::channel_timeout);
-        co_await pause(100ms);
+        seen = co_await ::asio::co_spawn(impl_->executor(), impl_->changed(seen, deadline), ::asio::use_awaitable);
     }
 }
 

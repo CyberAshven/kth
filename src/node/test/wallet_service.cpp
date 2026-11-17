@@ -342,6 +342,19 @@ auto wait_for(wallet::service& service, Awaitable&& operation) {
     return future.get();
 }
 
+// Whether the service's status comes to satisfy `reached` within 30 s, woken
+// by its changes (a moved status is one), not by sleeping between looks.
+template <typename Predicate>
+bool status_reaches(wallet::service& service, Predicate reached) {
+    auto const deadline = std::chrono::steady_clock::now() + 30s;
+    auto seen = wait_for(service, service.changed(0, 0s));
+    while ( ! reached(service.current())) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        seen = wait_for(service, service.changed(seen, 5s));
+    }
+    return true;
+}
+
 struct running_service {
     std::unique_ptr<wallet::service> service;
     std::future<std::error_code> running;
@@ -581,13 +594,9 @@ TEST_CASE("wallet from peers: a filter that does not fit its block is found and 
     temporary_directory dir("dispute");
     running_service running(settings_for(dir.path, {peer.endpoint()}));
     auto& service = *running.service;
-    auto const deadline = std::chrono::steady_clock::now() + 30s;
-    bool found = false;
-    while ( ! found && std::chrono::steady_clock::now() < deadline) {
-        found = service.current().error.find("does not fit block 10") != std::string::npos;
-        if ( ! found) std::this_thread::sleep_for(50ms);
-    }
-    REQUIRE(found);
+    REQUIRE(status_reaches(service, [](wallet::status const& now) {
+        return now.error.find("does not fit block 10") != std::string::npos;
+    }));
     REQUIRE(service.current().tip.value_or(0) < 10u);
 }
 
@@ -628,13 +637,9 @@ TEST_CASE("wallet from peers: a birthday syncs only the filters after it, and pe
         temporary_directory dir("disagree");
         running_service running(settings_for(dir.path, {first.endpoint(), second.endpoint()}));
         auto& service = *running.service;
-        auto const deadline = std::chrono::steady_clock::now() + 30s;
-        bool refused = false;
-        while ( ! refused && std::chrono::steady_clock::now() < deadline) {
-            refused = service.current().error.find("disagree") != std::string::npos;
-            if ( ! refused) std::this_thread::sleep_for(50ms);
-        }
-        REQUIRE(refused);
+        REQUIRE(status_reaches(service, [](wallet::status const& now) {
+            return now.error.find("disagree") != std::string::npos;
+        }));
         REQUIRE( ! service.current().synced);
     }
 }
@@ -850,11 +855,13 @@ TEST_CASE("wallet double-spend proofs: the full node lists its own as the peer p
     running_service running(settings_for(dir.path, {peer.endpoint()}));
     auto& from_peers = *running.service;
     REQUIRE(wait_for(from_peers, from_peers.wait_synced(30s)));
-    std::vector<hash_digest> peer_list;
+    // A relayed proof is a change: woken by it, not by sleeping between looks.
+    auto seen = wait_for(from_peers, from_peers.changed(0, 0s));
+    auto peer_list = wait_for(from_peers, from_peers.dsproof_transactions());
     auto const deadline = std::chrono::steady_clock::now() + 30s;
     while (peer_list.empty() && std::chrono::steady_clock::now() < deadline) {
+        seen = wait_for(from_peers, from_peers.changed(seen, 5s));
         peer_list = wait_for(from_peers, from_peers.dsproof_transactions());
-        if (peer_list.empty()) std::this_thread::sleep_for(50ms);
     }
     REQUIRE(peer_list == own_list);
     auto const peer_proof = wait_for(from_peers, from_peers.dsproof(pending.hash()));
