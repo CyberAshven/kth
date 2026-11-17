@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <map>
 #include <mutex>
 #include <set>
@@ -44,7 +45,6 @@ using namespace std::chrono_literals;
 using domain::chain::point;
 using block_ptr = std::shared_ptr<domain::chain::block const>;
 
-constexpr uint64_t default_relay_fee = 1000;
 constexpr auto follow_interval = 250ms;
 
 struct chain_impl final : service::impl {
@@ -445,14 +445,11 @@ struct chain_impl final : service::impl {
         co_return txid;
     }
 
+    // The node's own relay floor (chain.byte_fee_satoshis per byte), which
+    // its estimatefee answers too.
     fee_estimate fees() const override {
-        std::vector<uint64_t> rates;
-        for (auto const& [txid, entry] : pool.transactions()) {
-            if (entry.fee) rates.push_back(*entry.fee * 1000 / std::max<size_t>(1, entry.size));
-        }
-        std::ranges::sort(rates);
-        auto const median = rates.empty() ? default_relay_fee : rates[rates.size() / 2];
-        return fee_estimate{default_relay_fee, std::max(median, default_relay_fee)};
+        auto const relay = std::max<uint64_t>(1, uint64_t(std::llround(double(chain.chain_settings().byte_fee_satoshis) * 1000.0)));
+        return fee_estimate{relay, relay};
     }
 
     mempool_summary mempool() const override {

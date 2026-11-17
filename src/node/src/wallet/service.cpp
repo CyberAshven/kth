@@ -73,7 +73,6 @@ constexpr size_t header_size = 80;
 // behind, the mempool copy starts over.
 constexpr uint32_t live_window = 12;
 constexpr size_t recent_blocks = 24;
-constexpr size_t fee_samples = 2000;
 constexpr uint64_t default_relay_fee = 1000;
 constexpr auto broadcast_wait = 10s;
 constexpr auto retry_pause = 5s;
@@ -352,7 +351,6 @@ struct peer_impl final : service::impl {
     mempool_copy pool;
     std::set<hash_digest> requested;
     std::map<uint64_t, uint64_t> fee_filters;
-    std::deque<uint64_t> fee_rates;
     std::map<point, uint64_t> recent_outputs;
     std::deque<std::vector<point>> recent_created;
     std::optional<uint32_t> live_tip;
@@ -1216,23 +1214,6 @@ struct peer_impl final : service::impl {
                     created.emplace_back(txid, vout);
                 }
             }
-            for (size_t at = 1; at < blk->transactions().size(); ++at) {
-                auto const& tx = blk->transactions()[at];
-                uint64_t in = 0;
-                bool known = true;
-                for (auto const& input : tx.inputs()) {
-                    auto const found = recent_outputs.find(point(input.previous_output().hash(), input.previous_output().index()));
-                    if (found == recent_outputs.end()) {
-                        known = false;
-                        break;
-                    }
-                    in += found->second;
-                }
-                uint64_t out = 0;
-                for (auto const& output : tx.outputs()) out += output.value();
-                if (known && in >= out) fee_rates.push_back((in - out) * 1000 / std::max<size_t>(1, tx.serialized_size(true)));
-            }
-            while (fee_rates.size() > fee_samples) fee_rates.pop_front();
             recent_created.push_back(std::move(created));
             while (recent_created.size() > recent_blocks) {
                 for (auto const& old : recent_created.front()) recent_outputs.erase(old);
@@ -1655,6 +1636,9 @@ struct peer_impl final : service::impl {
         co_return txid;
     }
 
+    // The peers' mempool minimums (their fee filters) are the floor a
+    // transaction must pay to be relayed by all of them: what BCHN's
+    // estimatefee answers for its own mempool.
     fee_estimate fees() const override {
         uint64_t relay = default_relay_fee;
         if ( ! fee_filters.empty()) {
@@ -1662,13 +1646,7 @@ struct peer_impl final : service::impl {
             for (auto const& [id, rate] : fee_filters) relay = std::max(relay, rate);
             relay = std::max<uint64_t>(relay, 1);
         }
-        std::vector<uint64_t> rates(fee_rates.begin(), fee_rates.end());
-        for (auto const& [txid, entry] : pool.transactions()) {
-            if (entry.fee) rates.push_back(*entry.fee * 1000 / std::max<size_t>(1, entry.size));
-        }
-        std::ranges::sort(rates);
-        auto const median = rates.empty() ? relay : rates[rates.size() / 2];
-        return fee_estimate{relay, std::max(median, relay)};
+        return fee_estimate{relay, relay};
     }
 
     mempool_summary mempool() const override {

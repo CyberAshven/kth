@@ -107,9 +107,11 @@ struct rpa_match {
 
 /// Fee rates in satoshis per 1000 bytes.
 struct fee_estimate {
-    /// The lowest rate peers relay: the highest fee filter they sent, or 1000.
+    /// The lowest rate relayed: the node's own relay floor, or the highest
+    /// fee filter peers sent (1000 before any).
     uint64_t relay;
-    /// The median rate of recent transactions whose fee is known, at least `relay`.
+    /// What BCHN's estimatefee answers: the mempool's minimum, which is the
+    /// relay floor while blocks have room (BCH has no fee market to guess).
     uint64_t estimate;
 };
 
