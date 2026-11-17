@@ -6,6 +6,13 @@
 
 #include <kth/node/full_node.hpp>
 
+#if ! defined(__EMSCRIPTEN__)
+#include <asio/co_spawn.hpp>
+#include <asio/detached.hpp>
+#include <kth/node/wallet/electrum.hpp>
+#include <kth/node/wallet/service.hpp>
+#endif
+
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -317,6 +324,7 @@ full_node::~full_node() {
     // This blocks until ALL tasks complete (i.e., until stop() is called).
     // No detached coroutines - everything is properly awaited.
     spdlog::debug("[full_node] Starting parallel tasks with && operator");
+    start_wallet();
     auto core = [this]() -> ::asio::awaitable<void> {
         co_await (run_blockchain_subscriber() && network_.run() && run_sync() && run_compact_filters());
 #if defined(KTH_WITH_RPC)
@@ -332,6 +340,7 @@ full_node::~full_node() {
 #endif
     };
     co_await (core() && run_rpc());
+    stop_wallet();
     spdlog::debug("[full_node] All parallel tasks completed");
 #else
     // WASM: only blockchain subscriber (no network)
@@ -340,6 +349,43 @@ full_node::~full_node() {
 
     co_return error::success;
 }
+
+#if ! defined(__EMSCRIPTEN__)
+// The node's own wallet support, answered from its own chain, behind a local
+// Electrum listener for wallets that do not speak P2P. Runs on its own
+// executor; nothing of it is reachable unless node.wallet_electrum names it.
+void full_node::start_wallet() {
+    auto const& bind = node_settings_.wallet_electrum;
+    if (bind.empty()) return;
+    auto const colon = bind.rfind(':');
+    if (colon == std::string::npos) {
+        spdlog::error("[node] node.wallet_electrum is not ADDRESS:PORT: {}", bind);
+        return;
+    }
+    auto const address = bind.substr(0, colon);
+    auto const port = uint16_t(std::strtoul(bind.substr(colon + 1).c_str(), nullptr, 10));
+    wallet_ = wallet::service::from_chain(chain_, network_type_);
+    wallet_electrum_ = std::make_unique<wallet::electrum_server>(*wallet_, network_type_);
+    auto const bound = wallet_electrum_->listen(address, port);
+    if ( ! bound) {
+        spdlog::error("[node] The wallet's Electrum listener cannot listen on {}", bind);
+        wallet_electrum_.reset();
+        wallet_.reset();
+        return;
+    }
+    spdlog::info("[node] Wallet support answered from this node's own chain; Electrum listener on {}:{}",
+        address, *bound);
+    ::asio::co_spawn(wallet_->executor(), wallet_->run(), ::asio::detached);
+    ::asio::co_spawn(wallet_->executor(), wallet_electrum_->run(), ::asio::detached);
+}
+
+void full_node::stop_wallet() {
+    if (wallet_electrum_) wallet_electrum_->stop();
+    if (wallet_) wallet_->stop();
+    wallet_electrum_.reset();
+    wallet_.reset();
+}
+#endif
 
 ::asio::awaitable<void> full_node::run_rpc() {
 #if defined(KTH_WITH_RPC) && ! defined(__EMSCRIPTEN__)

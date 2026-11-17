@@ -306,6 +306,11 @@ void add_settings(CLI::App& app, configuration& cfg) {
     app.add_option("--node.refresh_transactions",           cfg.node.refresh_transactions);
     app.add_option("--node.compact_blocks_high_bandwidth",  cfg.node.compact_blocks_high_bandwidth);
     app.add_option("--node.ds_proofs",                      cfg.node.ds_proofs_enabled);
+#if ! defined(__EMSCRIPTEN__)
+    app.add_option("--node.wallet_electrum",                cfg.node.wallet_electrum,
+        "ADDRESS:PORT of a local Electrum listener answering from this node's own chain, "
+        "for wallets that do not speak P2P (off by default).");
+#endif
     add_enum_option(app, "--node.display",
         cfg.node.display, parse_display_mode,
         "Display mode (tui, log, daemon).");
