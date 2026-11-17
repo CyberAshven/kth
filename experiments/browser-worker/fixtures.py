@@ -588,7 +588,8 @@ async def bch_tx_disown(socket):
 # blocks from them, as a node with NODE_COMPACT_FILTERS does.
 # -----------------------------------------------------------------------------
 
-NODE_COMPACT_FILTERS = 1 << 6
+# The compact filters service bit as a BCH node announces it (version.hpp: node_compact_filters).
+NODE_COMPACT_FILTERS = 1 << 8
 WALLET_CHAIN = None
 
 
