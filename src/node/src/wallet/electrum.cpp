@@ -80,7 +80,7 @@ std::unexpected<failure> fail(int code, std::string message) {
 // ---------------------------------------------------------------------------
 // JSON text
 
-std::string quoted(std::string_view text) {
+std::string json_text(std::string_view text) {
     std::string out = "\"";
     for (unsigned char ch : text) {
         if (ch == '"' || ch == '\\') {
@@ -102,12 +102,12 @@ public:
     object& raw(std::string_view key, std::string_view value) {
         text_ += first_ ? "" : ",";
         first_ = false;
-        text_ += quoted(key);
+        text_ += json_text(key);
         text_ += ':';
         text_ += value;
         return *this;
     }
-    object& text(std::string_view key, std::string_view value) { return raw(key, quoted(value)); }
+    object& text(std::string_view key, std::string_view value) { return raw(key, json_text(value)); }
     object& number(std::string_view key, int64_t value) { return raw(key, std::to_string(value)); }
     object& flag(std::string_view key, bool value) { return raw(key, value ? "true" : "false"); }
     std::string done() const { return "{" + text_ + "}"; }
@@ -284,7 +284,7 @@ std::string header_json(uint32_t height, chain::header const& header) {
 
 std::string hashes_json(hash_list const& hashes) {
     std::vector<std::string> items;
-    for (auto const& hash : hashes) items.push_back(quoted(encode_hash(hash)));
+    for (auto const& hash : hashes) items.push_back(json_text(encode_hash(hash)));
     return array_of(items);
 }
 
@@ -421,7 +421,7 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
         for (auto const& tx : history.unconfirmed) text += encode_hash(tx.txid) + ":" + std::to_string(tx.unconfirmed_parent ? -1 : 0) + ":";
         if (text.empty()) return "null";
         auto const digest = sha256_hash(byte_span(reinterpret_cast<uint8_t const*>(text.data()), text.size()));
-        return quoted(encode_base16(digest));
+        return json_text(encode_base16(digest));
     }
 
     ::asio::awaitable<std::optional<std::pair<uint32_t, chain::header>>> tip() {
@@ -434,10 +434,10 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
 
     ::asio::awaitable<result> call(std::string const& method, std::vector<param> const& params) {
         // server.*
-        if (method == "server.version") co_return array_of({quoted(software), quoted(protocol_version)});
+        if (method == "server.version") co_return array_of({json_text(software), json_text(protocol_version)});
         if (method == "server.ping") co_return "null";
-        if (method == "server.banner") co_return quoted(std::string(software) + ": answered by this node's own wallet support");
-        if (method == "server.donation_address") co_return quoted("");
+        if (method == "server.banner") co_return json_text(std::string(software) + ": answered by this node's own wallet support");
+        if (method == "server.donation_address") co_return json_text("");
         if (method == "server.peers.subscribe") co_return "[]";
         if (method == "server.add_peer") co_return "false";
         if (method == "server.features") {
@@ -469,7 +469,7 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
             }
             auto const header = co_await wallet.header(height);
             if ( ! header) co_return fail(invalid_params, "Invalid height");
-            if (cp_height == 0) co_return quoted(encode_base16(header_bytes(*header)));
+            if (cp_height == 0) co_return json_text(encode_base16(header_bytes(*header)));
             auto const proof = co_await wallet.header_branch(height, cp_height);
             if ( ! proof) {
                 co_return fail(invalid_params, "header height " + std::to_string(height) + " must be <= cp_height " +
@@ -546,7 +546,7 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
                 if (params.empty()) co_return fail(invalid_params, "Invalid address");
                 auto const script = address_script(params[0]);
                 if ( ! script) co_return fail(invalid_params, "Invalid address");
-                co_return quoted(encode_hash(sha256_hash(*script)));
+                co_return json_text(encode_hash(sha256_hash(*script)));
             }
             auto const watched = target_of(method, params);
             if ( ! watched) co_return fail(invalid_params, method.starts_with("blockchain.address.") ? "Invalid address" : "Invalid scripthash");
@@ -612,7 +612,7 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
             if ( ! tx || reader.remaining_size() != 0) co_return fail(invalid_params, "Invalid transaction");
             auto const sent = co_await wallet.broadcast(std::move(*tx));
             if ( ! sent) co_return fail(bad_request, "the transaction was not accepted: " + sent.error().message() + " " + wallet.current().error);
-            co_return quoted(encode_hash(*sent));
+            co_return json_text(encode_hash(*sent));
         }
         if (method == "blockchain.transaction.get") {
             auto const txid = txid_of(params, 0);
@@ -621,7 +621,7 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
             auto const found = co_await wallet.transaction(*txid, std::nullopt);
             if ( ! found) co_return fail(bad_request, "No such mempool or blockchain transaction");
             auto const raw = transaction_bytes(found->tx);
-            if ( ! verbose) co_return quoted(encode_base16(raw));
+            if ( ! verbose) co_return json_text(encode_base16(raw));
 #if defined(KTH_WITH_RPC)
             {
                 // Fulcrum answers with its daemon's verbose getrawtransaction:
@@ -702,7 +702,7 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
             auto const proof = co_await wallet.merkle(*txid, hint);
             if ( ! proof) co_return fail(bad_request, "No confirmed transaction with that hash");
             std::vector<std::string> branch;
-            for (auto const& hash : proof->branch) branch.push_back(quoted(encode_hash(hash)));
+            for (auto const& hash : proof->branch) branch.push_back(json_text(encode_hash(hash)));
             co_return object().number("block_height", proof->confirmed.height).raw("merkle", array_of(branch))
                 .number("pos", proof->confirmed.position).done();
         }
@@ -712,9 +712,9 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
             bool const with_merkle = params.size() > 2 && params[2].what == param::kind::boolean && params[2].flag;
             auto const found = co_await wallet.transaction_at(uint32_t(params[0].number), uint32_t(params[1].number));
             if ( ! found) co_return fail(bad_request, "No transaction at that position");
-            if ( ! with_merkle) co_return quoted(encode_hash(found->first.hash()));
+            if ( ! with_merkle) co_return json_text(encode_hash(found->first.hash()));
             std::vector<std::string> branch;
-            for (auto const& hash : found->second.branch) branch.push_back(quoted(encode_hash(hash)));
+            for (auto const& hash : found->second.branch) branch.push_back(json_text(encode_hash(hash)));
             co_return object().text("tx_hash", encode_hash(found->first.hash())).raw("merkle", array_of(branch)).done();
         }
         if (method == "blockchain.transaction.subscribe") {
@@ -892,7 +892,7 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
                 if (known == who->transactions.end() || known->second == height) continue;
                 known->second = height;
                 if ( ! co_await write_line(*who, object().text("jsonrpc", "2.0").text("method", "blockchain.transaction.subscribe")
-                        .raw("params", array_of({quoted(txid_text), height})).done())) {
+                        .raw("params", array_of({json_text(txid_text), height})).done())) {
                     who->open = false;
                     break;
                 }
@@ -906,7 +906,7 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
                 if (known == who->proofs.end() || known->second == shown) continue;
                 known->second = shown;
                 if ( ! co_await write_line(*who, object().text("jsonrpc", "2.0").text("method", "blockchain.transaction.dsproof.subscribe")
-                        .raw("params", array_of({quoted(txid_text), shown})).done())) {
+                        .raw("params", array_of({json_text(txid_text), shown})).done())) {
                     who->open = false;
                     break;
                 }
@@ -940,7 +940,7 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
                 known->second = status;
                 auto const name = address ? "blockchain.address.subscribe" : "blockchain.scripthash.subscribe";
                 if ( ! co_await write_line(*who, object().text("jsonrpc", "2.0").text("method", name)
-                        .raw("params", array_of({quoted(key), status})).done())) {
+                        .raw("params", array_of({json_text(key), status})).done())) {
                     who->open = false;
                     break;
                 }

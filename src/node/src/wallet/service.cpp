@@ -388,7 +388,7 @@ struct peer_impl final : service::impl {
     std::unique_ptr<::asio::thread_pool> scan_pool;
     std::thread thread;
 
-    impl(peer_settings given, size_t capacity)
+    peer_impl(peer_settings given, size_t capacity)
         : settings(std::move(given))
         , transport(settings.network)
         , threads(settings.scan_threads != 0 ? settings.scan_threads : std::max<size_t>(1, std::thread::hardware_concurrency()))
@@ -416,7 +416,7 @@ struct peer_impl final : service::impl {
         scan_pool = std::make_unique<::asio::thread_pool>(1);
     }
 
-    ~impl() {
+    ~peer_impl() override {
         stopping = true;
         ::asio::post(*io, [this] { shutdown(); });
         work.reset();
@@ -1555,7 +1555,7 @@ struct peer_impl final : service::impl {
         if ( ! link) co_return std::unexpected(error::channel_stopped);
         pending_broadcasts.insert(txid);
         struct forget {
-            impl& self;
+            peer_impl& self;
             hash_digest txid;
             ~forget() {
                 self.pending_broadcasts.erase(txid);
