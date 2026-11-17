@@ -237,7 +237,8 @@ struct chain_impl final : service::impl {
 
     ::asio::awaitable<std::expected<target_state const*, std::error_code>> ready(target const& watched) {
         (void)watch_one(watched, settings.birthday);
-        if (auto const ec = co_await catch_up()) co_return std::unexpected(ec);
+        auto const ec = co_await catch_up();
+        if (ec) co_return std::unexpected(ec);
         co_await refresh_pool();
         auto const found = targets.find(watched.key());
         if (found == targets.end()) co_return std::unexpected(error::not_found);
@@ -363,7 +364,8 @@ struct chain_impl final : service::impl {
     ::asio::awaitable<std::expected<hash_digest, std::error_code>> broadcast(domain::chain::transaction tx) override {
         auto const txid = tx.hash();
         auto const pointer = std::make_shared<domain::message::transaction const>(std::move(tx));
-        if (auto const ec = co_await chain.submit_transaction(pointer)) {
+        auto const ec = co_await chain.submit_transaction(pointer);
+        if (ec) {
             last_error = "transaction rejected: " + ec.message();
             co_return std::unexpected(ec);
         }
@@ -403,7 +405,8 @@ struct chain_impl final : service::impl {
             auto const now = tip();
             if ( ! followed || *followed != now) {
                 if ( ! targets.empty()) {
-                    if (auto const ec = co_await catch_up()) last_error = ec.message();
+                    auto const ec = co_await catch_up();
+                    if (ec) last_error = ec.message();
                 }
                 co_await refresh_pool();
                 followed = now;

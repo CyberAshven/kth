@@ -561,7 +561,8 @@ struct peer_impl final : service::impl {
         } guard{*link, &wait};
         auto packet = packet_of(*link, item);
         log_sent(Message::command, packet);
-        if (auto const ec = co_await link->session->send_raw(std::move(packet))) co_return std::unexpected(ec);
+        auto const ec = co_await link->session->send_raw(std::move(packet));
+        if (ec) co_return std::unexpected(ec);
         auto const deadline = std::chrono::steady_clock::now() + settings.request_timeout;
         auto executor = co_await ::asio::this_coro::executor;
         auto completion = co_await ::asio::experimental::make_select(
@@ -1320,7 +1321,8 @@ struct peer_impl final : service::impl {
 
     ::asio::awaitable<std::expected<target_state const*, std::error_code>> ready(target const& watched) {
         (void)watch_one(watched, settings.birthday);
-        if (auto const ec = co_await catch_up()) co_return std::unexpected(ec);
+        auto const ec = co_await catch_up();
+        if (ec) co_return std::unexpected(ec);
         auto const found = targets.find(watched.key());
         if (found == targets.end()) co_return std::unexpected(error::not_found);
         co_return &found->second;
@@ -1469,7 +1471,8 @@ struct peer_impl final : service::impl {
                 self.rejections.erase(txid);
             }
         } guard{*this, txid};
-        if (auto const ec = co_await send(*link, message::transaction(tx))) co_return std::unexpected(ec);
+        auto const ec = co_await send(*link, message::transaction(tx));
+        if (ec) co_return std::unexpected(ec);
         // A pong after the transaction: the peer has read it.
         auto const nonce = next_nonce();
         auto const pong = co_await request(link, message::ping(nonce), [nonce, version = link->session->negotiated_version()](raw_message const& m) {
