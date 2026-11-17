@@ -1039,25 +1039,31 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
     }
 };
 
-std::optional<std::string> electrum_bind_refusal(std::string const& bind) {
+std::expected<electrum_bind, std::string> parse_electrum_bind(std::string const& bind) {
     auto const colon = bind.rfind(':');
-    if (colon == std::string::npos || colon + 1 == bind.size()) return "it is not ADDRESS:PORT: " + bind;
+    if (colon == std::string::npos || colon + 1 == bind.size()) return std::unexpected("it is not ADDRESS:PORT: " + bind);
     auto address = bind.substr(0, colon);
     auto const port_text = bind.substr(colon + 1);
     if (address.size() >= 2 && address.front() == '[' && address.back() == ']') address = address.substr(1, address.size() - 2);
     uint32_t port = 0;
     auto const [end, parsed] = std::from_chars(port_text.data(), port_text.data() + port_text.size(), port);
     if (parsed != std::errc{} || end != port_text.data() + port_text.size() || port > 65535) {
-        return "its port is not a number from 0 to 65535: " + bind;
+        return std::unexpected("its port is not a number from 0 to 65535: " + bind);
     }
     std::error_code ec;
     auto const ip = ::asio::ip::make_address(address, ec);
-    if (ec) return "its address is not an IP address: " + bind;
+    if (ec) return std::unexpected("its address is not an IP address: " + bind);
     if ( ! ip.is_loopback()) {
-        return "its address is not a loopback address (127.0.0.0/8 or ::1): " + bind +
-            ". The listener answers only wallets on this machine; a node must not learn what others' wallets watch.";
+        return std::unexpected("its address is not a loopback address (127.0.0.0/8 or ::1): " + bind +
+            ". The listener answers only wallets on this machine; a node must not learn what others' wallets watch.");
     }
-    return std::nullopt;
+    return electrum_bind{std::move(address), uint16_t(port)};
+}
+
+std::optional<std::string> electrum_bind_refusal(std::string const& bind) {
+    auto const parsed = parse_electrum_bind(bind);
+    if (parsed) return std::nullopt;
+    return parsed.error();
 }
 
 electrum_server::electrum_server(service& wallet, domain::config::network network)
@@ -1068,7 +1074,8 @@ electrum_server::~electrum_server() = default;
 std::expected<uint16_t, std::error_code> electrum_server::listen(std::string const& address, uint16_t port) {
     std::error_code ec;
     auto const ip = ::asio::ip::make_address(address, ec);
-    if (ec) return std::unexpected(error::listen_failed);
+    // Only this machine's wallets: no other address is ever bound.
+    if (ec || ! ip.is_loopback()) return std::unexpected(error::listen_failed);
     tcp::endpoint const endpoint(ip, port);
     impl_->acceptor.open(endpoint.protocol(), ec);
     if ( ! ec) impl_->acceptor.set_option(tcp::acceptor::reuse_address(true), ec);

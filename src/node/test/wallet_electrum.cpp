@@ -99,6 +99,16 @@ TEST_CASE("wallet listener of the node accepts loopback addresses only", "[walle
         REQUIRE(node::wallet::electrum_bind_refusal(refused));
     }
     REQUIRE(node::wallet::electrum_bind_refusal("0.0.0.0:50001")->find("loopback") != std::string::npos);
+    // [::1] loses its brackets, as kth-wallet and the node bind it.
+    auto const v6 = node::wallet::parse_electrum_bind("[::1]:50001");
+    REQUIRE(v6);
+    REQUIRE(v6->address == "::1");
+    REQUIRE(v6->port == 50001);
+    auto const v4 = node::wallet::parse_electrum_bind("127.0.0.1:0");
+    REQUIRE(v4);
+    REQUIRE(v4->address == "127.0.0.1");
+    REQUIRE(v4->port == 0);
+    REQUIRE( ! node::wallet::parse_electrum_bind("[0.0.0.0]:50001"));
 
     // The option refuses the same at startup.
     auto const parse = [](std::string const& value) {
@@ -114,4 +124,24 @@ TEST_CASE("wallet listener of the node accepts loopback addresses only", "[walle
     REQUIRE(parse("[::1]:50001").first);
     REQUIRE( ! parse("0.0.0.0:50001").first);
     REQUIRE( ! parse("192.168.0.160:50001").first);
+}
+
+TEST_CASE("wallet Electrum listener binds loopback addresses only", "[wallet][wallet_electrum]") {
+    // A service that is never run: only its executor is used.
+    temporary_directory dir("listen");
+    auto made = wallet::service::from_peers(settings_for(dir.path, {"127.0.0.1:1"}));
+    REQUIRE(made);
+    auto& service = **made;
+    for (auto const* refused : {"0.0.0.0", "192.168.1.10", "10.0.0.1", "::", "2001:db8::1", "localhost", "[::1]"}) {
+        CAPTURE(refused);
+        wallet::electrum_server listener(service, domain::config::network::regtest);
+        auto const bound = listener.listen(refused, 0);
+        REQUIRE( ! bound);
+        REQUIRE(bound.error() == error::listen_failed);
+    }
+    wallet::electrum_server listener(service, domain::config::network::regtest);
+    auto const bound = listener.listen("127.0.0.1", 0);
+    REQUIRE(bound);
+    REQUIRE(*bound != 0);
+    listener.stop();
 }

@@ -24,14 +24,25 @@ namespace kth::node::wallet {
 // A local Electrum-protocol listener: a compatibility layer only for wallets
 // that do not speak the P2P protocol. It answers Fulcrum's methods, with
 // Fulcrum's argument orders and result shapes, from the wallet support of the
-// same process. It listens on the loopback address unless the embedding
-// application binds it elsewhere on purpose; the node itself serves no
-// Electrum to the network, and a wallet that can should talk P2P instead.
-/// Why `bind` cannot be where the node's own wallet listener listens, or
-/// none. It must be ADDRESS:PORT ([ADDRESS]:PORT for IPv6) with a loopback
-/// address (127.0.0.0/8 or ::1): the listener is for the node owner's wallets
-/// on the same machine. A node answering Electrum on any other address would
-/// be a server that learns what other people's wallets watch.
+// same process. It listens on a loopback address only: the listener is for
+// the wallets on the same machine, and a node answering Electrum anywhere
+// else would be a server that learns what other people's wallets watch. A
+// wallet that can should talk P2P instead.
+
+/// Where a listener listens: a loopback address and a port.
+struct electrum_bind {
+    /// Without brackets, also for IPv6.
+    std::string address;
+    uint16_t port;
+};
+
+/// ADDRESS:PORT ([ADDRESS]:PORT for IPv6) with a loopback address
+/// (127.0.0.0/8 or ::1), or why not.
+[[nodiscard]]
+KND_API
+std::expected<electrum_bind, std::string> parse_electrum_bind(std::string const& bind);
+
+/// Why `bind` cannot be where a listener listens, or none.
 [[nodiscard]]
 KND_API
 std::optional<std::string> electrum_bind_refusal(std::string const& bind);
@@ -43,8 +54,10 @@ public:
     electrum_server(electrum_server const&) = delete;
     electrum_server& operator=(electrum_server const&) = delete;
 
-    /// Binds `address` at `port` (0: a port the OS assigns) on the wallet's
-    /// executor and returns the port it listens on. listen_failed otherwise.
+    /// Binds `address` (a loopback address) at `port` (0: a port the OS
+    /// assigns) on the wallet's executor and returns the port it listens on.
+    /// listen_failed otherwise, and for any address that is not a loopback
+    /// one, which is never bound.
     [[nodiscard]] std::expected<uint16_t, std::error_code> listen(std::string const& address, uint16_t port);
 
     /// Accepts and answers clients until stop().

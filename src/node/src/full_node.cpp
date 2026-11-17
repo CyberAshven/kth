@@ -366,11 +366,10 @@ full_node::~full_node() {
 // executor; nothing of it is reachable unless node.wallet_electrum names it.
 void full_node::start_wallet() {
     auto const& bind = node_settings_.wallet_electrum;
-    if (bind.empty() || wallet::electrum_bind_refusal(bind)) return;
-    auto const colon = bind.rfind(':');
-    auto address = bind.substr(0, colon);
-    if (address.size() >= 2 && address.front() == '[' && address.back() == ']') address = address.substr(1, address.size() - 2);
-    auto const port = uint16_t(std::strtoul(bind.substr(colon + 1).c_str(), nullptr, 10));
+    if (bind.empty()) return;
+    auto const parsed = wallet::parse_electrum_bind(bind);
+    if ( ! parsed) return;
+    auto const& [address, port] = *parsed;
     wallet_ = wallet::service::from_chain(chain_, network_type_);
     wallet_electrum_ = std::make_unique<wallet::electrum_server>(*wallet_, network_type_);
     auto const bound = wallet_electrum_->listen(address, port);

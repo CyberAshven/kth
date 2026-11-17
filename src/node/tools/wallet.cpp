@@ -8,7 +8,7 @@
 // any peer. Prints "electrum <port>" once listening.
 //
 //   kth-wallet --network regtest --directory DIR --peer HOST:PORT [--peer ...]
-//              [--electrum ADDRESS:PORT] [--birthday HEIGHT] [--sent-log FILE]
+//              [--electrum LOOPBACK:PORT] [--birthday HEIGHT] [--sent-log FILE]
 //              [--isolate] [--decoys N] [--download-all] [--scan-threads N]
 //              [--no-input-prefix-filters]
 
@@ -51,7 +51,7 @@ std::optional<network> network_of(std::string_view name) {
 
 int usage() {
     std::fprintf(stderr, "usage: kth-wallet --network NAME --directory DIR --peer HOST:PORT [--peer ...] "
-        "[--electrum ADDRESS:PORT] [--birthday HEIGHT] [--sent-log FILE] [--isolate] [--decoys N] "
+        "[--electrum LOOPBACK:PORT] [--birthday HEIGHT] [--sent-log FILE] [--isolate] [--decoys N] "
         "[--download-all] [--scan-threads N] [--no-input-prefix-filters]\n");
     return 2;
 }
@@ -98,10 +98,14 @@ int main(int argc, char** argv) {
         }
     }
     if (settings.directory.empty() || settings.peers.empty()) return usage();
-    auto const colon = electrum.rfind(':');
-    if (colon == std::string::npos) return usage();
-    auto const address = electrum.substr(0, colon);
-    auto const port = uint16_t(std::strtoul(electrum.substr(colon + 1).c_str(), nullptr, 10));
+    // A loopback address only ([::1] without its brackets): the listener is
+    // for this machine's wallets.
+    auto const bind = wallet::parse_electrum_bind(electrum);
+    if ( ! bind) {
+        std::fprintf(stderr, "kth-wallet: --electrum is refused: %s\n", bind.error().c_str());
+        return 2;
+    }
+    auto const& [address, port] = *bind;
 
     auto made = wallet::service::from_peers(settings);
     if ( ! made) {
