@@ -101,7 +101,7 @@ bool target_state::apply_block(uint32_t height, hash_digest const& block, transa
             auto const& out = outputs[vout];
             if ( ! target_.owns(out)) continue;
             point const outpoint(txids[position], vout);
-            coins_.insert_or_assign(outpoint, coin{outpoint, out.value(), out.token_data(), out.script().bytes(), height});
+            coins_.insert_or_assign(outpoint, coin{outpoint, out.value(), out.token_data(), out.script().bytes(), height, position});
             entry(position, txids[position]).outputs.push_back(received{vout, out.value(), out.token_data(), out.script().bytes()});
         }
     }
@@ -145,7 +145,7 @@ std::vector<coin> target_state::unspent() const {
     }
     std::ranges::sort(out, [](coin const& a, coin const& b) {
         if (a.height != b.height) return a.height < b.height;
-        if (a.outpoint.hash() != b.outpoint.hash()) return encode_hash(a.outpoint.hash()) < encode_hash(b.outpoint.hash());
+        if (a.position != b.position) return a.position < b.position;
         return a.outpoint.index() < b.outpoint.index();
     });
     return out;

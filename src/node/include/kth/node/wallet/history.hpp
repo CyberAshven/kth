@@ -102,6 +102,8 @@ struct coin {
     domain::chain::token_data_opt token;
     data_chunk script;
     uint32_t height;
+    /// The creating transaction's position in its block.
+    uint32_t position;
 };
 
 /// The confirmed state of one target.
@@ -140,8 +142,8 @@ public:
     /// Whether a confirmed transaction spent the output.
     [[nodiscard]] bool is_spent(domain::chain::point const& outpoint) const;
 
-    /// The confirmed outputs no confirmed transaction spent, by height, then
-    /// transaction hash, then index.
+    /// The confirmed outputs no confirmed transaction spent, in chain order
+    /// (height, position in the block, index), as Fulcrum lists them.
     [[nodiscard]] std::vector<coin> unspent() const;
 
 private:

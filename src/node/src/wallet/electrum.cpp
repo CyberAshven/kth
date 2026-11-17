@@ -584,11 +584,11 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
                 if ( ! answer->confirmed.empty()) {
                     auto const& first = answer->confirmed.front();
                     co_return object().text("block_hash", encode_hash(first.block)).number("block_height", first.height)
-                        .text("tx_hash", encode_hash(first.txid)).done();
+                        .number("height", first.height).text("tx_hash", encode_hash(first.txid)).done();
                 }
                 if ( ! answer->unconfirmed.empty()) {
                     co_return object().text("block_hash", encode_hash(null_hash)).number("block_height", 0)
-                        .text("tx_hash", encode_hash(answer->unconfirmed.front().txid)).done();
+                        .number("height", 0).text("tx_hash", encode_hash(answer->unconfirmed.front().txid)).done();
                 }
                 co_return "null";
             }

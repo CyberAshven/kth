@@ -489,6 +489,20 @@ TEST_CASE("wallet history follows a token category across scripts, and filters t
     REQUIRE(state.next_height() == 5u);
 }
 
+TEST_CASE("wallet unspent outputs are in chain order, as Fulcrum lists them", "[wallet]") {
+    wallet::target_state state(wallet::target::of_script(p2pkh_a), 0);
+    // Two payments in one block: listed by their position in it, whatever their hashes.
+    auto const first = spending({chain::point(digest_of(41), 0)}, {{10, p2pkh_a}}, 41);
+    auto const second = spending({chain::point(digest_of(42), 0)}, {{20, p2pkh_a}, {30, p2pkh_a}}, 42);
+    REQUIRE(state.apply_block(3, digest_of(3), {coinbase_paying(p2pkh_b, 1, 3), second, first}));
+    auto const listed = state.unspent();
+    REQUIRE(listed.size() == 3u);
+    REQUIRE(listed[0].outpoint == chain::point(second.hash(), 0));
+    REQUIRE(listed[1].outpoint == chain::point(second.hash(), 1));
+    REQUIRE(listed[2].outpoint == chain::point(first.hash(), 0));
+    REQUIRE(listed[2].position == 2u);
+}
+
 TEST_CASE("wallet targets have the script filter keys of what they watch", "[wallet]") {
     auto const by_script = wallet::target::of_script(p2pkh_a);
     auto const by_hash = wallet::target::of_script_hash(sha256_hash(p2pkh_a));
