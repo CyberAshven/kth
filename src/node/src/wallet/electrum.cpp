@@ -39,7 +39,11 @@
 #include <kth/domain/wallet/payment_address.hpp>
 #include <kth/infrastructure/formats/base_16.hpp>
 #include <kth/infrastructure/utility/async_channel.hpp>
+#include <kth/blockchain/settings.hpp>
 #include <kth/node/wallet/blocks.hpp>
+#if defined(KTH_WITH_RPC)
+#include <kth/node/rpc/query.hpp>
+#endif
 
 namespace kth::node::wallet {
 
@@ -52,7 +56,8 @@ namespace chain = domain::chain;
 constexpr std::string_view protocol_version = "1.5";
 constexpr std::string_view software = "Knuth wallet support";
 constexpr size_t max_line = 4 * 1024 * 1024;
-constexpr auto notify_interval = 1s;
+// What a client follows is checked when something changes, and at least this often.
+constexpr auto notify_wait = std::chrono::seconds(60);
 
 // JSON-RPC error codes, as Fulcrum answers them.
 constexpr int invalid_params = -32602;
@@ -277,6 +282,21 @@ std::string header_json(uint32_t height, chain::header const& header) {
     return object().number("height", height).text("hex", encode_base16(header_bytes(header))).done();
 }
 
+std::string hashes_json(hash_list const& hashes) {
+    std::vector<std::string> items;
+    for (auto const& hash : hashes) items.push_back(quoted(encode_hash(hash)));
+    return array_of(items);
+}
+
+std::string dsproof_json(dsproof_info const& proof) {
+    object out;
+    out.text("dspid", encode_hash(proof.dspid)).text("txid", encode_hash(proof.txid)).text("hex", encode_base16(proof.raw));
+    out.raw("outpoint", object().text("txid", encode_hash(proof.outpoint.hash())).number("vout", proof.outpoint.index()).done());
+    hash_list descendants(proof.descendants.begin(), proof.descendants.end());
+    out.raw("descendants", hashes_json(descendants));
+    return out.done();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -427,7 +447,7 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
             out.raw("hosts", "{}");
             out.text("protocol_min", "1.4").text("protocol_max", protocol_version);
             out.raw("pruning", "null").text("server_version", software).text("hash_function", "sha256");
-            out.flag("cashtokens", true).flag("dsproof", false);
+            out.flag("cashtokens", true).flag("dsproof", true);
             out.raw("rpa", object().number("history_block_limit", 0).number("max_history", 0).number("prefix_bits", 16).number("prefix_bits_min", 4).number("starting_height", 0).done());
             co_return out.done();
         }
@@ -441,12 +461,22 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
         if (method == "blockchain.headers.unsubscribe") co_return "true";
         if (method == "blockchain.block.header") {
             if (params.empty() || params[0].what != param::kind::number || params[0].number < 0) co_return fail(invalid_params, "Invalid height");
-            if (params.size() > 1 && params[1].what == param::kind::number && params[1].number > 0) {
-                co_return fail(invalid_params, "checkpoint proofs are not answered yet");
+            auto const height = uint32_t(params[0].number);
+            uint32_t cp_height = 0;
+            if (params.size() > 1) {
+                if (params[1].what != param::kind::number || params[1].number < 0) co_return fail(invalid_params, "Invalid cp_height");
+                cp_height = uint32_t(params[1].number);
             }
-            auto const header = co_await wallet.header(uint32_t(params[0].number));
+            auto const header = co_await wallet.header(height);
             if ( ! header) co_return fail(invalid_params, "Invalid height");
-            co_return quoted(encode_base16(header_bytes(*header)));
+            if (cp_height == 0) co_return quoted(encode_base16(header_bytes(*header)));
+            auto const proof = co_await wallet.header_branch(height, cp_height);
+            if ( ! proof) {
+                co_return fail(invalid_params, "header height " + std::to_string(height) + " must be <= cp_height " +
+                    std::to_string(cp_height) + " which must be <= chain height");
+            }
+            co_return object().text("header", encode_base16(header_bytes(*header))).raw("branch", hashes_json(proof->first))
+                .text("root", encode_hash(proof->second)).done();
         }
         if (method == "blockchain.block.headers") {
             if (params.size() < 2 || params[0].what != param::kind::number || params[1].what != param::kind::number ||
@@ -461,7 +491,15 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
                 hex += encode_base16(header_bytes(*header));
                 ++found;
             }
-            co_return object().number("count", found).text("hex", hex).number("max", 2016).done();
+            object answer;
+            answer.number("count", found).text("hex", hex).number("max", 2016);
+            if (params.size() > 2 && params[2].what == param::kind::number && params[2].number > 0 && found > 0) {
+                auto const cp_height = uint32_t(params[2].number);
+                auto const proof = co_await wallet.header_branch(start + uint32_t(found) - 1, cp_height);
+                if ( ! proof) co_return fail(invalid_params, "header height + (count - 1) must be <= cp_height which must be <= chain height");
+                answer.raw("branch", hashes_json(proof->first)).text("root", encode_hash(proof->second));
+            }
+            co_return answer.done();
         }
         if (method == "blockchain.header.get") {
             if (params.empty()) co_return fail(invalid_params, "Invalid height or hash");
@@ -584,6 +622,23 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
             if ( ! found) co_return fail(bad_request, "No such mempool or blockchain transaction");
             auto const raw = transaction_bytes(found->tx);
             if ( ! verbose) co_return quoted(encode_base16(raw));
+#if defined(KTH_WITH_RPC)
+            {
+                // Fulcrum answers with its daemon's verbose getrawtransaction:
+                // kth's own is the same object.
+                std::optional<rpc::transaction_location> location;
+                if (found->confirmed) {
+                    auto const now = wallet.current();
+                    auto const tip_height = now.tip.value_or(found->confirmed->height);
+                    auto const header = co_await wallet.header(found->confirmed->height);
+                    location = rpc::transaction_location{found->confirmed->block,
+                        int64_t(tip_height) - int64_t(found->confirmed->height) + 1,
+                        header ? header->timestamp() : 0u};
+                }
+                co_return rpc::render_transaction_verbose(found->tx, network,
+                    blockchain::settings(network).enabled_flags(), location);
+            }
+#endif
             object out;
             out.text("hex", encode_base16(raw)).text("txid", encode_hash(*txid)).text("hash", encode_hash(*txid));
             out.number("size", int64_t(raw.size())).number("version", found->tx.version()).number("locktime", found->tx.locktime());
@@ -670,6 +725,36 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
             co_return std::to_string(found->confirmed ? found->confirmed->height : 0);
         }
         if (method == "blockchain.transaction.unsubscribe") co_return "true";
+
+        if (method == "blockchain.utxo.get_info") {
+            auto const txid = txid_of(params, 0);
+            if ( ! txid) co_return fail(invalid_params, "Invalid tx hash");
+            if (params.size() < 2 || params[1].what != param::kind::number || params[1].number < 0 || params[1].number > 0xffffffffll) {
+                co_return fail(invalid_params, "Invalid tx out number");
+            }
+            auto const found = co_await wallet.output(domain::chain::point(*txid, uint32_t(params[1].number)));
+            if ( ! found) co_return fail(internal_error, found.error().message());
+            if ( ! *found) co_return "null";
+            auto const& coin = **found;
+            object out;
+            if (coin.height) out.number("confirmed_height", *coin.height);
+            out.text("scripthash", encode_hash(sha256_hash(coin.script)));
+            if (coin.token) out.raw("token_data", token_json(*coin.token));
+            out.number("value", int64_t(coin.value));
+            co_return out.done();
+        }
+        if (method == "blockchain.transaction.dsproof.get" || method == "blockchain.transaction.dsproof.subscribe") {
+            auto const id = txid_of(params, 0);
+            if ( ! id) co_return fail(invalid_params, "Invalid dsp hash or tx hash");
+            auto const proof = co_await wallet.dsproof(*id);
+            if ( ! proof) co_return "null";
+            co_return dsproof_json(*proof);
+        }
+        if (method == "blockchain.transaction.dsproof.list") {
+            auto const listed = co_await wallet.dsproof_transactions();
+            co_return hashes_json(hash_list(listed.begin(), listed.end()));
+        }
+        if (method == "blockchain.transaction.dsproof.unsubscribe") co_return "true";
 
         // Reusable payment addresses
         if (method == "blockchain.rpa.get_history" || method == "blockchain.reusable.get_history") {
@@ -759,6 +844,8 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
         kth::select_channel<int> writing{1};
         std::map<std::string, std::string> scripts;   // scripthash or address -> last status
         std::optional<std::string> tip;               // last header sent, when subscribed
+        std::map<std::string, std::string> transactions;  // txid -> last height
+        std::map<std::string, std::string> proofs;        // txid -> last double-spend proof
         bool open = true;
         client() { (void)writing.try_send(0); }
     };
@@ -779,13 +866,51 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
 
     // Subscriptions are followed by asking again every second: a changed
     // status or tip is sent as Fulcrum sends it.
+    // What a client follows is sent when the wallet support reports a change
+    // (a new tip, a reorganization, a mempool transaction in or out, a
+    // double-spend proof), not found by asking again on a timer.
     ::asio::awaitable<void> notify(std::shared_ptr<client> who) {
         auto executor = co_await ::asio::this_coro::executor;
-        ::asio::steady_timer timer(executor);
+        ::asio::steady_timer pause(executor);
+        uint64_t seen = co_await wallet.changed(0, std::chrono::seconds(0));
         while (who->open && ! stopping) {
-            timer.expires_after(notify_interval);
-            auto [ec] = co_await timer.async_wait(::asio::as_tuple(::asio::use_awaitable));
-            if (ec || ! who->open) break;
+            auto const now_seen = co_await wallet.changed(seen, notify_wait);
+            if ( ! who->open || stopping) break;
+            if (now_seen == seen) {
+                // A stopped wallet answers at once: do not spin.
+                pause.expires_after(std::chrono::milliseconds(200));
+                auto [ignored] = co_await pause.async_wait(::asio::as_tuple(::asio::use_awaitable));
+                (void)ignored;
+            }
+            seen = now_seen;
+            for (auto& [txid_text, last] : std::map<std::string, std::string>(who->transactions)) {
+                auto const txid = decode_hash(txid_text);
+                if ( ! txid) continue;
+                auto const found = co_await wallet.transaction(*txid, std::nullopt);
+                auto const height = found ? std::to_string(found->confirmed ? found->confirmed->height : 0) : std::string("null");
+                auto const known = who->transactions.find(txid_text);
+                if (known == who->transactions.end() || known->second == height) continue;
+                known->second = height;
+                if ( ! co_await write_line(*who, object().text("jsonrpc", "2.0").text("method", "blockchain.transaction.subscribe")
+                        .raw("params", array_of({quoted(txid_text), height})).done())) {
+                    who->open = false;
+                    break;
+                }
+            }
+            for (auto& [txid_text, last] : std::map<std::string, std::string>(who->proofs)) {
+                auto const txid = decode_hash(txid_text);
+                if ( ! txid) continue;
+                auto const proof = co_await wallet.dsproof(*txid);
+                auto const shown = proof ? dsproof_json(*proof) : std::string("null");
+                auto const known = who->proofs.find(txid_text);
+                if (known == who->proofs.end() || known->second == shown) continue;
+                known->second = shown;
+                if ( ! co_await write_line(*who, object().text("jsonrpc", "2.0").text("method", "blockchain.transaction.dsproof.subscribe")
+                        .raw("params", array_of({quoted(txid_text), shown})).done())) {
+                    who->open = false;
+                    break;
+                }
+            }
             if (who->tip) {
                 auto const now = co_await tip();
                 if (now) {
@@ -850,6 +975,27 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
                 } else if (params && ! params->empty() && params->front().what == param::kind::string &&
                     (parsed->method == "blockchain.scripthash.unsubscribe" || parsed->method == "blockchain.address.unsubscribe")) {
                     who->scripts.erase(params->front().text);
+                } else if (params && ! params->empty() && params->front().what == param::kind::string &&
+                    parsed->method == "blockchain.transaction.subscribe") {
+                    auto const txid = decode_hash(params->front().text);
+                    if (txid) {
+                        auto const found = co_await wallet.transaction(*txid, std::nullopt);
+                        who->transactions[params->front().text] = found
+                            ? std::to_string(found->confirmed ? found->confirmed->height : 0) : std::string("null");
+                    }
+                } else if (params && ! params->empty() && params->front().what == param::kind::string &&
+                    parsed->method == "blockchain.transaction.unsubscribe") {
+                    who->transactions.erase(params->front().text);
+                } else if (params && ! params->empty() && params->front().what == param::kind::string &&
+                    parsed->method == "blockchain.transaction.dsproof.subscribe") {
+                    auto const txid = decode_hash(params->front().text);
+                    if (txid) {
+                        auto const proof = co_await wallet.dsproof(*txid);
+                        who->proofs[params->front().text] = proof ? dsproof_json(*proof) : std::string("null");
+                    }
+                } else if (params && ! params->empty() && params->front().what == param::kind::string &&
+                    parsed->method == "blockchain.transaction.dsproof.unsubscribe") {
+                    who->proofs.erase(params->front().text);
                 } else if (parsed->method == "blockchain.headers.subscribe") {
                     auto const now = co_await tip();
                     if (now) who->tip = header_json(now->first, now->second);

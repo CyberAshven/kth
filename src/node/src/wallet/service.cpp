@@ -285,6 +285,24 @@ domain::chain::block genesis_of(domain::config::network network) {
     return genesis_block(network);
 }
 
+std::pair<hash_list, hash_digest> merkle_branch_and_root(hash_list leaves, size_t index) {
+    hash_list branch;
+    while (leaves.size() > 1) {
+        if (leaves.size() % 2 != 0) leaves.push_back(leaves.back());
+        branch.push_back(leaves[index ^ 1]);
+        hash_list next;
+        next.reserve(leaves.size() / 2);
+        for (size_t at = 0; at < leaves.size(); at += 2) {
+            data_chunk pair(leaves[at].begin(), leaves[at].end());
+            pair.insert(pair.end(), leaves[at + 1].begin(), leaves[at + 1].end());
+            next.push_back(bitcoin_hash(pair));
+        }
+        leaves = std::move(next);
+        index /= 2;
+    }
+    return {std::move(branch), leaves.empty() ? null_hash : leaves.front()};
+}
+
 } // namespace detail
 
 namespace {
@@ -342,6 +360,11 @@ struct peer_impl final : service::impl {
 
     std::optional<bool> transaction_keys;
     bool synced = false;
+    detail::change_signal changes;
+    std::optional<uint32_t> announced_tip;
+    // Double-spend proofs from relay, by their hash.
+    std::map<hash_digest, dsproof_info> dsproofs;
+    std::set<hash_digest> requested_dsproofs;
     // Which peer served the filters of each appended batch: a filter that
     // does not fit its block is traced to the peer that served it.
     std::vector<std::tuple<uint8_t, uint32_t, uint32_t, uint64_t>> served_by;
@@ -421,6 +444,7 @@ struct peer_impl final : service::impl {
     void shutdown() {
         wake.close();
         history_lock.close();
+        changes.close();
         for (auto const& link : links) {
             if (link->session) link->session->stop();
         }
@@ -511,6 +535,10 @@ struct peer_impl final : service::impl {
         next.blocks_downloaded = blocks_downloaded;
         next.filter_bytes = (scripts ? scripts->data_bytes() : 0) + (prefixes ? prefixes->data_bytes() : 0);
         next.error = last_error;
+        if (next.tip != announced_tip) {
+            announced_tip = next.tip;
+            changes.bump();
+        }
         std::lock_guard<std::mutex> guard(status_mutex);
         snapshot = std::move(next);
     }
@@ -612,6 +640,7 @@ struct peer_impl final : service::impl {
             auto const inventory = message::inventory::from_data(reader, version);
             if ( ! inventory) co_return;
             hash_list wanted;
+            hash_list proofs;
             for (auto const& item : inventory->inventories()) {
                 if (item.type() == type_id::block) {
                     ring();
@@ -619,7 +648,16 @@ struct peer_impl final : service::impl {
                     if (pending_broadcasts.contains(item.hash())) relayed.insert(item.hash());
                     // Every announced transaction is fetched: what is asked for says nothing.
                     if ( ! pool.contains(item.hash()) && requested.insert(item.hash()).second) wanted.push_back(item.hash());
+                } else if (item.type() == type_id::double_spend_proof) {
+                    if ( ! dsproofs.contains(item.hash()) && requested_dsproofs.insert(item.hash()).second) {
+                        proofs.push_back(item.hash());
+                    }
                 }
+            }
+            if (requested_dsproofs.size() > 10'000) requested_dsproofs.clear();
+            if ( ! proofs.empty()) {
+                auto const fetch = message::get_data::create(proofs, type_id::double_spend_proof);
+                if (fetch) (void)co_await send(*link, *fetch);
             }
             if (requested.size() > 100'000) requested.clear();
             if ( ! wanted.empty()) {
@@ -634,6 +672,9 @@ struct peer_impl final : service::impl {
                 requested.erase(tx->hash());
                 on_mempool_tx(domain::chain::transaction(std::move(*tx)));
             }
+        } else if (command == message::double_spend_proof::command) {
+            auto const proof = message::double_spend_proof::from_data(reader, version);
+            if (proof) on_dsproof(*proof, raw.payload);
         } else if (command == message::fee_filter::command) {
             auto const fee = message::fee_filter::from_data(reader, version);
             if (fee) fee_filters[link->id] = fee->minimum_fee();
@@ -751,7 +792,9 @@ struct peer_impl final : service::impl {
         if (live_tip) live_tip = std::min(*live_tip, fork);
         pool.clear();
         requested.clear();
+        dsproofs.clear();
         synced = false;
+        changes.bump();
     }
 
     // ------------------------------------------------------------------------
@@ -1112,7 +1155,10 @@ struct peer_impl final : service::impl {
         std::vector<uint32_t> heights;
         for (auto height = start; height <= tip; ++height) heights.push_back(height);
         co_return co_await each_block(heights, [this](uint32_t height, block_ptr const& blk) -> std::error_code {
-            (void)pool.remove_for_block(blk->transactions());
+            if ( ! pool.remove_for_block(blk->transactions()).empty()) {
+                resolve_dsproofs();
+                changes.bump();
+            }
             std::vector<point> created;
             for (auto const& tx : blk->transactions()) {
                 auto const txid = tx.hash();
@@ -1160,7 +1206,53 @@ struct peer_impl final : service::impl {
     }
 
     void on_mempool_tx(domain::chain::transaction tx) {
-        (void)pool.insert(std::move(tx), [this](point const& outpoint) { return known_value(outpoint); });
+        if (pool.insert(std::move(tx), [this](point const& outpoint) { return known_value(outpoint); })) {
+            resolve_dsproofs();
+            changes.bump();
+        }
+    }
+
+    // The mempool transaction a proof is about, and its descendants.
+    void describe(dsproof_info& info) const {
+        info.descendants.clear();
+        auto const spender = pool.spender(info.outpoint);
+        info.txid = spender.value_or(null_hash);
+        if ( ! spender) return;
+        std::vector<hash_digest> pending{*spender};
+        std::set<hash_digest> seen;
+        while ( ! pending.empty()) {
+            auto const txid = pending.back();
+            pending.pop_back();
+            if ( ! seen.insert(txid).second) continue;
+            info.descendants.push_back(txid);
+            auto const* entry = pool.find(txid);
+            if (entry == nullptr) continue;
+            for (uint32_t vout = 0; vout < entry->tx.outputs().size(); ++vout) {
+                if (auto const child = pool.spender(point(txid, vout))) pending.push_back(*child);
+            }
+        }
+    }
+
+    void on_dsproof(message::double_spend_proof const& proof, data_chunk const& raw) {
+        auto const dspid = proof.hash();
+        requested_dsproofs.erase(dspid);
+        dsproof_info info{dspid, null_hash, raw, point(proof.out_point().hash(), proof.out_point().index()), {}};
+        describe(info);
+        dsproofs.insert_or_assign(dspid, std::move(info));
+        changes.bump();
+    }
+
+    // Proofs follow the mempool: descendants that arrive later join, proofs
+    // whose transaction left it go.
+    void resolve_dsproofs() {
+        for (auto it = dsproofs.begin(); it != dsproofs.end();) {
+            describe(it->second);
+            if (it->second.txid == null_hash) {
+                it = dsproofs.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     std::vector<unconfirmed_tx> unconfirmed_of(target_state const& state) const {
@@ -1528,6 +1620,72 @@ struct peer_impl final : service::impl {
         return out;
     }
 
+    ::asio::awaitable<std::expected<std::pair<hash_list, hash_digest>, std::error_code>>
+    header_branch(uint32_t height, uint32_t cp_height) override {
+        if (height > cp_height || cp_height > header_tip()) co_return std::unexpected(error::operation_failed);
+        hash_list leaves;
+        leaves.reserve(size_t(cp_height) + 1);
+        for (uint32_t at = 0; at <= cp_height; ++at) leaves.push_back(*hash_at(at));
+        co_return detail::merkle_branch_and_root(std::move(leaves), height);
+    }
+
+    // Spending an output puts its script's key (or its category's) in the
+    // spending block's script filter: only the blocks those keys match are read.
+    ::asio::awaitable<std::expected<std::optional<utxo>, std::error_code>> output(point outpoint) override {
+        if (pool.spender(outpoint)) co_return std::optional<utxo>{};
+        auto const found = co_await transaction(outpoint.hash(), std::nullopt);
+        if ( ! found) {
+            if (found.error() == error::not_found) co_return std::optional<utxo>{};
+            co_return std::unexpected(found.error());
+        }
+        auto const& outputs = found->tx.outputs();
+        if (outpoint.index() >= outputs.size()) co_return std::optional<utxo>{};
+        auto const& out = outputs[outpoint.index()];
+        auto const& script = out.script().bytes();
+        // OP_RETURN outputs are not spendable outputs.
+        if ( ! script.empty() && script.front() == 0x6a) co_return std::optional<utxo>{};
+        std::optional<uint32_t> height;
+        if (found->confirmed) height = found->confirmed->height;
+        utxo result{outpoint, out.value(), out.token_data(), script, height};
+        if ( ! height || ! scripts || ! scripts->tip() || *scripts->tip() <= *height) co_return std::optional<utxo>{result};
+        std::vector<scan_key> keys;
+        if ( ! script.empty()) keys.push_back(scan_key{domain::chain::script_key(script), *height + 1});
+        if (out.token_data()) keys.push_back(scan_key{domain::chain::category_key(out.token_data()->id), *height + 1});
+        if (keys.empty()) co_return std::optional<utxo>{result};
+        auto const hits = co_await scan_keys(keys, *height + 1, *scripts->tip());
+        if ( ! hits) co_return std::unexpected(hits.error());
+        for (auto const& [at, matched] : *hits) {
+            auto const blk = co_await fetch_block(at);
+            if ( ! blk) co_return std::unexpected(blk.error());
+            for (auto const& tx : (*blk)->transactions()) {
+                for (auto const& in : tx.inputs()) {
+                    if (in.previous_output().hash() == outpoint.hash() && in.previous_output().index() == outpoint.index()) {
+                        co_return std::optional<utxo>{};
+                    }
+                }
+            }
+        }
+        co_return std::optional<utxo>{result};
+    }
+
+    ::asio::awaitable<std::optional<dsproof_info>> dsproof(hash_digest id) override {
+        if (auto const found = dsproofs.find(id); found != dsproofs.end()) co_return found->second;
+        for (auto const& [dspid, info] : dsproofs) {
+            if (std::ranges::find(info.descendants, id) != info.descendants.end()) co_return info;
+        }
+        co_return std::nullopt;
+    }
+
+    ::asio::awaitable<std::vector<hash_digest>> dsproof_transactions() override {
+        std::set<hash_digest> all;
+        for (auto const& [dspid, info] : dsproofs) all.insert(info.descendants.begin(), info.descendants.end());
+        co_return std::vector<hash_digest>(all.begin(), all.end());
+    }
+
+    ::asio::awaitable<uint64_t> changed(uint64_t seen, std::chrono::steady_clock::time_point deadline) override {
+        co_return co_await changes.wait(seen, deadline);
+    }
+
     void request_stop() override {
         stopping = true;
         ::asio::post(*io, [this] { shutdown(); });
@@ -1688,6 +1846,28 @@ service::rpa_history(uint16_t prefix, uint8_t bits, uint32_t from, std::optional
     co_return co_await ::asio::co_spawn(impl_->executor(), [state]() -> ::asio::awaitable<mempool_summary> {
         co_return state->mempool();
     }, ::asio::use_awaitable);
+}
+
+::asio::awaitable<std::expected<std::pair<hash_list, hash_digest>, std::error_code>>
+service::header_branch(uint32_t height, uint32_t cp_height) {
+    co_return co_await ::asio::co_spawn(impl_->executor(), impl_->header_branch(height, cp_height), ::asio::use_awaitable);
+}
+
+::asio::awaitable<std::expected<std::optional<utxo>, std::error_code>> service::output(domain::chain::point outpoint) {
+    co_return co_await ::asio::co_spawn(impl_->executor(), impl_->output(outpoint), ::asio::use_awaitable);
+}
+
+::asio::awaitable<std::optional<dsproof_info>> service::dsproof(hash_digest dspid_or_txid) {
+    co_return co_await ::asio::co_spawn(impl_->executor(), impl_->dsproof(dspid_or_txid), ::asio::use_awaitable);
+}
+
+::asio::awaitable<std::vector<hash_digest>> service::dsproof_transactions() {
+    co_return co_await ::asio::co_spawn(impl_->executor(), impl_->dsproof_transactions(), ::asio::use_awaitable);
+}
+
+::asio::awaitable<uint64_t> service::changed(uint64_t seen, std::chrono::seconds timeout) {
+    auto const deadline = std::chrono::steady_clock::now() + timeout;
+    co_return co_await ::asio::co_spawn(impl_->executor(), impl_->changed(seen, deadline), ::asio::use_awaitable);
 }
 
 ::asio::awaitable<std::optional<domain::chain::header>> service::header(uint32_t height) {

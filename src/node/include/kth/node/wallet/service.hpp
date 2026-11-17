@@ -113,6 +113,17 @@ struct fee_estimate {
     uint64_t estimate;
 };
 
+/// A double-spend proof relayed by peers (or held by the node's mempool).
+struct dsproof_info {
+    hash_digest dspid;
+    /// The mempool transaction that spends the outpoint the proof is about.
+    hash_digest txid;
+    data_chunk raw;
+    domain::chain::point outpoint;
+    /// That transaction and its mempool descendants.
+    std::vector<hash_digest> descendants;
+};
+
 struct mempool_summary {
     size_t count;
     size_t bytes;
@@ -173,8 +184,20 @@ struct peer_settings {
     std::string user_agent;
 };
 
+/// How a full node finds the blocks that matter to a wallet.
+enum class chain_scan : uint8_t {
+    /// Each stored block is parsed and applied to every target: outputs to a
+    /// watched script or category, inputs that spend the target's outpoints.
+    direct,
+    /// Each block's script filter is built from the block and its undo record
+    /// (as the node serves it, nothing stored) and only the blocks it matches
+    /// are applied.
+    filters,
+};
+
 /// How a full node answers its wallet from its own chain.
 struct chain_settings {
+    chain_scan scan = chain_scan::direct;
     /// The first height a target is read from when it is watched without one.
     uint32_t birthday = 0;
     /// Blocks read at once during a scan.
@@ -244,6 +267,27 @@ public:
     ::asio::awaitable<fee_estimate> fees();
     ::asio::awaitable<mempool_summary> mempool();
     ::asio::awaitable<std::optional<domain::chain::header>> header(uint32_t height);
+
+    /// The Merkle branch of the hash of block `height` in the tree of the block
+    /// hashes 0 to `cp_height`, and that tree's root (Electrum's header proofs).
+    ::asio::awaitable<std::expected<std::pair<hash_list, hash_digest>, std::error_code>> header_branch(uint32_t height, uint32_t cp_height);
+
+    /// An output that exists and nothing spends, confirmed or in the mempool;
+    /// none when it is spent or does not exist.
+    ::asio::awaitable<std::expected<std::optional<utxo>, std::error_code>> output(domain::chain::point outpoint);
+
+    /// The double-spend proof with this hash, or the one about this
+    /// transaction or one of its ancestors in the mempool.
+    ::asio::awaitable<std::optional<dsproof_info>> dsproof(hash_digest dspid_or_txid);
+
+    /// Every mempool transaction a double-spend proof is about, with its descendants.
+    ::asio::awaitable<std::vector<hash_digest>> dsproof_transactions();
+
+    /// The number of changes so far (a new tip, a reorganization, a mempool
+    /// transaction in or out, a double-spend proof), as soon as it is above
+    /// `seen`, or after `timeout`. What follows the wallet waits on this
+    /// instead of asking again and again.
+    ::asio::awaitable<uint64_t> changed(uint64_t seen, std::chrono::seconds timeout);
 
     struct impl;
 
