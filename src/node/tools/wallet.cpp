@@ -16,6 +16,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <future>
 #include <optional>
 #include <string>
@@ -26,6 +27,7 @@
 #include <asio/detached.hpp>
 #include <asio/io_context.hpp>
 #include <asio/signal_set.hpp>
+#include <asio/steady_timer.hpp>
 #include <asio/use_future.hpp>
 
 #include <kth/node/wallet/electrum.hpp>
@@ -121,9 +123,30 @@ int main(int argc, char** argv) {
         std::printf("electrum %u\n", unsigned(*bound));
         std::fflush(stdout);
 
+        // Where it stands, every two seconds, as one line of JSON: heights,
+        // peers, and the bytes it sent and received.
         ::asio::io_context signals_context;
         ::asio::signal_set signals(signals_context, SIGINT, SIGTERM);
-        signals.async_wait([](std::error_code, int) {});
+        ::asio::steady_timer report(signals_context);
+        std::function<void()> print_status = [&] {
+            auto const now = service.current();
+            auto const height = [](std::optional<uint32_t> const& value) {
+                return value ? std::to_string(*value) : std::string("null");
+            };
+            std::printf("status {\"header_height\":%u,\"tip\":%s,\"input_prefix_tip\":%s,\"peers\":%zu,"
+                "\"synced\":%s,\"bytes_received\":%llu,\"bytes_sent\":%llu,\"blocks_downloaded\":%llu,"
+                "\"filter_bytes\":%llu}\n", now.header_height, height(now.tip).c_str(), height(now.input_prefix_tip).c_str(),
+                now.peers, now.synced ? "true" : "false", (unsigned long long)now.bytes_received,
+                (unsigned long long)now.bytes_sent, (unsigned long long)now.blocks_downloaded,
+                (unsigned long long)now.filter_bytes);
+            std::fflush(stdout);
+            report.expires_after(std::chrono::seconds(2));
+            report.async_wait([&](std::error_code ec) {
+                if ( ! ec) print_status();
+            });
+        };
+        print_status();
+        signals.async_wait([&](std::error_code, int) { report.cancel(); });
         signals_context.run();
         listener.stop();
         service.stop();
