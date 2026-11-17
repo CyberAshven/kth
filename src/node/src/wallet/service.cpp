@@ -22,13 +22,14 @@
 #include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/deferred.hpp>
+#include <asio/post.hpp>
+#include <asio/this_coro.hpp>
+#include <asio/use_awaitable.hpp>
+#if ! defined(KTH_BROWSER_NODE)
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
-#include <asio/post.hpp>
-#include <asio/steady_timer.hpp>
-#include <asio/this_coro.hpp>
 #include <asio/thread_pool.hpp>
-#include <asio/use_awaitable.hpp>
+#endif
 
 #include <spdlog/spdlog.h>
 
@@ -37,7 +38,11 @@
 #include <kth/domain/chain/script_filter_builder.hpp>
 #include <kth/infrastructure/formats/base_16.hpp>
 #include <kth/infrastructure/utility/async_channel.hpp>
+#include <kth/infrastructure/utility/platform_timer.hpp>
 #include <kth/infrastructure/utility/task_group.hpp>
+#if defined(KTH_BROWSER_NODE)
+#include <kth/node/detail/worker_runtime.hpp>
+#endif
 #include <kth/network/peer_session.hpp>
 #include <kth/network/protocols_coro.hpp>
 #include <kth/node/user_agent.hpp>
@@ -140,6 +145,7 @@ hash_list locator(blockchain::header_index const& index) {
     }
 }
 
+#if ! defined(KTH_BROWSER_NODE)
 // host:port, [v6]:port or host alone.
 std::pair<std::string, uint16_t> split_endpoint(std::string const& endpoint, uint16_t fallback) {
     auto host = endpoint;
@@ -164,9 +170,11 @@ std::pair<std::string, uint16_t> split_endpoint(std::string const& endpoint, uin
     }
     return {host, port};
 }
+#endif
 
+// kth::steady_timer: in a browser node, the timer its Worker's runtime wakes for.
 ::asio::awaitable<void> pause(std::chrono::steady_clock::duration duration) {
-    ::asio::steady_timer timer(co_await ::asio::this_coro::executor, duration);
+    kth::steady_timer timer(co_await ::asio::this_coro::executor, duration);
     co_await timer.async_wait(::asio::as_tuple(::asio::use_awaitable));
 }
 
@@ -380,13 +388,21 @@ struct peer_impl final : service::impl {
     std::atomic<bool> stopping{false};
 
     // Last: destroyed first, so no operation outlives what it uses.
+#if defined(KTH_BROWSER_NODE)
+    // The Worker's runtime: everything runs on the Worker's one thread, and
+    // the scans inline.
+    std::shared_ptr<browser::runtime> runtime = node::detail::worker_runtime();
+#else
     std::unique_ptr<::asio::io_context> io;
     std::optional<::asio::executor_work_guard<::asio::io_context::executor_type>> work;
+#endif
     kth::select_channel<int> wake{1};
     kth::select_channel<int> history_lock{1};
     std::unique_ptr<kth::task_group> tasks;
+#if ! defined(KTH_BROWSER_NODE)
     std::unique_ptr<::asio::thread_pool> scan_pool;
     std::thread thread;
+#endif
 
     peer_impl(peer_settings given, size_t capacity)
         : settings(std::move(given))
@@ -396,7 +412,10 @@ struct peer_impl final : service::impl {
         , consensus(validation_settings(settings.network))
         , organizer(index, consensus, settings.network)
         , pool(settings.mempool_bytes)
-        , io(std::make_unique<::asio::io_context>(1)) {
+#if ! defined(KTH_BROWSER_NODE)
+        , io(std::make_unique<::asio::io_context>(1))
+#endif
+    {
         // It keeps headers and filters: it serves no blocks. It asks peers
         // to announce transactions, for the mempool copy.
         transport.services = 0;
@@ -411,13 +430,20 @@ struct peer_impl final : service::impl {
         organizer.sync_tip();
         organizer.start();
         (void)history_lock.try_send(0);
+#if ! defined(KTH_BROWSER_NODE)
         work.emplace(io->get_executor());
-        tasks = std::make_unique<kth::task_group>("wallet peers", io->get_executor());
         scan_pool = std::make_unique<::asio::thread_pool>(1);
+#endif
+        tasks = std::make_unique<kth::task_group>("wallet peers", executor());
     }
 
     ~peer_impl() override {
         stopping = true;
+#if defined(KTH_BROWSER_NODE)
+        // The Worker owns the thread: run() has returned before this (see
+        // service.hpp), so nothing waits on what is destroyed here.
+        shutdown();
+#else
         ::asio::post(*io, [this] { shutdown(); });
         work.reset();
         auto const deadline = std::chrono::steady_clock::now() + 10s;
@@ -427,17 +453,29 @@ struct peer_impl final : service::impl {
         io->stop();
         if (thread.joinable()) thread.join();
         scan_pool->join();
+#endif
         links.clear();
+#if ! defined(KTH_BROWSER_NODE)
         io.reset();
+#endif
         organizer.stop();
         persist();
     }
 
     void start_thread() {
+#if ! defined(KTH_BROWSER_NODE)
         thread = std::thread([this] { io->run(); });
+#endif
     }
 
-    ::asio::any_io_executor executor() const override { return io->get_executor(); }
+    ::asio::any_io_executor executor() const override {
+#if defined(KTH_BROWSER_NODE)
+        runtime->wake();
+        return runtime->context().get_executor();
+#else
+        return io->get_executor();
+#endif
+    }
 
     void ring() { (void)wake.try_send(0); }
 
@@ -694,8 +732,15 @@ struct peer_impl final : service::impl {
 
     ::asio::awaitable<std::shared_ptr<peer_link>> connect(std::string endpoint, bool isolated) {
         auto executor = co_await ::asio::this_coro::executor;
+#if defined(KTH_BROWSER_NODE)
+        // A ws:// or wss:// bridge that relays the peer's byte stream.
+        auto bridged = transport;
+        bridged.browser_bridge_url = endpoint;
+        auto connected = co_await network::async_connect(executor, "ws-peer", 8333, bridged, connect_timeout);
+#else
         auto const [host, port] = split_endpoint(endpoint, transport.inbound_port);
         auto connected = co_await network::async_connect(executor, host, port, transport, connect_timeout);
+#endif
         if ( ! connected) co_return nullptr;
         auto session = *connected;
         auto config = network::make_handshake_config(transport, header_tip(), next_nonce());
@@ -1267,12 +1312,17 @@ struct peer_impl final : service::impl {
         if ( ! scripts) co_return scan_hits{};
         auto locations = scripts->locations(from, to + 1);
         auto path = scripts->data_path();
+#if defined(KTH_BROWSER_NODE)
+        // Inline: the Worker has one thread.
+        co_return scan_script_filters(path, locations, keys, 1);
+#else
         auto const workers = threads;
         co_return co_await ::asio::co_spawn(scan_pool->get_executor(),
             [path, locations = std::move(locations), keys = std::move(keys), workers]()
                 -> ::asio::awaitable<std::expected<scan_hits, std::error_code>> {
                 co_return scan_script_filters(path, locations, keys, workers);
             }, ::asio::use_awaitable);
+#endif
     }
 
     ::asio::awaitable<std::error_code> catch_up() {
@@ -1511,12 +1561,17 @@ struct peer_impl final : service::impl {
         if (first > last) co_return out;
         auto locations = prefixes->locations(first, last + 1);
         auto path = prefixes->data_path();
-        auto const workers = threads;
         std::vector<scan_prefix> asked{scan_prefix{prefix, bits, first}};
+#if defined(KTH_BROWSER_NODE)
+        // Inline: the Worker has one thread.
+        auto const hits = scan_input_prefix_filters(path, locations, asked, 1);
+#else
+        auto const workers = threads;
         auto const hits = co_await ::asio::co_spawn(scan_pool->get_executor(),
             [path, locations = std::move(locations), asked, workers]() -> ::asio::awaitable<std::expected<scan_hits, std::error_code>> {
                 co_return scan_input_prefix_filters(path, locations, asked, workers);
             }, ::asio::use_awaitable);
+#endif
         if ( ! hits) co_return std::unexpected(hits.error());
         std::vector<uint32_t> heights;
         for (auto const& [height, matched] : *hits) heights.push_back(height);
@@ -1688,7 +1743,7 @@ struct peer_impl final : service::impl {
 
     void request_stop() override {
         stopping = true;
-        ::asio::post(*io, [this] { shutdown(); });
+        ::asio::post(executor(), [this] { shutdown(); });
     }
 
     bool stopped() const override {
@@ -1746,10 +1801,12 @@ std::expected<std::unique_ptr<service>, std::error_code> service::from_peers(pee
     return std::unique_ptr<service>(new service(std::unique_ptr<impl>(std::move(state))));
 }
 
+#if ! defined(KTH_BROWSER_NODE)
 std::unique_ptr<service> service::from_chain(blockchain::block_chain& chain, domain::config::network network,
         chain_settings settings) {
     return std::unique_ptr<service>(new service(detail::make_chain_impl(chain, network, settings)));
 }
+#endif
 
 service::service(std::unique_ptr<impl> state) : impl_(std::move(state)) {}
 

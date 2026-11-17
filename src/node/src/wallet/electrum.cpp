@@ -27,7 +27,6 @@
 #include <asio/ip/tcp.hpp>
 #include <asio/post.hpp>
 #include <asio/read_until.hpp>
-#include <asio/steady_timer.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 #include <asio/write.hpp>
@@ -39,6 +38,7 @@
 #include <kth/domain/wallet/payment_address.hpp>
 #include <kth/infrastructure/formats/base_16.hpp>
 #include <kth/infrastructure/utility/async_channel.hpp>
+#include <kth/infrastructure/utility/platform_timer.hpp>
 #include <kth/blockchain/settings.hpp>
 #include <kth/node/wallet/blocks.hpp>
 #if defined(KTH_WITH_RPC)
@@ -869,7 +869,7 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
     // double-spend proof), not found by asking again on a timer.
     ::asio::awaitable<void> notify(std::shared_ptr<client> who) {
         auto executor = co_await ::asio::this_coro::executor;
-        ::asio::steady_timer pause(executor);
+        kth::steady_timer pause(executor);
         uint64_t seen = co_await wallet.changed(0, std::chrono::seconds(0));
         while (who->open && ! stopping) {
             auto const now_seen = co_await wallet.changed(seen, notify_wait);
