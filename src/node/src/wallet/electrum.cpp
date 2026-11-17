@@ -66,6 +66,12 @@ constexpr int parse_error = -32700;
 constexpr int internal_error = -32603;
 constexpr int bad_request = 1;
 
+// Fulcrum's RPA defaults: the shortest prefix answered, and the blocks one
+// blockchain.rpa.get_history call reads at most (rpa_history_blocks).
+constexpr size_t rpa_prefix_bits_min = 8;
+constexpr uint32_t rpa_history_blocks = 60;
+constexpr std::string_view rpa_prefix_refusal = "Invalid prefix argument; expected hex string of at least 2 and at most 4 characters";
+
 struct failure {
     int code;
     std::string message;
@@ -382,8 +388,9 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
         return *hash;
     }
 
+    // At least rpa_prefix_bits_min bits (8, Fulcrum's default), at most 16.
     static std::optional<std::pair<uint16_t, uint8_t>> prefix_of(param const& p) {
-        if (p.what != param::kind::string || p.text.empty() || p.text.size() > 4) return std::nullopt;
+        if (p.what != param::kind::string || p.text.size() < rpa_prefix_bits_min / 4 || p.text.size() > 4) return std::nullopt;
         uint32_t value = 0;
         auto const [end, ec] = std::from_chars(p.text.data(), p.text.data() + p.text.size(), value, 16);
         if (ec != std::errc{} || end != p.text.data() + p.text.size()) return std::nullopt;
@@ -448,7 +455,8 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
             out.text("protocol_min", "1.4").text("protocol_max", protocol_version);
             out.raw("pruning", "null").text("server_version", software).text("hash_function", "sha256");
             out.flag("cashtokens", true).flag("dsproof", true);
-            out.raw("rpa", object().number("history_block_limit", 0).number("max_history", 0).number("prefix_bits", 16).number("prefix_bits_min", 4).number("starting_height", 0).done());
+            out.raw("rpa", object().number("history_block_limit", rpa_history_blocks).number("max_history", 0).number("prefix_bits", 16)
+                .number("prefix_bits_min", int64_t(rpa_prefix_bits_min)).number("starting_height", 0).done());
             co_return out.done();
         }
 
@@ -769,28 +777,26 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
                     co_return fail(invalid_params, "Bad count argument");
                 }
             }
-            if (args.empty()) co_return fail(invalid_params, "Bad prefix");
+            if (args.empty()) co_return fail(invalid_params, std::string(rpa_prefix_refusal));
             auto const prefix = prefix_of(args[0]);
-            if ( ! prefix) co_return fail(invalid_params, "Bad prefix");
+            if ( ! prefix) co_return fail(invalid_params, std::string(rpa_prefix_refusal));
             auto const range = range_of(args, 1);
             if ( ! range) co_return fail(invalid_params, "Bad from_height or to_height argument");
             if (range->second && *range->second <= range->first) co_return "[]";
-            std::optional<uint32_t> last;
-            if (range->second) last = *range->second - 1;
+            // As Fulcrum: at most rpa_history_blocks blocks from from_height,
+            // and never the mempool (blockchain.rpa.get_mempool has it).
+            auto last = range->first + (rpa_history_blocks - 1);
+            if (range->second) last = std::min(last, *range->second - 1);
             auto const confirmed = co_await wallet.rpa_history(prefix->first, prefix->second, range->first, last);
             if ( ! confirmed) co_return fail(internal_error, confirmed.error().message());
             std::vector<std::string> items;
             for (auto const& match : *confirmed) items.push_back(history_item(match.txid, match.height.value_or(0), std::nullopt));
-            if ( ! range->second) {
-                auto const pending = co_await wallet.rpa_mempool(prefix->first, prefix->second);
-                for (auto const& match : pending) items.push_back(history_item(match.txid, 0, std::nullopt));
-            }
             co_return array_of(items);
         }
         if (method == "blockchain.rpa.get_mempool" || method == "blockchain.reusable.get_mempool") {
-            if (params.empty()) co_return fail(invalid_params, "Bad prefix");
+            if (params.empty()) co_return fail(invalid_params, std::string(rpa_prefix_refusal));
             auto const prefix = prefix_of(params[0]);
-            if ( ! prefix) co_return fail(invalid_params, "Bad prefix");
+            if ( ! prefix) co_return fail(invalid_params, std::string(rpa_prefix_refusal));
             std::vector<std::string> items;
             auto const pending = co_await wallet.rpa_mempool(prefix->first, prefix->second);
             for (auto const& match : pending) items.push_back(history_item(match.txid, 0, std::nullopt));

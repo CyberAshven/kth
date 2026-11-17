@@ -505,6 +505,10 @@ TEST_CASE("wallet from peers: histories, balances, a transaction by hash alone, 
     char prefix_text[8];
     std::snprintf(prefix_text, sizeof(prefix_text), "%04x", unsigned(value));
     REQUIRE(ask("blockchain.rpa.get_history", std::string("[\"") + prefix_text + "\",0]").find(encode_hash(ground.hash())) != std::string::npos);
+    // to_height is exclusive, and a prefix shorter than 8 bits is refused, as Fulcrum refuses it.
+    REQUIRE(ask("blockchain.rpa.get_history", std::string("[\"") + prefix_text + "\",0,20]").find(encode_hash(ground.hash())) == std::string::npos);
+    REQUIRE(ask("blockchain.rpa.get_history", std::string("[\"") + prefix_text + "\",20,21]").find(encode_hash(ground.hash())) != std::string::npos);
+    REQUIRE(ask("blockchain.rpa.get_history", std::string("[\"") + prefix_text[0] + "\",0]").find(R"("code":-32602)") != std::string::npos);
     REQUIRE(ask("no.such.method", "[]").find(R"("code":-32601)") != std::string::npos);
     REQUIRE(wait_for(service, electrum.answer("not json")).find(R"("code":-32700)") != std::string::npos);
     auto const batch = wait_for(service, electrum.answer(R"([{"id":1,"method":"server.ping","params":[]},{"id":2,"method":"server.version","params":[]}])"));
