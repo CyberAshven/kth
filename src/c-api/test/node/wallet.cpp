@@ -1,6 +1,7 @@
 // Copyright (c) 2016-present Knuth Project developers.
 // Distributed under the MIT software license, see the accompanying file COPYING.
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <future>
@@ -26,6 +27,20 @@ void on_answer(kth_wallet_mut_t, void* ctx, kth_error_code_t status, char* answe
 
 void on_run(kth_wallet_mut_t, void* ctx, kth_error_code_t status) {
     static_cast<std::promise<kth_error_code_t>*>(ctx)->set_value(status);
+}
+
+// Reads the handle it is given, as a handler may.
+struct run_reading {
+    std::atomic<bool> read{false};
+    std::string status;
+};
+
+void on_run_reading(kth_wallet_mut_t self, void* ctx, kth_error_code_t) {
+    auto* reading = static_cast<run_reading*>(ctx);
+    char* status = kth_node_wallet_status(self);
+    reading->status = status != nullptr ? status : "";
+    kth_core_destruct_string(status);
+    reading->read = true;
 }
 
 } // namespace
@@ -78,5 +93,22 @@ TEST_CASE("C wallet from peers answers requests and reports where it stands", "[
 
     kth_node_wallet_destruct(wallet);
     kth_node_wallet_destruct(nullptr);
+    std::filesystem::remove_all(directory, ignored);
+}
+
+TEST_CASE("C wallet released while it runs: the run handler gets the handle whole, before the release returns", "[capi][wallet]") {
+    auto const directory = std::filesystem::temp_directory_path() / "kth_capi_wallet_release";
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+    char const* peers[] = {"127.0.0.1:1"};
+    kth_wallet_mut_t wallet = nullptr;
+    REQUIRE(kth_node_wallet_construct_from_peers(kth_network_regtest, directory.string().c_str(), peers, 1, 0,
+        nullptr, &wallet) == kth_ec_success);
+    run_reading reading;
+    kth_node_wallet_async_run(wallet, &reading, on_run_reading);
+    // Released at once, without a stop first.
+    kth_node_wallet_destruct(wallet);
+    REQUIRE(reading.read);
+    REQUIRE(reading.status.find("\"source\":\"peers\"") != std::string::npos);
     std::filesystem::remove_all(directory, ignored);
 }

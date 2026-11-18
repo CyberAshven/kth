@@ -4,9 +4,12 @@
 
 #include <kth/capi/node/wallet.h>
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <string>
@@ -27,10 +30,32 @@ namespace {
 namespace wallet = kth::node::wallet;
 
 // The service, and the Electrum-protocol answers in front of it (no
-// listener). Destroyed in reverse: the answers go before the service.
+// listener). Destroyed in reverse: the answers go before the service, and
+// both only once every handler given the handle has returned.
 struct wallet_handle {
     std::unique_ptr<wallet::service> service;
     std::unique_ptr<wallet::electrum_server> answers;
+    std::mutex mutex;
+    std::condition_variable idle;
+    size_t pending = 0;
+
+    void begin() {
+        std::lock_guard<std::mutex> guard(mutex);
+        ++pending;
+    }
+
+    void end() {
+        std::lock_guard<std::mutex> guard(mutex);
+        --pending;
+        idle.notify_all();
+    }
+
+    // A stopped service ends what it runs at once; one stuck past a minute
+    // is not waited for.
+    void wait_idle() {
+        std::unique_lock<std::mutex> guard(mutex);
+        (void)idle.wait_for(guard, std::chrono::minutes(1), [this] { return pending == 0; });
+    }
 };
 
 wallet_handle& handle_of(void const* self) {
@@ -117,6 +142,9 @@ void kth_node_wallet_destruct(kth_wallet_mut_t self) {
     auto* owned = static_cast<wallet_handle*>(self);
     owned->answers->stop();
     owned->service->stop();
+    // A run or a request under way ends with the service stopped, and its
+    // handler gets the handle whole.
+    owned->wait_idle();
     delete owned;
 }
 
@@ -125,10 +153,17 @@ void kth_node_wallet_async_run(kth_wallet_mut_t self, void* ctx, kth_node_wallet
     KTH_PRECONDITION(handler != nullptr);
     try {
         auto& owned = handle_of(self);
-        ::asio::co_spawn(owned.service->executor(), owned.service->run(),
-            [self, ctx, handler](std::exception_ptr failure, std::error_code ec) {
-                handler(self, ctx, failure ? kth_ec_unhandled_exception : kth::to_c_err(ec));
-            });
+        owned.begin();
+        try {
+            ::asio::co_spawn(owned.service->executor(), owned.service->run(),
+                [self, ctx, handler, &owned](std::exception_ptr failure, std::error_code ec) {
+                    handler(self, ctx, failure ? kth_ec_unhandled_exception : kth::to_c_err(ec));
+                    owned.end();
+                });
+        } catch (...) {
+            owned.end();
+            throw;
+        }
     } catch (std::bad_alloc const&) {
         handler(self, ctx, kth_ec_out_of_memory);
     } catch (...) {
@@ -173,14 +208,21 @@ void kth_node_wallet_async_request(kth_wallet_mut_t self, char const* request, v
     KTH_PRECONDITION(handler != nullptr);
     try {
         auto& owned = handle_of(self);
-        ::asio::co_spawn(owned.service->executor(), owned.answers->answer(std::string(request)),
-            [self, ctx, handler](std::exception_ptr failure, std::string answer) {
-                if (failure) {
-                    handler(self, ctx, kth_ec_unhandled_exception, nullptr);
-                    return;
-                }
-                handler(self, ctx, kth_ec_success, kth::create_c_str(answer));
-            });
+        owned.begin();
+        try {
+            ::asio::co_spawn(owned.service->executor(), owned.answers->answer(std::string(request)),
+                [self, ctx, handler, &owned](std::exception_ptr failure, std::string answer) {
+                    if (failure) {
+                        handler(self, ctx, kth_ec_unhandled_exception, nullptr);
+                    } else {
+                        handler(self, ctx, kth_ec_success, kth::create_c_str(answer));
+                    }
+                    owned.end();
+                });
+        } catch (...) {
+            owned.end();
+            throw;
+        }
     } catch (std::bad_alloc const&) {
         handler(self, ctx, kth_ec_out_of_memory, nullptr);
     } catch (...) {

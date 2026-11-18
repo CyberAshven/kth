@@ -55,7 +55,7 @@ KTH_EXPORT
 kth_error_code_t kth_node_wallet_construct_from_chain(kth_chain_t chain, kth_network_t network, uint32_t birthday,
     KTH_OUT_OWNED kth_wallet_mut_t* out);
 
-/** Stops it and releases it. Null is ignored. */
+/** Stops it and releases it once every handler given it has returned (so not from inside one). Null is ignored. */
 KTH_EXPORT
 void kth_node_wallet_destruct(kth_wallet_mut_t self);
 
