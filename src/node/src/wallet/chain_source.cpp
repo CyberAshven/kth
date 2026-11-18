@@ -66,6 +66,8 @@ struct chain_impl final : service::impl {
     std::map<hash_digest, target_state> targets;
     mempool_copy pool;
     std::set<hash_digest> pooled;
+    // The identities followed (in memory: the node keeps no wallet files).
+    detail::identity_memory known_identities;
     // The block applied to the targets at each recent height.
     std::map<uint32_t, hash_digest> applied;
     // The generation of the chain view last followed.
@@ -522,6 +524,67 @@ struct chain_impl final : service::impl {
 
     // An output a watched target owns is answered from its state; any other
     // is found by reading its transaction's block and the blocks after it.
+    // A confirmed output from the node's UTXO set: the output, or none when
+    // it is spent (or never was); no answer while the set is not built to
+    // the tip.
+    std::optional<std::optional<utxo>> utxo_of(point const& outpoint) const {
+        auto const built = chain.get_utxo_built_height();
+        if ( ! built || *built < tip()) return std::nullopt;
+        auto const stored = chain.get_utxo(domain::chain::output_point{outpoint.hash(), outpoint.index()}, tip());
+        if ( ! stored) {
+            if (stored.error() != database::result_code::key_not_found) return std::nullopt;
+            return std::optional<utxo>{};
+        }
+        auto const& out = stored->output;
+        if ( ! out.script().bytes().empty() && out.script().bytes().front() == 0x6a) return std::optional<utxo>{};
+        return std::optional<utxo>{utxo{outpoint, out.value(), out.token_data(), out.script().bytes(), uint32_t(stored->height)}};
+    }
+
+    // A watched target that owned the output saw its spend; an output the
+    // UTXO set holds has none confirmed; otherwise the node's own blocks
+    // are read forward from `from` until one spends it. Then the mempool.
+    ::asio::awaitable<std::expected<std::optional<transaction_info>, std::error_code>> spender_of(
+            point outpoint, data_chunk script, std::optional<uint32_t> from) override {
+        (void)script;
+        co_await refresh_pool();
+        if (from) {
+            std::optional<uint32_t> start = *from;
+            for (auto const& [key, state] : targets) {
+                for (auto const& entry : state.history()) {
+                    if (entry.height < *from) continue;
+                    if (std::ranges::any_of(entry.inputs, [&](spent const& in) { return in.prevout == outpoint; })) {
+                        start = entry.height;
+                        break;
+                    }
+                }
+            }
+            auto const unspent = utxo_of(outpoint);
+            if ( ! unspent || ! *unspent) {
+                std::optional<transaction_info> found;
+                auto const ec = co_await each_block(*start, tip(), false, [&](uint32_t height, block_ptr const& blk) {
+                    auto const& txs = blk->transactions();
+                    for (uint32_t at = 0; at < txs.size(); ++at) {
+                        auto const spending = std::ranges::any_of(txs[at].inputs(), [&](domain::chain::input const& in) {
+                            return in.previous_output().hash() == outpoint.hash() && in.previous_output().index() == outpoint.index();
+                        });
+                        if ( ! spending) continue;
+                        found = transaction_info{txs[at], confirmation{height, blk->hash(), at}};
+                        return true;
+                    }
+                    return false;
+                });
+                if (found) co_return found;
+                if (ec) co_return std::unexpected(ec);
+            }
+        }
+        if (auto const spender = pool.spender(outpoint)) {
+            if (auto const* entry = pool.find(*spender)) co_return std::optional<transaction_info>{transaction_info{entry->tx, std::nullopt}};
+        }
+        co_return std::optional<transaction_info>{};
+    }
+
+    detail::identity_memory& identities() override { return known_identities; }
+
     ::asio::awaitable<std::expected<std::optional<utxo>, std::error_code>> output(point outpoint) override {
         co_await refresh_pool();
         if (pool.spender(outpoint)) co_return std::optional<utxo>{};
@@ -532,6 +595,10 @@ struct chain_impl final : service::impl {
             auto const& coin = owned->second;
             co_return std::optional<utxo>{utxo{outpoint, coin.value, coin.token, coin.script, coin.height}};
         }
+        // The node's UTXO set, when it is built to the tip, answers for a
+        // confirmed output at once: there, or spent.
+        auto const unspent = utxo_of(outpoint);
+        if (unspent && *unspent) co_return std::optional<utxo>{**unspent};
         auto const found = co_await transaction(outpoint.hash(), std::nullopt);
         if ( ! found) {
             if (found.error() == error::not_found) co_return std::optional<utxo>{};
@@ -546,6 +613,7 @@ struct chain_impl final : service::impl {
         if (found->confirmed) height = found->confirmed->height;
         utxo result{outpoint, out.value(), out.token_data(), script, height};
         if ( ! height) co_return std::optional<utxo>{result};
+        if (unspent) co_return std::optional<utxo>{};
         bool spent = false;
         auto const ec = co_await each_block(*height + 1, tip(), false, [&](uint32_t, block_ptr const& blk) {
             for (auto const& tx : blk->transactions()) {

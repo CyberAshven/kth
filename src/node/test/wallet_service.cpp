@@ -404,27 +404,6 @@ TEST_CASE("wallet double-spend proofs: the full node lists its own as the peer p
 
 namespace {
 
-// The getdata requests for blocks in a sent log: their heights in `served`.
-std::set<uint32_t> blocks_asked(std::filesystem::path const& log_path, served_chain const& served) {
-    std::set<uint32_t> out;
-    std::ifstream log(log_path);
-    std::string line;
-    while (std::getline(log, line)) {
-        if ( ! line.starts_with("getdata ")) continue;
-        auto const payload = decode_base16(line.substr(8));
-        if ( ! payload) continue;
-        byte_reader reader(*payload);
-        auto const ask = message::get_data::from_data(reader, message::version::level::maximum);
-        if ( ! ask) continue;
-        for (auto const& item : ask->inventories()) {
-            if (item.type() != message::inventory_vector::type_id::block) continue;
-            auto const found = served.heights.find(item.hash());
-            if (found != served.heights.end()) out.insert(found->second);
-        }
-    }
-    return out;
-}
-
 size_t getdata_lines(std::filesystem::path const& log_path) {
     std::ifstream log(log_path);
     std::string line;

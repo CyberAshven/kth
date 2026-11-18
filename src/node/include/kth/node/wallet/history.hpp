@@ -106,6 +106,16 @@ struct coin {
     uint32_t position;
 };
 
+/// An unspent output, confirmed or in the mempool.
+struct utxo {
+    domain::chain::point outpoint;
+    uint64_t value;
+    domain::chain::token_data_opt token;
+    data_chunk script;
+    /// None while in the mempool.
+    std::optional<uint32_t> height;
+};
+
 /// The confirmed state of one target.
 class KND_API target_state {
 public:
