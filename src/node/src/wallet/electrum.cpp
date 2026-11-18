@@ -685,9 +685,11 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
                     auto const now = wallet.current();
                     auto const tip_height = now.tip.value_or(found->confirmed->height);
                     auto const header = co_await wallet.header(found->confirmed->height);
+                    // Found by its hash alone: no block was named, so no
+                    // in_active_chain, as BCHN answers getrawtransaction <txid> true.
                     location = rpc::transaction_location{found->confirmed->block,
                         int64_t(tip_height) - int64_t(found->confirmed->height) + 1,
-                        header ? header->timestamp() : 0u};
+                        header ? header->timestamp() : 0u, std::nullopt, false};
                 }
                 co_return rpc::render_transaction_verbose(found->tx, network,
                     blockchain::settings(network).enabled_flags(), location);
