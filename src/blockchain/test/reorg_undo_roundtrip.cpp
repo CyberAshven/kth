@@ -8,11 +8,16 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <optional>
+#include <span>
 #include <string>
 #include <unistd.h>
 
 #include <kth/blockchain/utxo_builder.hpp>
+#include <kth/database/block_store.hpp>
 #include <kth/database/databases/utxoz_database.hpp>
+
+#include <boost/unordered/unordered_flat_set.hpp>
 
 using namespace kth;
 using namespace kth::blockchain;
@@ -422,4 +427,172 @@ TEST_CASE("bip30: a read that fails while capturing a displaced entry is reporte
     // And it really went looking -- without this the case would pass on a
     // capture that skipped replacements entirely.
     CHECK(source.reads == 1u);
+}
+
+// =============================================================================
+// Whether one block's undo is written the same way every time (reproduction)
+// =============================================================================
+//
+// capture_block_undo appends the spent outputs the probe answers in one pass,
+// and the ones the probe leaves to the batch resolution after that, so the order
+// of a record follows the route each output was found by. A block connected
+// again after a reorganization can find its outputs by other routes -- the
+// disconnect restored them into the active versions -- and write the same undo
+// in another order. The startup scan refuses two records of one block with
+// different checksums. These assert that the bytes do not depend on the route;
+// they fail where they do.
+
+namespace {
+
+// Answers the probe from `stored`, except for the keys in `deferred`, which it
+// leaves to the batch resolution, the way a store answers the probe from its
+// active versions only.
+struct split_source {
+    boost::unordered_flat_map<utxoz::raw_outpoint, utxoz_database::raw_stored> stored;
+    boost::unordered_flat_set<utxoz::raw_outpoint> deferred;
+
+    std::expected<utxoz_database::raw_stored, result_code>
+    find_utxo_raw(utxoz::raw_outpoint const& key, uint32_t) const {
+        if (deferred.contains(key)) return std::unexpected(result_code::not_resolved);
+        auto const it = stored.find(key);
+        if (it == stored.end()) return std::unexpected(result_code::not_resolved);
+        return it->second;
+    }
+
+    std::expected<utxoz_database::raw_resolution, result_code>
+    utxo_resolve_raw(std::span<utxoz::lookup_request const> requests) const {
+        utxoz_database::raw_resolution out;
+        for (auto const& request : requests) {
+            if (auto const it = stored.find(request.key); it != stored.end()) {
+                out.found.emplace(request.key, it->second);
+            } else {
+                out.absent.push_back(request.key);
+            }
+        }
+        return out;
+    }
+};
+
+using raw_inserts = boost::unordered_flat_map<utxoz::raw_outpoint, utxo_raw_value, outpoint_fast_hasher>;
+
+} // namespace
+
+TEST_CASE("undo order: one block's record is the same bytes whichever route found its outputs",
+          "[reorg][undo][undo_order]") {
+    utxo_raw_delta block_delta;
+    block_delta.deletes.emplace(make_outpoint(0xA1, 0), 500u);
+    block_delta.deletes.emplace(make_outpoint(0xA2, 0), 500u);
+    utxo_raw_delta const empty_batch;
+    // The output the delta lists first is the one deferred below, so the two
+    // routes place it differently whatever the hash order is.
+    auto const listed_first = block_delta.deletes.begin()->first;
+
+    split_source source;
+    source.stored.emplace(make_outpoint(0xA1, 0), utxoz_database::raw_stored{make_payload(1, 100), 100u});
+    source.stored.emplace(make_outpoint(0xA2, 0), utxoz_database::raw_stored{make_payload(2, 200), 200u});
+
+    // The first connection: the older output is outside the active versions.
+    source.deferred.insert(listed_first);
+    auto const first_connect = capture_block_undo(block_delta, empty_batch, source, 500u);
+    REQUIRE(first_connect.has_value());
+    REQUIRE(first_connect->spent.size() == 2);
+
+    // The replay, after the disconnect restored both into the active versions.
+    source.deferred.clear();
+    auto const replay = capture_block_undo(block_delta, empty_batch, source, 500u);
+    REQUIRE(replay.has_value());
+    REQUIRE(replay->spent.size() == 2);
+
+    // The same undo: every output, with its value and its height.
+    for (auto const& entry : first_connect->spent) {
+        auto const it = std::find_if(replay->spent.begin(), replay->spent.end(),
+            [&](auto const& e) { return e.key == entry.key; });
+        REQUIRE(it != replay->spent.end());
+        CHECK(it->value == entry.value);
+        CHECK(it->height == entry.height);
+    }
+
+    // Written the same way: fails when the order follows the route.
+    CHECK(first_connect->to_data() == replay->to_data());
+
+    // What the next start makes of the two records of one block.
+    auto const dir = fresh_dir("order_scan");
+    block_store store(dir, block_store::magic_t{{0xe3, 0xe1, 0xf3, 0xe8}});
+    REQUIRE(store.initialize());
+    REQUIRE(store.scan_block_positions([](int32_t, uint32_t, hash_digest const&) {}).clean());
+    REQUIRE(store.scan_undo_positions([](hash_digest const&) -> std::optional<hash_digest> {
+        return std::nullopt;
+    }).status == block_store::undo_scan_status::clean_eof);
+    hash_digest block{};
+    block[0] = 0x0B;
+    hash_digest parent{};
+    parent[0] = 0x0A;
+    REQUIRE_FALSE(store.write_undo(*first_connect, 0, block, parent).is_null());
+    REQUIRE_FALSE(store.write_undo(*replay, 0, block, parent).is_null());
+    auto const scanned = store.scan_undo_positions(
+        [&](hash_digest const& h) -> std::optional<hash_digest> {
+            if (h == block) return parent;
+            return std::nullopt;
+        });
+    CHECK(scanned.status == block_store::undo_scan_status::clean_eof);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST_CASE("undo order: a real store and a disconnect between two connections of one block",
+          "[reorg][undo][undo_order]") {
+    utxoz_database db;
+    REQUIRE(db.open(fresh_dir("order_real"), true));
+
+    auto const k1 = make_outpoint(0xB1, 0);
+    auto const k2 = make_outpoint(0xB2, 0);
+    utxo_raw_delta block_delta;
+    block_delta.deletes.emplace(k1, 500u);
+    block_delta.deletes.emplace(k2, 500u);
+    utxo_raw_delta const empty_batch;
+    auto const old_key = block_delta.deletes.begin()->first;
+    auto const new_key = old_key == k1 ? k2 : k1;
+
+    // The output the delta lists first is old: created, then compacted. The
+    // other one is recent.
+    raw_inserts old_insert;
+    old_insert.emplace(old_key, utxo_raw_value{make_payload(1, 100), 100u});
+    REQUIRE(db.apply_inserts_raw(old_insert) == result_code::success);
+    REQUIRE(db.compact_utxo().has_value());
+    raw_inserts new_insert;
+    new_insert.emplace(new_key, utxo_raw_value{make_payload(2, 200), 200u});
+    REQUIRE(db.apply_inserts_raw(new_insert) == result_code::success);
+
+    // Which route each output takes is reported, not assumed: what UTXO-Z keeps
+    // in its active versions after a compaction is the library's business.
+    // The first fails when the old output is left to the batch resolution.
+    CHECK(db.find_raw(old_key, 500u).has_value());
+    CHECK(db.find_raw(new_key, 500u).has_value());
+
+    db_source source{db};
+    auto const first_connect = capture_block_undo(block_delta, empty_batch, source, 500u);
+    REQUIRE(first_connect.has_value());
+    REQUIRE(first_connect->spent.size() == 2);
+
+    // Spent, then disconnected: the inverse delta restores both outputs into the
+    // active versions, where a replay finds them by the probe.
+    std::vector<utxoz::deferred_deletion_entry> spend;
+    spend.emplace_back(old_key, 500u);
+    spend.emplace_back(new_key, 500u);
+    auto const spent = db.apply_deletes(spend);
+    REQUIRE(spent.erased.size() == 2);
+    raw_inserts restore;
+    for (auto const& entry : first_connect->spent) {
+        restore.emplace(entry.key, utxo_raw_value{entry.value, entry.height});
+    }
+    REQUIRE(db.apply_inserts_raw(restore) == result_code::success);
+    CHECK(db.find_raw(old_key, 500u).has_value());
+
+    auto const replay = capture_block_undo(block_delta, empty_batch, source, 500u);
+    REQUIRE(replay.has_value());
+    REQUIRE(replay->spent.size() == 2);
+
+    // Written the same way: fails when the order followed the route.
+    CHECK(first_connect->to_data() == replay->to_data());
 }
