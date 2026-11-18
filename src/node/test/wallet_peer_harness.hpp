@@ -116,6 +116,10 @@ struct served_chain {
     // Announced to every client after the handshake, and served on request.
     std::vector<chain::transaction> pooled;
     std::vector<message::double_spend_proof> proofs;
+    // Sent to every client without being announced or asked for.
+    std::vector<chain::transaction> pushed;
+    // Checkpoint lists one short.
+    bool short_checkpoints = false;
     uint32_t base_time = uint32_t(std::time(nullptr)) - 4000u * 600u;
 
     served_chain() {
@@ -150,8 +154,13 @@ struct served_chain {
 
     // Mines the next block with `txs` after its coinbase.
     void mine(std::vector<chain::transaction> txs) {
+        mine(std::move(txs), uint32_t(blocks.size()));
+    }
+
+    // With a salt of its own: another branch's block at the same height.
+    void mine(std::vector<chain::transaction> txs, uint32_t salt) {
         auto const height = uint32_t(blocks.size());
-        append(test::mine_block(blocks.back().hash(), height, base_time + height * 600, height, std::move(txs), 0));
+        append(test::mine_block(blocks.back().hash(), height, base_time + height * 600, salt, std::move(txs), 0));
     }
 
     // A block made elsewhere; an output it spends that this chain did not
@@ -196,13 +205,20 @@ inline network::settings server_settings() {
 // One in-process peer: listens on a port the OS assigns and answers headers,
 // filters and blocks from its chain.
 struct test_peer {
-    served_chain const& chain;
+    // The chain it serves; switch_to() gives it another.
+    served_chain const* current;
+    // Its sessions, to announce a switch to.
+    std::vector<std::weak_ptr<network::peer_session>> live;
     ::asio::io_context io;
     tcp::acceptor acceptor{io, tcp::endpoint(::asio::ip::make_address("127.0.0.1"), 0)};
     std::thread thread;
     std::atomic<size_t> sessions{0};
+    // What it announced and served from its mempool, for a failing test to show.
+    std::atomic<size_t> announcements{0};
+    std::atomic<size_t> served_transactions{0};
+    std::atomic<size_t> served_proofs{0};
 
-    explicit test_peer(served_chain const& served) : chain(served) {
+    explicit test_peer(served_chain const& served) : current(&served) {
         ::asio::co_spawn(io, accept(), ::asio::detached);
         thread = std::thread([this] { io.run(); });
     }
@@ -230,16 +246,38 @@ struct test_peer {
         }
     }
 
+    served_chain const& chain() const { return *current; }
+
+    // Serves `next` from now on (a heavier branch, say) and announces its
+    // tip to every client; returns once that is done.
+    void switch_to(served_chain const& next) {
+        std::promise<void> done;
+        ::asio::post(io, [this, &next, &done] {
+            current = &next;
+            for (auto const& weak : live) {
+                auto peer = weak.lock();
+                if ( ! peer) continue;
+                auto const announced = message::inventory::create(message::inventory_vector::list{
+                    message::inventory_vector(message::inventory_vector::type_id::block, next.blocks.back().hash())});
+                if (announced) ::asio::co_spawn(io, [peer, inv = *announced]() -> ::asio::awaitable<void> {
+                    (void)co_await peer->send(inv);
+                }, ::asio::detached);
+            }
+            done.set_value();
+        });
+        done.get_future().wait();
+    }
+
     std::optional<uint32_t> height_of(hash_digest const& hash) const {
-        auto const found = chain.heights.find(hash);
-        if (found == chain.heights.end()) return std::nullopt;
+        auto const found = chain().heights.find(hash);
+        if (found == chain().heights.end()) return std::nullopt;
         return found->second;
     }
 
     ::asio::awaitable<void> serve(tcp::socket socket) {
         auto const settings = server_settings();
         auto peer = std::make_shared<network::peer_session>(std::move(socket), settings, true);
-        auto config = network::make_handshake_config(settings, chain.tip(), 0x5eed0000 + sessions.load());
+        auto config = network::make_handshake_config(settings, chain().tip(), 0x5eed0000 + sessions.load());
         config.ws_discovery = false;
         auto const handshake = co_await network::perform_handshake_direct(*peer, config);
         if ( ! handshake) {
@@ -247,6 +285,7 @@ struct test_peer {
             co_return;
         }
         ::asio::co_spawn(io, [peer]() -> ::asio::awaitable<void> { (void)co_await peer->run(); }, ::asio::detached);
+        live.push_back(peer);
         auto const version = peer->negotiated_version();
         // What the mempool holds is announced once the client asks its first
         // question: by then its handshake is over and it reads announcements.
@@ -254,13 +293,18 @@ struct test_peer {
         for (;;) {
             auto received = co_await peer->receive(std::chrono::steady_clock::now() + 120s);
             if ( ! received) break;
-            if ( ! announced && ( ! chain.pooled.empty() || ! chain.proofs.empty())) {
+            if ( ! announced && ( ! chain().pooled.empty() || ! chain().proofs.empty() || ! chain().pushed.empty())) {
                 announced = true;
+                // What a peer pushes without announcing it.
+                for (auto const& tx : chain().pushed) (void)co_await peer->send(message::transaction(tx));
                 message::inventory_vector::list items;
-                for (auto const& tx : chain.pooled) items.emplace_back(message::inventory_vector::type_id::transaction, tx.hash());
-                for (auto const& proof : chain.proofs) items.emplace_back(message::inventory_vector::type_id::double_spend_proof, proof.hash());
+                for (auto const& tx : chain().pooled) items.emplace_back(message::inventory_vector::type_id::transaction, tx.hash());
+                for (auto const& proof : chain().proofs) items.emplace_back(message::inventory_vector::type_id::double_spend_proof, proof.hash());
                 auto const inventory = message::inventory::create(std::move(items));
-                if (inventory) (void)co_await peer->send(*inventory);
+                if (inventory) {
+                    auto const sent = co_await peer->send(*inventory);
+                    if ( ! sent) ++announcements;
+                }
             }
             auto const& raw = *received;
             auto const command = raw.heading.command();
@@ -279,8 +323,8 @@ struct test_peer {
                     }
                 }
                 message::header::list list;
-                for (auto height = from + 1; height <= chain.tip() && list.size() < 2000; ++height) {
-                    list.emplace_back(chain.blocks[height].header());
+                for (auto height = from + 1; height <= chain().tip() && list.size() < 2000; ++height) {
+                    list.emplace_back(chain().blocks[height].header());
                 }
                 auto const answer = message::headers::create(std::move(list));
                 if (answer) (void)co_await peer->send(*answer);
@@ -291,8 +335,9 @@ struct test_peer {
                 if ( ! stop) continue;
                 message::compact_filter_checkpoint answer{ask->filter_type, ask->stop_hash, {}};
                 for (uint32_t height = 1000; height <= *stop; height += 1000) {
-                    answer.filter_headers.push_back(chain.headers[ask->filter_type][height]);
+                    answer.filter_headers.push_back(chain().headers[ask->filter_type][height]);
                 }
+                if (chain().short_checkpoints && ! answer.filter_headers.empty()) answer.filter_headers.pop_back();
                 (void)co_await peer->send(answer);
             } else if (command == message::get_compact_filter_headers::command) {
                 auto const ask = message::get_compact_filter_headers::from_data(reader, version);
@@ -301,9 +346,9 @@ struct test_peer {
                 if ( ! stop || ask->start_height > *stop || *stop - ask->start_height >= 2000) continue;
                 auto const type = ask->filter_type;
                 message::compact_filter_headers answer{type, ask->stop_hash,
-                    ask->start_height == 0 ? null_hash : chain.headers[type][ask->start_height - 1], {}};
+                    ask->start_height == 0 ? null_hash : chain().headers[type][ask->start_height - 1], {}};
                 for (auto height = ask->start_height; height <= *stop; ++height) {
-                    answer.filter_hashes.push_back(chain.hashes[type][height]);
+                    answer.filter_hashes.push_back(chain().hashes[type][height]);
                 }
                 (void)co_await peer->send(answer);
             } else if (command == message::get_compact_filters::command) {
@@ -312,7 +357,7 @@ struct test_peer {
                 auto const stop = height_of(ask->stop_hash);
                 if ( ! stop || ask->start_height > *stop) continue;
                 for (auto height = ask->start_height; height <= *stop; ++height) {
-                    message::compact_filter answer{ask->filter_type, chain.blocks[height].hash(), chain.filters[ask->filter_type][height]};
+                    message::compact_filter answer{ask->filter_type, chain().blocks[height].hash(), chain().filters[ask->filter_type][height]};
                     (void)co_await peer->send(answer);
                 }
             } else if (command == message::get_data::command) {
@@ -321,16 +366,20 @@ struct test_peer {
                 for (auto const& item : ask->inventories()) {
                     auto const at = height_of(item.hash());
                     if (item.type() == message::inventory_vector::type_id::block && at) {
-                        (void)co_await peer->send(message::block(chain.blocks[*at]));
+                        (void)co_await peer->send(message::block(chain().blocks[*at]));
                     }
                     if (item.type() == message::inventory_vector::type_id::transaction) {
-                        for (auto const& tx : chain.pooled) {
-                            if (tx.hash() == item.hash()) (void)co_await peer->send(message::transaction(tx));
+                        for (auto const& tx : chain().pooled) {
+                            if (tx.hash() != item.hash()) continue;
+                            (void)co_await peer->send(message::transaction(tx));
+                            ++served_transactions;
                         }
                     }
                     if (item.type() == message::inventory_vector::type_id::double_spend_proof) {
-                        for (auto const& proof : chain.proofs) {
-                            if (proof.hash() == item.hash()) (void)co_await peer->send(proof);
+                        for (auto const& proof : chain().proofs) {
+                            if (proof.hash() != item.hash()) continue;
+                            (void)co_await peer->send(proof);
+                            ++served_proofs;
                         }
                     }
                 }

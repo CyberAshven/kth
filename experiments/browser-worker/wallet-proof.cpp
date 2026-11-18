@@ -170,10 +170,8 @@ mined mine() {
 ::asio::awaitable<void> ask(wallet::service& service, mined const& chain_made) {
     auto const synced = co_await service.wait_synced(30s);
     require(bool(synced), "wallet support did not sync: " + service.current().error);
-    require(synced->header_height == length && synced->tip == length && synced->input_prefix_tip == length,
-        "wallet support synced to another height");
-    std::printf("synced headers=%u script_filters=%u prefix_filters=%u peers=%zu\n", synced->header_height,
-        *synced->tip, *synced->input_prefix_tip, synced->peers);
+    require(synced->header_height == length && synced->tip == length, "wallet support synced to another height");
+    std::printf("synced headers=%u script_filters=%u peers=%zu\n", synced->header_height, *synced->tip, synced->peers);
 
     auto const target = wallet::target::of_script(watched_script);
     auto const history = co_await service.history(target);

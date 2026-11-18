@@ -166,16 +166,21 @@ struct peer_settings {
     size_t service_peers = 2;
     /// Blocks downloaded at once.
     size_t parallel_downloads = 4;
-    /// Each block over a connection of its own.
-    bool isolate_downloads = false;
-    /// Random extra blocks downloaded with each block a scan needs.
-    size_t decoy_blocks = 0;
+    /// Each block over a connection of its own (on by default: the peers
+    /// that serve headers and filters do not see which blocks follow them).
+    bool isolate_downloads = true;
+    /// Other blocks downloaded with each block a wallet needs: the same ones
+    /// for that block every time, after a restart too (derived from a seed
+    /// kept in the store), so sessions cannot be intersected.
+    size_t decoy_blocks = 3;
     /// Every block of a scanned range, so which are fetched says nothing.
     bool download_all_blocks = false;
     /// Threads that match filters; 0 for one per core.
     size_t scan_threads = 0;
-    /// Also sync input prefix filters (filter type 2), for RPA.
-    bool input_prefix_filters = true;
+    /// Also sync input prefix filters (filter type 2) and check blocks
+    /// against them. RPA does not use them: an RPA lookup downloads every
+    /// block of its range, so which blocks it downloads names no prefix.
+    bool input_prefix_filters = false;
     /// The first height whose filters are synced: no wallet watched here
     /// received anything before it.
     uint32_t birthday = 0;

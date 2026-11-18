@@ -9,8 +9,8 @@
 //
 //   kth-wallet --network regtest --directory DIR --peer HOST:PORT [--peer ...]
 //              [--electrum LOOPBACK:PORT] [--birthday HEIGHT] [--sent-log FILE]
-//              [--isolate] [--decoys N] [--download-all] [--scan-threads N]
-//              [--no-input-prefix-filters]
+//              [--no-isolate] [--decoys N] [--download-all] [--scan-threads N]
+//              [--input-prefix-filters]
 
 #include <chrono>
 #include <csignal>
@@ -51,8 +51,8 @@ std::optional<network> network_of(std::string_view name) {
 
 int usage() {
     std::fprintf(stderr, "usage: kth-wallet --network NAME --directory DIR --peer HOST:PORT [--peer ...] "
-        "[--electrum LOOPBACK:PORT] [--birthday HEIGHT] [--sent-log FILE] [--isolate] [--decoys N] "
-        "[--download-all] [--scan-threads N] [--no-input-prefix-filters]\n");
+        "[--electrum LOOPBACK:PORT] [--birthday HEIGHT] [--sent-log FILE] [--no-isolate] [--decoys N] "
+        "[--download-all] [--scan-threads N] [--input-prefix-filters]\n");
     return 2;
 }
 
@@ -83,16 +83,16 @@ int main(int argc, char** argv) {
             settings.birthday = uint32_t(std::strtoul(value().c_str(), nullptr, 10));
         } else if (flag == "--sent-log") {
             settings.sent_log = value();
-        } else if (flag == "--isolate") {
-            settings.isolate_downloads = true;
+        } else if (flag == "--no-isolate") {
+            settings.isolate_downloads = false;
         } else if (flag == "--decoys") {
             settings.decoy_blocks = size_t(std::strtoul(value().c_str(), nullptr, 10));
         } else if (flag == "--download-all") {
             settings.download_all_blocks = true;
         } else if (flag == "--scan-threads") {
             settings.scan_threads = size_t(std::strtoul(value().c_str(), nullptr, 10));
-        } else if (flag == "--no-input-prefix-filters") {
-            settings.input_prefix_filters = false;
+        } else if (flag == "--input-prefix-filters") {
+            settings.input_prefix_filters = true;
         } else {
             return usage();
         }
