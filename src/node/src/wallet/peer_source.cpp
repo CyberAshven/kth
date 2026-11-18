@@ -259,12 +259,25 @@ status peer_impl::current() const {
     while ( ! stopping) {
         co_await keep_peers();
         std::error_code ec;
-        auto const peer = next_link();
-        if ( ! peer) {
+        if ( ! next_link()) {
             ec = error::channel_stopped;
             last_error = "no peer connected";
         } else {
-            ec = co_await sync_headers(peer);
+            // Headers from every connected peer: the tip does not wait for a
+            // round that asks the one ahead. A round goes on when one answers.
+            bool answered = false;
+            std::error_code failed = error::channel_stopped;
+            auto const open = links;
+            for (auto const& link : open) {
+                if (link->closed) continue;
+                auto const one = co_await sync_headers(link);
+                if ( ! one) {
+                    answered = true;
+                } else {
+                    failed = one;
+                }
+            }
+            if ( ! answered) ec = failed;
             if ( ! ec && scripts) ec = co_await sync_filters(script_type);
             if ( ! ec && prefixes) ec = co_await sync_filters(prefix_type);
             if ( ! ec) {
