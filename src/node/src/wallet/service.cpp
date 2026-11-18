@@ -465,7 +465,7 @@ bool spends(domain::chain::transaction const& tx, point const& outpoint) {
         for (auto const& kept : *known) {
             if (kept.from == identity_step::source::chain) {
                 auto const header = co_await state.header_at(kept.height);
-                if ( ! header || header->hash() != kept.block) break;
+                if ( ! header || domain::chain::hash(*header) != kept.block) break;
             }
             chain.push_back(kept);
         }
