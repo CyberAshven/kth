@@ -262,9 +262,10 @@ void peer_impl::on_reorg(uint32_t fork) {
             return parsed && parsed->filter_type == type && parsed->stop_hash == tip_hash ? step::done : step::skip;
         });
         if ( ! answer) {
-            if (answer.error() == error::channel_timeout) link->no_filters.insert(type);
+            if (answer.error() == error::channel_timeout && ++link->silences[type] >= silences_limit) link->no_filters.insert(type);
             continue;
         }
+        link->silences.erase(type);
         byte_reader reader(answer->back().payload);
         auto const parsed = message::compact_filter_checkpoint::from_data(reader, version);
         if ( ! parsed) continue;

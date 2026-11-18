@@ -480,6 +480,26 @@ TEST_CASE("wallet from peers: peers that misstate filter checkpoints or headers 
     }
 }
 
+TEST_CASE("wallet from peers: a filter server a block behind the headers is asked again once it catches up", "[wallet][wallet_peers]") {
+    // The filters' peer stays silent for a tip it does not have (BIP157):
+    // that is no sign it serves no filters.
+    served_chain behind;
+    for (uint32_t height = 1; height <= 20; ++height) behind.mine({});
+    auto ahead = behind;
+    ahead.mine({});
+    test_peer filters(behind);
+    test_peer headers(ahead, false);
+    temporary_directory dir("lagging_filters");
+    running_service running(settings_for(dir.path, {filters.endpoint(), headers.endpoint()}));
+    auto& service = *running.service;
+    REQUIRE(status_reaches(service, [](wallet::status const& now) { return now.header_height == 21u; }));
+    // Asked for block 21's checkpoints, it stays silent; the request times
+    // out, and the round ends without them.
+    REQUIRE(filters.silent.get_future().wait_for(30s) == std::future_status::ready);
+    filters.switch_to(ahead);
+    REQUIRE(status_reaches(service, [](wallet::status const& now) { return now.synced && now.tip == 21u; }));
+}
+
 TEST_CASE("wallet from peers: a filter above the last checkpoint is compared with another peer's and settled by its block", "[wallet][wallet_peers]") {
     served_chain served;
     auto const paid = spending({chain::point(digest_of(320), 0)}, {{700, watched_script}}, 1);

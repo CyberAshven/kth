@@ -218,8 +218,13 @@ struct test_peer {
     std::atomic<size_t> announcements{0};
     std::atomic<size_t> served_transactions{0};
     std::atomic<size_t> served_proofs{0};
+    // A peer that serves headers and blocks but no filters, as BCHN.
+    bool filters = true;
+    // Set the first time it stays silent for a block it does not have.
+    std::promise<void> silent;
+    std::atomic<bool> was_silent{false};
 
-    explicit test_peer(served_chain const& served) : current(&served) {
+    explicit test_peer(served_chain const& served, bool serves_filters = true) : current(&served), filters(serves_filters) {
         ::asio::co_spawn(io, accept(), ::asio::detached);
         thread = std::thread([this] { io.run(); });
     }
@@ -276,7 +281,8 @@ struct test_peer {
     }
 
     ::asio::awaitable<void> serve(tcp::socket socket) {
-        auto const settings = server_settings();
+        auto settings = server_settings();
+        if ( ! filters) settings.services = uint64_t(message::version::service::node_network);
         auto peer = std::make_shared<network::peer_session>(std::move(socket), settings, true);
         auto config = network::make_handshake_config(settings, chain().tip(), 0x5eed0000 + sessions.load());
         config.ws_discovery = false;
@@ -333,7 +339,10 @@ struct test_peer {
                 auto const ask = message::get_compact_filter_checkpoint::from_data(reader, version);
                 if ( ! ask || ask->filter_type == 0 || ask->filter_type > 2) continue;
                 auto const stop = height_of(ask->stop_hash);
-                if ( ! stop) continue;
+                if ( ! stop) {
+                    if ( ! was_silent.exchange(true)) silent.set_value();
+                    continue;
+                }
                 message::compact_filter_checkpoint answer{ask->filter_type, ask->stop_hash, {}};
                 for (uint32_t height = 1000; height <= *stop; height += 1000) {
                     answer.filter_headers.push_back(chain().headers[ask->filter_type][height]);

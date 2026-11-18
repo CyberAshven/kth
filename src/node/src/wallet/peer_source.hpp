@@ -91,6 +91,10 @@ constexpr size_t refused_limit = 32;
 constexpr uint64_t filter_answer_bytes = uint64_t(64) << 20;
 // Headers a store can grow by after it is opened.
 constexpr size_t header_headroom = 1'000'000;
+// Rounds in a row a peer may leave a checkpoint request unanswered before
+// it is taken for one that does not serve the type: a peer stays silent for
+// a block it does not have yet (BIP157), as one a block behind does.
+constexpr size_t silences_limit = 3;
 
 // What a waiting request does with a message: not its own, part of its
 // answer with more to come, or the end of its answer.
@@ -116,6 +120,8 @@ struct peer_link {
     bool closed = false;
     // The filter types it did not answer for.
     std::set<uint8_t> no_filters;
+    // Rounds in a row it left a checkpoint request of a type unanswered.
+    std::map<uint8_t, size_t> silences;
 };
 
 // A confirmed transaction found by hash, with its Merkle branch.
