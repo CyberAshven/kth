@@ -12,6 +12,7 @@
 #include <set>
 #include <string>
 
+#include <kth/node/wallet/electrum.hpp>
 #include <kth/node/wallet/tokens.hpp>
 
 namespace {
@@ -256,6 +257,22 @@ TEST_CASE("wallet tokens from peers: a category rebuilt, identities followed spe
         REQUIRE(held);
         REQUIRE(held->size() == 1u);
         REQUIRE(held->front().fungible == 600u);
+
+        // The same through the Electrum listener, as kth's own methods.
+        wallet::electrum_server electrum(service, domain::config::network::regtest);
+        auto const ask = [&](std::string const& method, std::string const& params) {
+            return wait_for(service, electrum.answer(R"({"jsonrpc":"2.0","id":3,"method":")" + method + R"(","params":)" + params + "}"));
+        };
+        auto const shown = ask("kth.token.category", "[\"" + encode_hash(made.category) + "\"]");
+        REQUIRE(shown.find(R"("genesis":{"tx_hash":")" + encode_hash(made.genesis.hash()) + R"(","height":5})") != std::string::npos);
+        REQUIRE(shown.find(R"("supply":{"total":"950","reserved":"50","circulating":"900"})") != std::string::npos);
+        REQUIRE(shown.find(R"("holders":5,"nfts":3)") != std::string::npos);
+        auto const resolved = ask("kth.identity.resolve", "[\"" + encode_hash(made.base.hash()) + "\"]");
+        REQUIRE(resolved.find(R"("authhead":")" + encode_hash(made.second_update.hash()) + "\"") != std::string::npos);
+        REQUIRE(resolved.find(R"("hash":")" + encode_base16(made.second_registry) + R"(","uris":["example.test/second.json","ipfs://bafysecond"]})") != std::string::npos);
+        REQUIRE(ask("kth.token.category", R"(["zz"])").find(R"("code":-32602)") != std::string::npos);
+        REQUIRE(ask("kth.identity.resolve", "[\"" + encode_hash(made.base.hash()) + R"(","00"])").find(R"("code":-32602)") != std::string::npos);
+        REQUIRE(ask("kth.token.holdings", "[1]").find(R"("code":-32602)") != std::string::npos);
 
         // Nothing sent names the category, an identity or a locking script.
         std::vector<std::string> const secrets{encode_hash(made.category), encode_base16(made.category),
