@@ -6,7 +6,6 @@
 
 #include <chrono>
 #include <condition_variable>
-#include <cstdio>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -20,6 +19,7 @@
 #include <kth/blockchain/interface/block_chain.hpp>
 #include <kth/capi/conversions.hpp>
 #include <kth/capi/helpers.hpp>
+#include <kth/node/rpc/json.hpp>
 #include <kth/node/wallet/electrum.hpp>
 #include <kth/node/wallet/service.hpp>
 
@@ -60,23 +60,6 @@ struct wallet_handle {
 
 wallet_handle& handle_of(void const* self) {
     return *static_cast<wallet_handle*>(const_cast<void*>(self));
-}
-
-std::string escaped(std::string const& text) {
-    std::string out;
-    for (unsigned char ch : text) {
-        if (ch == '"' || ch == '\\') {
-            out += '\\';
-            out += char(ch);
-        } else if (ch < 0x20) {
-            char code[8];
-            std::snprintf(code, sizeof(code), "\\u%04x", unsigned(ch));
-            out += code;
-        } else {
-            out += char(ch);
-        }
-    }
-    return out;
 }
 
 kth_error_code_t adopt(std::unique_ptr<wallet::service> service, kth::domain::config::network network,
@@ -180,21 +163,35 @@ char* kth_node_wallet_status(kth_wallet_const_t self) {
     KTH_PRECONDITION(self != nullptr);
     try {
         auto const now = handle_of(self).service->current();
-        auto const number = [](std::optional<uint32_t> const& value) {
-            return value ? std::to_string(*value) : std::string("null");
+        kth::node::rpc::writer out;
+        auto const height = [&out](std::string_view key, std::optional<uint32_t> const& value) {
+            out.key(key);
+            if (value) {
+                out.value(uint64_t(*value));
+            } else {
+                out.value_null();
+            }
         };
-        std::string json = "{\"source\":\"" + escaped(now.source) + "\"";
-        json += ",\"header_height\":" + std::to_string(now.header_height);
-        json += ",\"tip\":" + number(now.tip);
-        json += ",\"input_prefix_tip\":" + number(now.input_prefix_tip);
-        json += ",\"peers\":" + std::to_string(now.peers);
-        json += std::string(",\"synced\":") + (now.synced ? "true" : "false");
-        json += ",\"transaction_keys\":" + std::string( ! now.transaction_keys ? "null" : *now.transaction_keys ? "true" : "false");
-        json += ",\"bytes_received\":" + std::to_string(now.bytes_received);
-        json += ",\"bytes_sent\":" + std::to_string(now.bytes_sent);
-        json += ",\"blocks_downloaded\":" + std::to_string(now.blocks_downloaded);
-        json += ",\"filter_bytes\":" + std::to_string(now.filter_bytes);
-        json += ",\"error\":\"" + escaped(now.error) + "\"}";
+        out.begin_object();
+        out.field("source", std::string_view(now.source));
+        out.field("header_height", uint64_t(now.header_height));
+        height("tip", now.tip);
+        height("input_prefix_tip", now.input_prefix_tip);
+        out.field("peers", uint64_t(now.peers));
+        out.field("synced", now.synced);
+        out.key("transaction_keys");
+        if (now.transaction_keys) {
+            out.value(*now.transaction_keys);
+        } else {
+            out.value_null();
+        }
+        out.field("bytes_received", uint64_t(now.bytes_received));
+        out.field("bytes_sent", uint64_t(now.bytes_sent));
+        out.field("blocks_downloaded", uint64_t(now.blocks_downloaded));
+        out.field("filter_bytes", uint64_t(now.filter_bytes));
+        out.field("error", std::string_view(now.error));
+        out.end_object();
+        auto const json = out.str();
         return kth::create_c_str(json);
     } catch (...) {
         return nullptr;

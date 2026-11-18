@@ -41,6 +41,8 @@
 #include <kth/blockchain/settings.hpp>
 #include <kth/node/wallet/blocks.hpp>
 #if defined(KTH_WITH_RPC)
+#include <kth/node/rpc/error.hpp>
+#include <kth/node/rpc/json.hpp>
 #include <kth/node/rpc/query.hpp>
 #endif
 
@@ -58,11 +60,11 @@ constexpr size_t max_line = 4 * 1024 * 1024;
 // What a client follows is checked when something changes, and at least this often.
 constexpr auto notify_wait = std::chrono::seconds(60);
 
-// JSON-RPC error codes, as Fulcrum answers them.
-constexpr int invalid_params = -32602;
-constexpr int method_not_found = -32601;
-constexpr int parse_error = -32700;
-constexpr int internal_error = -32603;
+// JSON-RPC error codes, as Fulcrum answers them: the node's RPC codes, and
+// Fulcrum's own for a request it cannot answer.
+constexpr int invalid_params = int(rpc::error_code::invalid_params);
+constexpr int method_not_found = int(rpc::error_code::method_not_found);
+constexpr int internal_error = int(rpc::error_code::internal_error);
 constexpr int bad_request = 1;
 
 // Fulcrum's RPA defaults: the shortest prefix answered, and the blocks one
@@ -83,51 +85,51 @@ std::unexpected<failure> fail(int code, std::string message) {
 }
 
 // ---------------------------------------------------------------------------
-// JSON text
+// JSON text, written with the node's JSON-RPC writer
 
 std::string json_text(std::string_view text) {
-    std::string out = "\"";
-    for (unsigned char ch : text) {
-        if (ch == '"' || ch == '\\') {
-            out += '\\';
-            out += char(ch);
-        } else if (ch < 0x20) {
-            char escaped[8];
-            std::snprintf(escaped, sizeof(escaped), "\\u%04x", unsigned(ch));
-            out += escaped;
-        } else {
-            out += char(ch);
-        }
-    }
-    return out + '"';
+    rpc::writer out;
+    out.value(text);
+    return out.str();
 }
 
+// One JSON object, a field at a time.
 class object {
 public:
+    object() { out_.begin_object(); }
     object& raw(std::string_view key, std::string_view value) {
-        text_ += first_ ? "" : ",";
-        first_ = false;
-        text_ += json_text(key);
-        text_ += ':';
-        text_ += value;
+        out_.field_raw(key, value);
         return *this;
     }
-    object& text(std::string_view key, std::string_view value) { return raw(key, json_text(value)); }
-    object& number(std::string_view key, int64_t value) { return raw(key, std::to_string(value)); }
-    object& flag(std::string_view key, bool value) { return raw(key, value ? "true" : "false"); }
-    std::string done() const { return "{" + text_ + "}"; }
+    object& text(std::string_view key, std::string_view value) {
+        out_.key(key);
+        out_.value(value);
+        return *this;
+    }
+    object& number(std::string_view key, int64_t value) {
+        out_.key(key);
+        out_.value(value);
+        return *this;
+    }
+    object& flag(std::string_view key, bool value) {
+        out_.key(key);
+        out_.value(value);
+        return *this;
+    }
+    std::string done() {
+        out_.end_object();
+        return out_.str();
+    }
 private:
-    std::string text_;
-    bool first_ = true;
+    rpc::writer out_;
 };
 
 std::string array_of(std::vector<std::string> const& items) {
-    std::string out = "[";
-    for (size_t i = 0; i < items.size(); ++i) {
-        if (i > 0) out += ',';
-        out += items[i];
-    }
-    return out + "]";
+    rpc::writer out;
+    out.begin_array();
+    for (auto const& item : items) out.value_raw(item);
+    out.end_array();
+    return out.str();
 }
 
 std::string coins(uint64_t satoshis) {
@@ -184,36 +186,6 @@ std::optional<std::vector<param>> params_of(std::string_view raw) {
             p.what = param::kind::other;
         }
         out.push_back(std::move(p));
-    }
-    return out;
-}
-
-struct request {
-    std::string method;
-    std::string params;
-    std::string id = "null";
-    bool notification = false;
-};
-
-std::optional<request> request_of(std::string_view line) {
-    simdjson::ondemand::parser parser;
-    simdjson::padded_string padded(line);
-    simdjson::ondemand::document doc;
-    if (parser.iterate(padded).get(doc) != simdjson::SUCCESS) return std::nullopt;
-    request out;
-    std::string_view method;
-    if (doc["method"].get_string().get(method) != simdjson::SUCCESS) return std::nullopt;
-    out.method.assign(method);
-    simdjson::ondemand::value params;
-    std::string_view raw;
-    if (doc["params"].get(params) == simdjson::SUCCESS && params.raw_json().get(raw) == simdjson::SUCCESS) {
-        out.params.assign(raw);
-    }
-    simdjson::ondemand::value id;
-    if (doc["id"].get(id) == simdjson::SUCCESS && id.raw_json().get(raw) == simdjson::SUCCESS) {
-        out.id.assign(raw);
-    } else {
-        out.notification = true;
     }
     return out;
 }
@@ -830,15 +802,15 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
     }
 
     ::asio::awaitable<std::string> answer_one(std::string const& line, client* who = nullptr) {
-        auto const parsed = request_of(line);
+        auto const parsed = rpc::parse_request(line);
         if ( ! parsed) {
-            co_return object().text("jsonrpc", "2.0").raw("error", object().number("code", parse_error).text("message", "Parse error").done())
-                .raw("id", "null").done();
+            co_return object().text("jsonrpc", "2.0").raw("error", object().number("code", parsed.error().code)
+                .text("message", parsed.error().message).done()).raw("id", "null").done();
         }
         auto const params = params_of(parsed->params);
         result outcome = fail(invalid_params, "Invalid params");
         if (params) outcome = co_await call(parsed->method, *params, who);
-        if (parsed->notification) co_return std::string{};
+        if ( ! parsed->has_id) co_return std::string{};
         object out;
         out.text("jsonrpc", "2.0");
         if (outcome) {

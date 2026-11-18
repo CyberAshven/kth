@@ -54,7 +54,7 @@ std::expected<request, rpc_error> parse_request(std::string_view body) {
     // "id" is optional; echoed back verbatim. Absent => "null" (default).
     simdjson::ondemand::value id;
     if (doc["id"].get(id) == simdjson::SUCCESS) {
-        copy_raw(id, req.id);
+        req.has_id = copy_raw(id, req.id);
     }
 
     return req;

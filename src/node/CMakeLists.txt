@@ -147,6 +147,11 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     src/detail/header_walk_tasks.cpp
     src/detail/compact_filters.cpp
 
+    # JSON-RPC text and the bitcoind-shaped answers: the RPC server and the
+    # wallet support's Electrum listener both use them.
+    src/rpc/json.cpp
+    src/rpc/query.cpp
+
     # Wallet support: answers from the node's own chain, or from peers.
     src/wallet/blocks.cpp
     src/wallet/chain_source.cpp
@@ -219,10 +224,8 @@ endif()
 if(KTH_WITH_RPC AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
   set(kth_sources_just_legacy
     ${kth_sources_just_legacy}
-    src/rpc/json.cpp
     src/rpc/dispatch.cpp
     src/rpc/mining.cpp
-    src/rpc/query.cpp
     src/rpc/methods.cpp
     src/rpc/server.cpp
   )
