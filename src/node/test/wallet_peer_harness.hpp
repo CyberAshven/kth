@@ -248,16 +248,20 @@ struct test_peer {
         }
         ::asio::co_spawn(io, [peer]() -> ::asio::awaitable<void> { (void)co_await peer->run(); }, ::asio::detached);
         auto const version = peer->negotiated_version();
-        if ( ! chain.pooled.empty() || ! chain.proofs.empty()) {
-            message::inventory_vector::list items;
-            for (auto const& tx : chain.pooled) items.emplace_back(message::inventory_vector::type_id::transaction, tx.hash());
-            for (auto const& proof : chain.proofs) items.emplace_back(message::inventory_vector::type_id::double_spend_proof, proof.hash());
-            auto const announced = message::inventory::create(std::move(items));
-            if (announced) (void)co_await peer->send(*announced);
-        }
+        // What the mempool holds is announced once the client asks its first
+        // question: by then its handshake is over and it reads announcements.
+        bool announced = false;
         for (;;) {
             auto received = co_await peer->receive(std::chrono::steady_clock::now() + 120s);
             if ( ! received) break;
+            if ( ! announced && ( ! chain.pooled.empty() || ! chain.proofs.empty())) {
+                announced = true;
+                message::inventory_vector::list items;
+                for (auto const& tx : chain.pooled) items.emplace_back(message::inventory_vector::type_id::transaction, tx.hash());
+                for (auto const& proof : chain.proofs) items.emplace_back(message::inventory_vector::type_id::double_spend_proof, proof.hash());
+                auto const inventory = message::inventory::create(std::move(items));
+                if (inventory) (void)co_await peer->send(*inventory);
+            }
             auto const& raw = *received;
             auto const command = raw.heading.command();
             byte_reader reader(raw.payload);

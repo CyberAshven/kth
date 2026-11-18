@@ -256,6 +256,8 @@ struct peer_impl final : service::impl {
     std::vector<std::tuple<uint8_t, uint32_t, uint32_t, uint64_t>> served_by;
     bool disputed = false;
     std::string last_error;
+    // Peers that served what does not fit the chain, the latest last.
+    std::deque<std::string> refused;
     uint64_t bytes_sent = 0;
     uint64_t bytes_received = 0;
     uint64_t blocks_downloaded = 0;
@@ -451,13 +453,14 @@ struct peer_impl final : service::impl {
         next.blocks_downloaded = blocks_downloaded;
         next.filter_bytes = (scripts ? scripts->data_bytes() : 0) + (prefixes ? prefixes->data_bytes() : 0);
         next.error = last_error;
-        // A new tip, or where the service stands (synced, its error), wakes
-        // whoever waits on changes.
+        next.refused.assign(refused.begin(), refused.end());
+        // A new tip, or where the service stands (synced, its error, a
+        // refused peer), wakes whoever waits on changes.
         auto moved = next.tip != announced_tip;
         if (moved) announced_tip = next.tip;
         {
             std::lock_guard<std::mutex> guard(status_mutex);
-            moved = moved || next.synced != snapshot.synced || next.error != snapshot.error;
+            moved = moved || next.synced != snapshot.synced || next.error != snapshot.error || next.refused != snapshot.refused;
             snapshot = std::move(next);
         }
         if (moved) changes.bump();
@@ -931,6 +934,8 @@ struct peer_impl final : service::impl {
                 if (link->id != id) continue;
                 link->no_filters.insert(script_type);
                 link->no_filters.insert(prefix_type);
+                refused.push_back(link->endpoint + ": a filter that does not fit block " + std::to_string(height));
+                while (refused.size() > 32) refused.pop_front();
             }
         }
         std::erase_if(served_by, [height](auto const& range) { return std::get<2>(range) >= height; });

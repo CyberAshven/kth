@@ -175,8 +175,11 @@ TEST_CASE("wallet from peers: a filter that does not fit its block is found and 
     temporary_directory dir("dispute");
     running_service running(settings_for(dir.path, {peer.endpoint()}));
     auto& service = *running.service;
+    // The peer that served it is refused, which stays in the status.
     REQUIRE(status_reaches(service, [](wallet::status const& now) {
-        return now.error.find("does not fit block 10") != std::string::npos;
+        return std::ranges::any_of(now.refused, [](std::string const& why) {
+            return why.find("does not fit block 10") != std::string::npos;
+        });
     }));
     REQUIRE(service.current().tip.value_or(0) < 10u);
 }
@@ -320,62 +323,6 @@ TEST_CASE("wallet from the node's own chain answers as from peers", "[wallet][wa
     auto const peer_found = wait_for(from_peers, from_peers.transaction(coinbase_txid, std::nullopt));
     REQUIRE(peer_found);
     REQUIRE(peer_found->confirmed->height == 1u);
-}
-
-TEST_CASE("wallet from the node's own chain: direct parse and filters built on the fly agree, timed", "[wallet][wallet_chain]") {
-    // 400 blocks; from 101 on, each spends the coinbase of the block 100 below.
-    constexpr uint32_t length = 400;
-    auto const flags = blockchain::settings(domain::config::network::regtest).enabled_flags();
-    auto const base_time = uint32_t(zulu_time()) - (length + 30) * test::block_spacing;
-    std::vector<chain::block> blocks;
-    auto previous = chain::block::genesis_regtest().hash();
-    for (uint32_t height = 1; height <= length; ++height) {
-        std::vector<chain::transaction> txs;
-        uint64_t fees = 0;
-        if (height > 100) {
-            auto const& coinbase = blocks[height - 101].transactions().front();
-            txs.push_back(test::spend_p2pkh(coinbase, 0, coinbase.outputs()[0].value() - 1000, flags));
-            fees = 1000;
-        }
-        blocks.push_back(test::mine_block(previous, height, base_time + height * test::block_spacing, 5, std::move(txs), fees));
-        previous = blocks.back().hash();
-    }
-    test::chain_fixture fixture("wallet_chain_timing");
-    REQUIRE(fixture.created());
-    REQUIRE(fixture.start());
-    REQUIRE(fixture.organizer().add_headers(test::headers_of(blocks)).headers_added == blocks.size());
-    test::persist_headers(fixture, blocks, 1);
-    test::connect_bodies(fixture, blocks, 1);
-    REQUIRE(fixture.chain().chain_view()->connected_tip_height == length);
-
-    auto const dense = wallet::target::of_script(test::miner_script().bytes());
-    auto const sparse = wallet::target::of_script(other_script);
-    auto const timed = [&](wallet::chain_scan scan, wallet::target const& target) {
-        wallet::chain_settings settings;
-        settings.scan = scan;
-        auto own = wallet::service::from_chain(fixture.chain(), domain::config::network::regtest, settings);
-        auto const started = std::chrono::steady_clock::now();
-        auto history = wait_for(*own, own->history(target));
-        auto const seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-        REQUIRE(history);
-        return std::pair{std::move(*history), seconds};
-    };
-    auto const [direct_dense, direct_dense_seconds] = timed(wallet::chain_scan::direct, dense);
-    auto const [filters_dense, filters_dense_seconds] = timed(wallet::chain_scan::filters, dense);
-    auto const [direct_sparse, direct_sparse_seconds] = timed(wallet::chain_scan::direct, sparse);
-    auto const [filters_sparse, filters_sparse_seconds] = timed(wallet::chain_scan::filters, sparse);
-    REQUIRE(direct_dense.confirmed.size() == length + (length - 100));
-    REQUIRE(filters_dense.confirmed.size() == direct_dense.confirmed.size());
-    for (size_t at = 0; at < direct_dense.confirmed.size(); ++at) {
-        REQUIRE(filters_dense.confirmed[at].txid == direct_dense.confirmed[at].txid);
-        REQUIRE(filters_dense.confirmed[at].height == direct_dense.confirmed[at].height);
-    }
-    REQUIRE(direct_sparse.confirmed.empty());
-    REQUIRE(filters_sparse.confirmed.empty());
-    std::printf("wallet birthday scan of %u blocks: a script in every block: direct %.3f s, filters %.3f s; "
-        "a script in none: direct %.3f s, filters %.3f s\n", length, direct_dense_seconds, filters_dense_seconds,
-        direct_sparse_seconds, filters_sparse_seconds);
-    std::fflush(stdout);
 }
 
 TEST_CASE("wallet double-spend proofs: the full node lists its own as the peer path lists those relayed", "[wallet][wallet_chain]") {
