@@ -524,6 +524,10 @@ peer_impl::header_branch(uint32_t height, uint32_t cp_height) {
     co_return co_await changes.wait(seen, deadline);
 }
 
+::asio::awaitable<touched_keys> peer_impl::touched(uint64_t seen) {
+    co_return touched_keys{changes.count(), changes.touched_since(seen)};
+}
+
 ::asio::awaitable<std::optional<domain::chain::header>> peer_impl::header_at(uint32_t height) {
     co_return header(height);
 }

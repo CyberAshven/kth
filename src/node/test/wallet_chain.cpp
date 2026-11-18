@@ -204,6 +204,40 @@ TEST_CASE("wallet double-spend proofs: the full node lists its own", "[wallet][w
     REQUIRE( ! pending_found->confirmed);
 }
 
+TEST_CASE("wallet from the node's own chain: a mempool transaction touches the targets it pays and spends from, no others", "[wallet][wallet_chain]") {
+    stored_chain stored("wallet_chain_touched", 110, std::nullopt);
+    auto& node_chain = stored.fixture.chain();
+    auto const flags = blockchain::settings(domain::config::network::regtest).enabled_flags();
+    auto const& coinbase = stored.blocks.front().transactions().front();
+    auto const miner = wallet::target::of_script(coinbase.outputs()[0].script().bytes());
+    auto const other = wallet::target::of_script(data_chunk{0x51});
+
+    auto own = wallet::service::from_chain(node_chain, domain::config::network::regtest);
+    REQUIRE(wait_for(*own, own->history(miner)));
+    REQUIRE(wait_for(*own, own->history(other)));
+    auto const seen = wait_for(*own, own->changed(0, 0s));
+
+    // Block 1's coinbase spent back to the miner, in the mempool.
+    auto const pending = test::spend_p2pkh(coinbase, 0, coinbase.outputs()[0].value() - 1000, flags);
+    auto const pooled = std::make_shared<message::transaction const>(pending);
+    auto submitted = ::asio::co_spawn(node_chain.executor(), [&node_chain, pooled]() -> ::asio::awaitable<code> {
+        co_return co_await node_chain.submit_transaction(pooled);
+    }, ::asio::use_future);
+    REQUIRE(submitted.get() == error::success);
+    auto const after = wait_for(*own, own->history(miner));
+    REQUIRE(after);
+    REQUIRE(after->unconfirmed.size() == 1u);
+
+    // Who follows the miner or the transaction looks again; who follows a
+    // target it did not touch need not.
+    auto const change = wait_for(*own, own->touched(seen));
+    REQUIRE(change.count > seen);
+    REQUIRE(change.keys);
+    REQUIRE(std::ranges::binary_search(*change.keys, miner.key()));
+    REQUIRE(std::ranges::binary_search(*change.keys, pending.hash()));
+    REQUIRE( ! std::ranges::binary_search(*change.keys, other.key()));
+}
+
 namespace {
 
 // Mines `count` blocks on `parent` from `first` on, each paying the miner.

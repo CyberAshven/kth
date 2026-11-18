@@ -290,17 +290,36 @@ struct chain_impl final : service::impl {
         auto const txids = chain.get_mempool_txids();
         std::set<hash_digest> now(txids.begin(), txids.end());
         if (now == pooled) co_return;
+        // Who follows the targets and transactions these touch looks again;
+        // the others need not.
+        std::vector<hash_digest> keys;
+        auto const touching = [&](hash_digest const& txid) {
+            auto const* entry = pool.find(txid);
+            if (entry == nullptr) return;
+            auto const touched = detail::touched_by(entry->tx, pool, targets);
+            keys.insert(keys.end(), touched.begin(), touched.end());
+        };
         for (auto const& txid : pooled) {
-            if ( ! now.contains(txid)) (void)pool.erase(txid);
+            if (now.contains(txid)) continue;
+            touching(txid);
+            (void)pool.erase(txid);
         }
+        auto expected = pool.size();
         for (auto const& txid : now) {
             if (pooled.contains(txid)) continue;
             auto const tx = co_await chain.fetch_unconfirmed_transaction(txid);
             if ( ! tx || ! *tx) continue;
-            (void)pool.insert(domain::chain::transaction(**tx), [this](point const& outpoint) { return known_value(outpoint); });
+            if ( ! pool.insert(domain::chain::transaction(**tx), [this](point const& outpoint) { return known_value(outpoint); })) continue;
+            ++expected;
+            touching(txid);
         }
         pooled = std::move(now);
-        changes.bump();
+        // Room made by dropping older transactions touches what they touched.
+        if (pool.size() != expected) {
+            changes.bump();
+        } else {
+            changes.touch(keys);
+        }
     }
 
     target_state& watch_one(target const& watched, uint32_t birthday) {
@@ -580,6 +599,10 @@ struct chain_impl final : service::impl {
 
     ::asio::awaitable<uint64_t> changed(uint64_t seen, std::chrono::steady_clock::time_point deadline) override {
         co_return co_await changes.wait(seen, deadline);
+    }
+
+    ::asio::awaitable<touched_keys> touched(uint64_t seen) override {
+        co_return touched_keys{changes.count(), changes.touched_since(seen)};
     }
 
     ::asio::awaitable<std::optional<domain::chain::header>> header_at(uint32_t height) override {

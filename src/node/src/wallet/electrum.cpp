@@ -38,7 +38,6 @@
 #include <kth/domain/wallet/payment_address.hpp>
 #include <kth/infrastructure/formats/base_16.hpp>
 #include <kth/infrastructure/utility/async_channel.hpp>
-#include <kth/infrastructure/utility/platform_timer.hpp>
 #include <kth/blockchain/settings.hpp>
 #include <kth/node/wallet/blocks.hpp>
 #if defined(KTH_WITH_RPC)
@@ -422,6 +421,9 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
     }
 
     // SHA-256 of "txid:height:" for every transaction, or null for none.
+    // A connected client, and what it follows (defined with the clients below).
+    struct client;
+
     static std::string status_of(target_history const& history) {
         std::string text;
         for (auto const& tx : history.confirmed) text += encode_hash(tx.txid) + ":" + std::to_string(tx.height) + ":";
@@ -439,7 +441,10 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
         co_return std::pair{height, *header};
     }
 
-    ::asio::awaitable<result> call(std::string const& method, std::vector<param> const& params) {
+    // One request. `who` asked it over a connection: what it subscribes to is
+    // recorded as the very answer it gets, so a change after that answer is
+    // a change to notify, never lost between two readings.
+    ::asio::awaitable<result> call(std::string const& method, std::vector<param> const& params, client* who = nullptr) {
         // server.*
         if (method == "server.version") co_return array_of({json_text(software), json_text(protocol_version)});
         if (method == "server.ping") co_return "null";
@@ -464,9 +469,14 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
         if (method == "blockchain.headers.get_tip" || method == "blockchain.headers.subscribe") {
             auto const now = co_await tip();
             if ( ! now) co_return fail(internal_error, "no headers yet");
-            co_return header_json(now->first, now->second);
+            auto shown = header_json(now->first, now->second);
+            if (who != nullptr && method == "blockchain.headers.subscribe") who->tip = shown;
+            co_return shown;
         }
-        if (method == "blockchain.headers.unsubscribe") co_return "true";
+        if (method == "blockchain.headers.unsubscribe") {
+            if (who != nullptr) who->tip.reset();
+            co_return "true";
+        }
         if (method == "blockchain.block.header") {
             if (params.empty() || params[0].what != param::kind::number || params[0].number < 0) co_return fail(invalid_params, "Invalid height");
             auto const height = uint32_t(params[0].number);
@@ -575,9 +585,14 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
             if (call_name == "get_status" || call_name == "subscribe") {
                 auto const answer = co_await wallet.history(*watched);
                 if ( ! answer) co_return fail(internal_error, answer.error().message());
-                co_return status_of(*answer);
+                auto status = status_of(*answer);
+                if (who != nullptr && call_name == "subscribe") who->scripts[params[0].text] = status;
+                co_return status;
             }
-            if (call_name == "unsubscribe") co_return "true";
+            if (call_name == "unsubscribe") {
+                if (who != nullptr) who->scripts.erase(params[0].text);
+                co_return "true";
+            }
             if (call_name == "get_first_use") {
                 auto const answer = co_await wallet.history(*watched);
                 if ( ! answer) co_return fail(internal_error, answer.error().message());
@@ -729,10 +744,14 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
             auto const txid = txid_of(params, 0);
             if ( ! txid) co_return fail(invalid_params, "Invalid tx hash");
             auto const found = co_await wallet.transaction(*txid, std::nullopt);
-            if ( ! found) co_return "null";
-            co_return std::to_string(found->confirmed ? found->confirmed->height : 0);
+            auto height = found ? std::to_string(found->confirmed ? found->confirmed->height : 0) : std::string("null");
+            if (who != nullptr) who->transactions[params[0].text] = height;
+            co_return height;
         }
-        if (method == "blockchain.transaction.unsubscribe") co_return "true";
+        if (method == "blockchain.transaction.unsubscribe") {
+            if (who != nullptr && ! params.empty()) who->transactions.erase(params[0].text);
+            co_return "true";
+        }
 
         if (method == "blockchain.utxo.get_info") {
             auto const txid = txid_of(params, 0);
@@ -755,14 +774,18 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
             auto const id = txid_of(params, 0);
             if ( ! id) co_return fail(invalid_params, "Invalid dsp hash or tx hash");
             auto const proof = co_await wallet.dsproof(*id);
-            if ( ! proof) co_return "null";
-            co_return dsproof_json(*proof);
+            auto shown = proof ? dsproof_json(*proof) : std::string("null");
+            if (who != nullptr && method == "blockchain.transaction.dsproof.subscribe") who->proofs[params[0].text] = shown;
+            co_return shown;
         }
         if (method == "blockchain.transaction.dsproof.list") {
             auto const listed = co_await wallet.dsproof_transactions();
             co_return hashes_json(hash_list(listed.begin(), listed.end()));
         }
-        if (method == "blockchain.transaction.dsproof.unsubscribe") co_return "true";
+        if (method == "blockchain.transaction.dsproof.unsubscribe") {
+            if (who != nullptr && ! params.empty()) who->proofs.erase(params[0].text);
+            co_return "true";
+        }
 
         // Reusable payment addresses
         if (method == "blockchain.rpa.get_history" || method == "blockchain.reusable.get_history") {
@@ -806,7 +829,7 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
         co_return fail(method_not_found, "Unknown method");
     }
 
-    ::asio::awaitable<std::string> answer_one(std::string const& line) {
+    ::asio::awaitable<std::string> answer_one(std::string const& line, client* who = nullptr) {
         auto const parsed = request_of(line);
         if ( ! parsed) {
             co_return object().text("jsonrpc", "2.0").raw("error", object().number("code", parse_error).text("message", "Parse error").done())
@@ -814,7 +837,7 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
         }
         auto const params = params_of(parsed->params);
         result outcome = fail(invalid_params, "Invalid params");
-        if (params) outcome = co_await call(parsed->method, *params);
+        if (params) outcome = co_await call(parsed->method, *params, who);
         if (parsed->notification) co_return std::string{};
         object out;
         out.text("jsonrpc", "2.0");
@@ -827,19 +850,19 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
         co_return out.done();
     }
 
-    ::asio::awaitable<std::string> answer(std::string line) {
+    ::asio::awaitable<std::string> answer(std::string line, client* who = nullptr) {
         auto const text = trimmed(line);
         if ( ! text.empty() && text.front() == '[') {
             auto const items = batch_of(text);
-            if ( ! items) co_return co_await answer_one(text);
+            if ( ! items) co_return co_await answer_one(text, who);
             std::vector<std::string> answers;
             for (auto const& item : *items) {
-                auto one = co_await answer_one(item);
+                auto one = co_await answer_one(item, who);
                 if ( ! one.empty()) answers.push_back(std::move(one));
             }
             co_return array_of(answers);
         }
-        co_return co_await answer_one(text);
+        co_return co_await answer_one(text, who);
     }
 
     // ------------------------------------------------------------------------
@@ -872,24 +895,28 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
 
     // What a client follows is sent when the wallet support reports a change
     // (a new tip, a reorganization, a mempool transaction in or out, a
-    // double-spend proof), not found by asking again on a timer.
+    // double-spend proof), not found by asking again on a timer; and only
+    // what that change touched is read again.
     ::asio::awaitable<void> notify(std::shared_ptr<client> who) {
-        auto executor = co_await ::asio::this_coro::executor;
-        kth::steady_timer pause(executor);
         uint64_t seen = co_await wallet.changed(0, std::chrono::seconds(0));
         while (who->open && ! stopping) {
+            auto const asked = std::chrono::steady_clock::now();
             auto const now_seen = co_await wallet.changed(seen, notify_wait);
             if ( ! who->open || stopping) break;
             if (now_seen == seen) {
-                // A stopped wallet answers at once: do not spin.
-                pause.expires_after(std::chrono::milliseconds(200));
-                auto [ignored] = co_await pause.async_wait(::asio::as_tuple(::asio::use_awaitable));
-                (void)ignored;
+                // Nothing changed for a while; or, answered at once, the
+                // wallet support stopped.
+                if (std::chrono::steady_clock::now() - asked < notify_wait) break;
+                continue;
             }
-            seen = now_seen;
+            auto const change = co_await wallet.touched(seen);
+            seen = change.count;
+            auto const touched = [&change](hash_digest const& key) {
+                return ! change.keys || std::ranges::binary_search(*change.keys, key);
+            };
             for (auto& [txid_text, last] : std::map<std::string, std::string>(who->transactions)) {
                 auto const txid = decode_hash(txid_text);
-                if ( ! txid) continue;
+                if ( ! txid || ! touched(*txid)) continue;
                 auto const found = co_await wallet.transaction(*txid, std::nullopt);
                 auto const height = found ? std::to_string(found->confirmed ? found->confirmed->height : 0) : std::string("null");
                 auto const known = who->transactions.find(txid_text);
@@ -903,7 +930,7 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
             }
             for (auto& [txid_text, last] : std::map<std::string, std::string>(who->proofs)) {
                 auto const txid = decode_hash(txid_text);
-                if ( ! txid) continue;
+                if ( ! txid || ! touched(*txid)) continue;
                 auto const proof = co_await wallet.dsproof(*txid);
                 auto const shown = proof ? dsproof_json(*proof) : std::string("null");
                 auto const known = who->proofs.find(txid_text);
@@ -915,7 +942,8 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
                     break;
                 }
             }
-            if (who->tip) {
+            // A mempool change does not move the tip.
+            if (who->tip && ! change.keys) {
                 auto const now = co_await tip();
                 if (now) {
                     auto const latest = header_json(now->first, now->second);
@@ -935,7 +963,7 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
                 params[0].what = param::kind::string;
                 params[0].text = key;
                 auto const watched = target_of(address ? "blockchain.address.subscribe" : "blockchain.scripthash.subscribe", params);
-                if ( ! watched) continue;
+                if ( ! watched || ! touched(watched->key())) continue;
                 auto const history = co_await wallet.history(*watched);
                 if ( ! history) continue;
                 auto const status = status_of(*history);
@@ -965,48 +993,7 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
             if (ec) break;
             auto const line = buffer.substr(0, size);
             buffer.erase(0, size);
-            auto const reply = co_await answer(line);
-            // Follow what was subscribed.
-            if (auto const parsed = request_of(trimmed(line))) {
-                auto const params = params_of(parsed->params);
-                if (params && ! params->empty() && params->front().what == param::kind::string &&
-                    (parsed->method == "blockchain.scripthash.subscribe" || parsed->method == "blockchain.address.subscribe")) {
-                    auto const watched = target_of(parsed->method, *params);
-                    if (watched) {
-                        auto const history = co_await wallet.history(*watched);
-                        if (history) who->scripts[params->front().text] = status_of(*history);
-                    }
-                } else if (params && ! params->empty() && params->front().what == param::kind::string &&
-                    (parsed->method == "blockchain.scripthash.unsubscribe" || parsed->method == "blockchain.address.unsubscribe")) {
-                    who->scripts.erase(params->front().text);
-                } else if (params && ! params->empty() && params->front().what == param::kind::string &&
-                    parsed->method == "blockchain.transaction.subscribe") {
-                    auto const txid = decode_hash(params->front().text);
-                    if (txid) {
-                        auto const found = co_await wallet.transaction(*txid, std::nullopt);
-                        who->transactions[params->front().text] = found
-                            ? std::to_string(found->confirmed ? found->confirmed->height : 0) : std::string("null");
-                    }
-                } else if (params && ! params->empty() && params->front().what == param::kind::string &&
-                    parsed->method == "blockchain.transaction.unsubscribe") {
-                    who->transactions.erase(params->front().text);
-                } else if (params && ! params->empty() && params->front().what == param::kind::string &&
-                    parsed->method == "blockchain.transaction.dsproof.subscribe") {
-                    auto const txid = decode_hash(params->front().text);
-                    if (txid) {
-                        auto const proof = co_await wallet.dsproof(*txid);
-                        who->proofs[params->front().text] = proof ? dsproof_json(*proof) : std::string("null");
-                    }
-                } else if (params && ! params->empty() && params->front().what == param::kind::string &&
-                    parsed->method == "blockchain.transaction.dsproof.unsubscribe") {
-                    who->proofs.erase(params->front().text);
-                } else if (parsed->method == "blockchain.headers.subscribe") {
-                    auto const now = co_await tip();
-                    if (now) who->tip = header_json(now->first, now->second);
-                } else if (parsed->method == "blockchain.headers.unsubscribe") {
-                    who->tip.reset();
-                }
-            }
+            auto const reply = co_await answer(line, who.get());
             if ( ! reply.empty() && ! co_await write_line(*who, reply)) break;
         }
         who->open = false;

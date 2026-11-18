@@ -195,6 +195,29 @@ std::pair<hash_list, hash_digest> header_tree::branch(uint32_t height, uint32_t 
     co_return ! ec;
 }
 
+std::vector<hash_digest> touched_by(domain::chain::transaction const& tx, mempool_copy const& pool,
+        std::map<hash_digest, target_state> const& targets) {
+    std::vector<hash_digest> out{tx.hash()};
+    auto const paid = [&](domain::chain::output const& output) {
+        for (auto const& [key, state] : targets) {
+            if (state.watched().owns(output)) out.push_back(key);
+        }
+    };
+    for (auto const& output : tx.outputs()) paid(output);
+    for (auto const& in : tx.inputs()) {
+        domain::chain::point const prevout(in.previous_output().hash(), in.previous_output().index());
+        if (auto const* parent = pool.find(prevout.hash()); parent != nullptr && prevout.index() < parent->tx.outputs().size()) {
+            paid(parent->tx.outputs()[prevout.index()]);
+        }
+        for (auto const& [key, state] : targets) {
+            if (state.coins().contains(prevout)) out.push_back(key);
+        }
+    }
+    std::ranges::sort(out);
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
 void describe(dsproof_info& info, mempool_copy const& pool) {
     info.descendants.clear();
     auto const spender = pool.spender(info.outpoint);
@@ -348,6 +371,10 @@ service::header_branch(uint32_t height, uint32_t cp_height) {
 ::asio::awaitable<uint64_t> service::changed(uint64_t seen, std::chrono::seconds timeout) {
     auto const deadline = std::chrono::steady_clock::now() + timeout;
     co_return co_await ::asio::co_spawn(impl_->executor(), impl_->changed(seen, deadline), ::asio::use_awaitable);
+}
+
+::asio::awaitable<touched_keys> service::touched(uint64_t seen) {
+    co_return co_await ::asio::co_spawn(impl_->executor(), impl_->touched(seen), ::asio::use_awaitable);
 }
 
 ::asio::awaitable<std::optional<domain::chain::header>> service::header(uint32_t height) {

@@ -126,6 +126,14 @@ struct dsproof_info {
     std::vector<hash_digest> descendants;
 };
 
+/// The count of changes, and the keys changed since the count asked about
+/// (watched targets' keys and transaction hashes), sorted; none when anything
+/// may have changed (a new tip, a reorganization).
+struct touched_keys {
+    uint64_t count = 0;
+    std::optional<std::vector<hash_digest>> keys;
+};
+
 struct mempool_summary {
     size_t count;
     size_t bytes;
@@ -292,6 +300,9 @@ public:
     /// `seen`, or after `timeout`. What follows the wallet waits on this
     /// instead of asking again and again.
     ::asio::awaitable<uint64_t> changed(uint64_t seen, std::chrono::seconds timeout);
+    /// What changed after the count `seen`: lets a follower skip the targets
+    /// and transactions a change did not touch.
+    ::asio::awaitable<touched_keys> touched(uint64_t seen);
 
     struct impl;
 

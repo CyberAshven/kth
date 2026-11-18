@@ -432,6 +432,7 @@ struct peer_impl final : service::impl {
         header_branch(uint32_t height, uint32_t cp_height) override;
     ::asio::awaitable<std::expected<std::optional<utxo>, std::error_code>> output(domain::chain::point outpoint) override;
     ::asio::awaitable<uint64_t> changed(uint64_t seen, std::chrono::steady_clock::time_point deadline) override;
+    ::asio::awaitable<touched_keys> touched(uint64_t seen) override;
     ::asio::awaitable<std::optional<domain::chain::header>> header_at(uint32_t height) override;
 };
 

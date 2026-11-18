@@ -32,10 +32,18 @@ void peer_impl::on_mempool_tx(domain::chain::transaction tx) {
     // A coinbase or a transaction without inputs or outputs is no mempool
     // transaction.
     if (tx.is_coinbase() || tx.inputs().empty() || tx.outputs().empty()) return;
-    if (pool.insert(std::move(tx), [this](point const& outpoint) { return known_value(outpoint); })) {
-        resolve_dsproofs(false);
+    auto const size_before = pool.size();
+    auto const txid = tx.hash();
+    if ( ! pool.insert(std::move(tx), [this](point const& outpoint) { return known_value(outpoint); })) return;
+    resolve_dsproofs(false);
+    // Room made by dropping older transactions touches what they touched.
+    auto const* entry = pool.find(txid);
+    if (entry == nullptr || pool.size() != size_before + 1) {
         changes.bump();
+        return;
     }
+    auto const keys = touched_by(entry->tx, pool, targets);
+    changes.touch(keys);
 }
 
 // A proof shows nothing until a transaction of the mempool copy spends its
@@ -45,12 +53,15 @@ void peer_impl::on_dsproof(message::double_spend_proof const& proof, data_chunk 
     auto const dspid = proof.hash();
     dsproof_info info{dspid, null_hash, raw, point(proof.out_point().hash(), proof.out_point().index()), {}};
     describe(info, pool);
+    // Who follows the proof, or a transaction it is about.
+    std::vector<hash_digest> keys(info.descendants.begin(), info.descendants.end());
+    keys.push_back(dspid);
     if (dsproofs.insert_or_assign(dspid, std::move(info)).second) dsproof_order.push_back(dspid);
     while (dsproof_order.size() > dsproof_limit) {
         dsproofs.erase(dsproof_order.front());
         dsproof_order.pop_front();
     }
-    changes.bump();
+    changes.touch(keys);
 }
 
 // Proofs follow the mempool: descendants that arrive later join, proofs

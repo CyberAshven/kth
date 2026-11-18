@@ -5,11 +5,15 @@
 #ifndef KTH_NODE_WALLET_DETAIL_SERVICE_IMPL_HPP
 #define KTH_NODE_WALLET_DETAIL_SERVICE_IMPL_HPP
 
+#include <algorithm>
 #include <chrono>
+#include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <stop_token>
 #include <optional>
+#include <span>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -62,20 +66,47 @@ struct service::impl {
     virtual ::asio::awaitable<std::optional<dsproof_info>> dsproof(hash_digest id) = 0;
     virtual ::asio::awaitable<std::vector<hash_digest>> dsproof_transactions() = 0;
     virtual ::asio::awaitable<uint64_t> changed(uint64_t seen, std::chrono::steady_clock::time_point deadline) = 0;
+    virtual ::asio::awaitable<touched_keys> touched(uint64_t seen) = 0;
 };
 
 namespace detail {
 
 // A count of changes, and the operations waiting for it to move. One owner:
-// the source's executor.
+// the source's executor. A change is to anything (a new tip, a
+// reorganization, where the service stands), or to a few keys only (a
+// mempool transaction: the targets it pays or spends from, and its hash):
+// who follows other keys need not look again.
 class change_signal {
 public:
+    // Keys remembered at most; older ones count as a change to anything.
+    static constexpr size_t touched_limit = 10'000;
+
     [[nodiscard]] uint64_t count() const { return count_; }
 
     void bump() {
         ++count_;
-        for (auto const& waiting : waiters_) (void)waiting->try_send(0);
-        waiters_.clear();
+        whole_at_ = count_;
+        wake();
+    }
+
+    void touch(std::span<hash_digest const> keys) {
+        ++count_;
+        for (auto const& key : keys) touched_.emplace_back(count_, key);
+        while (touched_.size() > touched_limit) {
+            trimmed_at_ = touched_.front().first;
+            touched_.pop_front();
+        }
+        wake();
+    }
+
+    // The keys changed after `seen`, sorted; none when anything may have.
+    [[nodiscard]] std::optional<std::vector<hash_digest>> touched_since(uint64_t seen) const {
+        if (whole_at_ > seen || trimmed_at_ > seen) return std::nullopt;
+        std::vector<hash_digest> out;
+        for (auto it = touched_.rbegin(); it != touched_.rend() && it->first > seen; ++it) out.push_back(it->second);
+        std::ranges::sort(out);
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
     }
 
     void close() {
@@ -98,10 +129,23 @@ public:
     }
 
 private:
+    void wake() {
+        for (auto const& waiting : waiters_) (void)waiting->try_send(0);
+        waiters_.clear();
+    }
+
     uint64_t count_ = 0;
+    uint64_t whole_at_ = 0;
+    uint64_t trimmed_at_ = 0;
+    std::deque<std::pair<uint64_t, hash_digest>> touched_;
     bool closed_ = false;
     std::vector<std::shared_ptr<kth::select_channel<int>>> waiters_;
 };
+
+// The keys a mempool transaction touches: the watched targets it pays, or
+// spends a coin or an unconfirmed output of, and its own hash.
+std::vector<hash_digest> touched_by(domain::chain::transaction const& tx, mempool_copy const& pool,
+    std::map<hash_digest, target_state> const& targets);
 
 // The Merkle branch of `leaves[index]` and the root, pairing as transaction
 // trees do (a last node without a partner is paired with itself).
