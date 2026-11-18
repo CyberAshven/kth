@@ -6,6 +6,7 @@
 #define KTH_NODE_WALLET_DETAIL_SERVICE_IMPL_HPP
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <stop_token>
 #include <optional>
@@ -105,6 +106,34 @@ private:
 // The Merkle branch of `leaves[index]` and the root, pairing as transaction
 // trees do (a last node without a partner is paired with itself).
 std::pair<hash_list, hash_digest> merkle_branch_and_root(hash_list leaves, size_t index);
+
+// The Merkle tree of the block hashes 0 to cp_height (Electrum's header
+// proofs), kept for the last cp_height asked while its block is the chain's:
+// a wallet asks with one checkpoint again and again. One tree at a time.
+class header_tree {
+public:
+    // The branch of `height` and the root; `hash_at` gives a block hash.
+    std::pair<hash_list, hash_digest> branch(uint32_t height, uint32_t cp_height,
+        std::function<hash_digest(uint32_t)> const& hash_at);
+
+private:
+    uint32_t cp_height_ = 0;
+    hash_digest cp_hash_{};
+    std::vector<hash_list> levels_;
+};
+
+// Waits for the one token a lock channel holds. False once it is closed.
+::asio::awaitable<bool> acquire(kth::select_channel<int>& lock);
+
+// Gives the token back.
+struct lock_release {
+    kth::select_channel<int>& lock;
+    ~lock_release() { (void)lock.try_send(0); }
+};
+
+// The mempool transaction a double-spend proof is about, and its
+// descendants; no transaction when none spends the proof's outpoint.
+void describe(dsproof_info& info, mempool_copy const& pool);
 
 // Answers both sources give the same way, from a target's confirmed state
 // and the mempool transactions the source knows.

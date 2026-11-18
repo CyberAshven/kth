@@ -198,6 +198,10 @@ public:
     /// descendants of what conflicts. Returns the removed hashes.
     std::vector<hash_digest> remove_for_block(domain::chain::transaction::list const& txs);
 
+    /// Removes one transaction (it left the mempool it copies). Returns
+    /// whether it was there.
+    bool erase(hash_digest const& txid);
+
     void clear();
 
 private:

@@ -12,9 +12,13 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <stop_token>
 #include <utility>
 
+#include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>
+#include <asio/deferred.hpp>
+#include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 
 #include <kth/infrastructure/error.hpp>
@@ -146,6 +150,69 @@ std::pair<hash_list, hash_digest> merkle_branch_and_root(hash_list leaves, size_
         index /= 2;
     }
     return {std::move(branch), leaves.empty() ? null_hash : leaves.front()};
+}
+
+std::pair<hash_list, hash_digest> header_tree::branch(uint32_t height, uint32_t cp_height,
+        std::function<hash_digest(uint32_t)> const& hash_at) {
+    auto const top = hash_at(cp_height);
+    if (levels_.empty() || cp_height_ != cp_height || cp_hash_ != top) {
+        levels_.clear();
+        hash_list leaves;
+        leaves.reserve(size_t(cp_height) + 1);
+        for (uint32_t at = 0; at <= cp_height; ++at) leaves.push_back(hash_at(at));
+        levels_.push_back(std::move(leaves));
+        while (levels_.back().size() > 1) {
+            auto const& below = levels_.back();
+            hash_list next;
+            next.reserve((below.size() + 1) / 2);
+            for (size_t at = 0; at < below.size(); at += 2) {
+                auto const& right = at + 1 < below.size() ? below[at + 1] : below[at];
+                data_chunk pair(below[at].begin(), below[at].end());
+                pair.insert(pair.end(), right.begin(), right.end());
+                next.push_back(bitcoin_hash(pair));
+            }
+            levels_.push_back(std::move(next));
+        }
+        cp_height_ = cp_height;
+        cp_hash_ = top;
+    }
+    hash_list out;
+    size_t index = height;
+    for (size_t level = 0; level + 1 < levels_.size(); ++level) {
+        auto const& nodes = levels_[level];
+        out.push_back(nodes[(index ^ 1) < nodes.size() ? (index ^ 1) : index]);
+        index /= 2;
+    }
+    return {std::move(out), levels_.back().front()};
+}
+
+::asio::awaitable<bool> acquire(kth::select_channel<int>& lock) {
+    auto executor = co_await ::asio::this_coro::executor;
+    auto completion = co_await ::asio::experimental::make_select(::asio::experimental::receive(lock))
+        .async_wait(executor, {}, std::stop_token{}, ::asio::as_tuple(::asio::deferred));
+    auto& [ec, selected] = completion;
+    (void)selected;
+    co_return ! ec;
+}
+
+void describe(dsproof_info& info, mempool_copy const& pool) {
+    info.descendants.clear();
+    auto const spender = pool.spender(info.outpoint);
+    info.txid = spender.value_or(null_hash);
+    if ( ! spender) return;
+    std::vector<hash_digest> pending{*spender};
+    std::set<hash_digest> seen;
+    while ( ! pending.empty()) {
+        auto const txid = pending.back();
+        pending.pop_back();
+        if ( ! seen.insert(txid).second) continue;
+        info.descendants.push_back(txid);
+        auto const* entry = pool.find(txid);
+        if (entry == nullptr) continue;
+        for (uint32_t vout = 0; vout < entry->tx.outputs().size(); ++vout) {
+            if (auto const child = pool.spender(point(txid, vout))) pending.push_back(*child);
+        }
+    }
 }
 
 } // namespace detail

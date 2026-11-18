@@ -6,19 +6,24 @@
 // target is read from its birthday on by parsing the stored blocks, many at
 // once, and applying them in height order, as Satoshi's wallet rescanned:
 // outputs to a watched script or category, inputs that spend the target's
-// own outpoints. Each block that connects later is read the same way. No
-// request leaves the node and nothing is stored: the histories are what the
-// wallet owns, kept in memory and rebuilt from the chain.
+// own outpoints. Each block that connects later is read the same way, woken
+// by the chain views the node publishes; a reorganization rolls every target
+// back to the fork and the chain's blocks are read again. No request leaves
+// the node and nothing is stored: the histories are what the wallet owns,
+// kept in memory and rebuilt from the chain.
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <deque>
+#include <future>
 #include <map>
 #include <mutex>
 #include <set>
 #include <stop_token>
 #include <thread>
+#include <tuple>
 
 #include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>
@@ -29,12 +34,12 @@
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 
+#include <spdlog/spdlog.h>
+
 #include <kth/blockchain/interface/block_chain.hpp>
 #include <kth/infrastructure/utility/async_channel.hpp>
 #include <kth/infrastructure/utility/task_group.hpp>
-#include <kth/domain/chain/script_filter_builder.hpp>
 #include <kth/node/wallet/blocks.hpp>
-#include <kth/node/wallet/scan.hpp>
 #include <kth/node/wallet/detail/service_impl.hpp>
 
 namespace kth::node::wallet {
@@ -45,7 +50,13 @@ using namespace std::chrono_literals;
 using domain::chain::point;
 using block_ptr = std::shared_ptr<domain::chain::block const>;
 
-constexpr auto follow_interval = 250ms;
+// The heights whose applied blocks are remembered, to find where a
+// reorganization forked. Bounded: it does not grow with the chain.
+constexpr uint32_t reorg_window = 2016;
+// Transactions found by hash alone, kept so that asking again reads no block.
+constexpr size_t located_limit = 10'000;
+// How long a closing service waits for what still runs on it.
+constexpr auto close_wait = 10s;
 
 struct chain_impl final : service::impl {
     blockchain::block_chain& chain;
@@ -55,7 +66,14 @@ struct chain_impl final : service::impl {
     std::map<hash_digest, target_state> targets;
     mempool_copy pool;
     std::set<hash_digest> pooled;
-    std::optional<uint32_t> followed;
+    // The block applied to the targets at each recent height.
+    std::map<uint32_t, hash_digest> applied;
+    // The generation of the chain view last followed.
+    uint64_t followed = 0;
+    // Confirmed transactions found by hash alone, the oldest first out.
+    std::map<hash_digest, transaction_info> located;
+    std::deque<hash_digest> located_order;
+    detail::header_tree tree;
     detail::change_signal changes;
     std::string last_error;
     uint64_t blocks_read = 0;
@@ -68,24 +86,31 @@ struct chain_impl final : service::impl {
     std::optional<::asio::executor_work_guard<::asio::io_context::executor_type>> work;
     kth::select_channel<int> wake{1};
     kth::select_channel<int> history_lock{1};
+    kth::select_channel<int> pool_lock{1};
+    std::promise<void> finished;
+    std::future<void> done = finished.get_future();
     std::thread thread;
 
     chain_impl(blockchain::block_chain& owner, domain::config::network net, chain_settings given)
         : chain(owner), network(net), settings(given), pool(given.mempool_bytes),
           io(std::make_unique<::asio::io_context>(1)) {
         (void)history_lock.try_send(0);
+        (void)pool_lock.try_send(0);
         work.emplace(io->get_executor());
         update_status();
-        thread = std::thread([this] { io->run(); });
+        thread = std::thread([this] {
+            io->run();
+            finished.set_value();
+        });
     }
 
+    // What still runs on the service ends once it is shut down; whatever a
+    // caller still holds after close_wait is cut off.
     ~chain_impl() override {
         stopping = true;
         ::asio::post(*io, [this] { shutdown(); });
         work.reset();
-        auto const deadline = std::chrono::steady_clock::now() + 10s;
-        while ( ! io->stopped() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(10ms);
-        io->stop();
+        if (done.wait_for(close_wait) != std::future_status::ready) io->stop();
         if (thread.joinable()) thread.join();
         io.reset();
     }
@@ -93,6 +118,7 @@ struct chain_impl final : service::impl {
     void shutdown() {
         wake.close();
         history_lock.close();
+        pool_lock.close();
         changes.close();
     }
 
@@ -146,11 +172,11 @@ struct chain_impl final : service::impl {
         auto const width = std::max<size_t>(1, settings.parallel_reads);
         auto executor = co_await ::asio::this_coro::executor;
         uint64_t const count = uint64_t(to) - from + 1;
-        for (uint64_t done = 0; done < count && ! stopping; done += width) {
-            auto const batch = size_t(std::min<uint64_t>(width, count - done));
+        for (uint64_t read = 0; read < count && ! stopping; read += width) {
+            auto const batch = size_t(std::min<uint64_t>(width, count - read));
             std::vector<uint32_t> heights;
             for (size_t i = 0; i < batch; ++i) {
-                heights.push_back(newest_first ? uint32_t(to - done - i) : uint32_t(from + done + i));
+                heights.push_back(newest_first ? uint32_t(to - read - i) : uint32_t(from + read + i));
             }
             std::vector<std::expected<block_ptr, std::error_code>> fetched(batch, std::unexpected(error::not_found));
             {
@@ -170,101 +196,83 @@ struct chain_impl final : service::impl {
         co_return stopping ? std::error_code(error::service_stopped) : std::error_code{};
     }
 
-    // Every watched target up to the connected tip: the blocks from the
-    // lowest next height on, each applied to the targets that have not read it.
-    ::asio::awaitable<std::error_code> catch_up() {
-        auto executor = co_await ::asio::this_coro::executor;
-        auto completion = co_await ::asio::experimental::make_select(::asio::experimental::receive(history_lock))
-            .async_wait(executor, {}, std::stop_token{}, ::asio::as_tuple(::asio::deferred));
-        auto& [locked, selected] = completion;
-        (void)selected;
-        if (locked) co_return error::service_stopped;
-        struct release {
-            kth::select_channel<int>& lock;
-            ~release() { (void)lock.try_send(0); }
-        } guard{history_lock};
+    // ------------------------------------------------------------------------
+    // Reorganizations
 
+    bool on_chain(uint32_t height, hash_digest const& hash) const {
+        auto const stored = chain.get_block_hash(size_t(height));
+        return stored && *stored == hash;
+    }
+
+    void remember(uint32_t height, hash_digest const& hash) {
+        // The genesis block is never reorganized away.
+        if (height == 0) return;
+        applied.insert_or_assign(height, hash);
+        while (applied.size() > 1 && applied.rbegin()->first - applied.begin()->first >= reorg_window) {
+            applied.erase(applied.begin());
+        }
+    }
+
+    // When the block applied at the highest remembered height is no longer
+    // the chain's, every target forgets the blocks above the fork: the
+    // highest remembered height whose block still is, or every block, for a
+    // reorganization deeper than the window. True when it rolled back.
+    bool unwind() {
+        if (applied.empty() || on_chain(applied.rbegin()->first, applied.rbegin()->second)) return false;
+        uint32_t fork = 0;
+        for (auto it = applied.rbegin(); it != applied.rend(); ++it) {
+            if (on_chain(it->first, it->second)) {
+                fork = it->first;
+                break;
+            }
+        }
+        spdlog::info("[wallet] Chain reorganization above height {}", fork);
+        for (auto& [key, state] : targets) (void)state.rollback(fork);
+        applied.erase(applied.upper_bound(fork), applied.end());
+        std::erase_if(located, [fork](auto const& entry) { return entry.second.confirmed->height > fork; });
+        std::erase_if(located_order, [this](hash_digest const& txid) { return ! located.contains(txid); });
+        changes.bump();
+        return true;
+    }
+
+    // ------------------------------------------------------------------------
+    // Histories
+
+    // Every watched target up to the connected tip: a reorganization rolled
+    // back first, then the blocks from the lowest next height on, each
+    // applied to the targets that have not read it. A block that does not
+    // follow the one applied below it means the chain moved during the read:
+    // the rest waits for the next round, which finds the fork.
+    ::asio::awaitable<std::error_code> catch_up() {
+        if ( ! co_await detail::acquire(history_lock)) co_return error::service_stopped;
+        detail::lock_release release{history_lock};
+        (void)unwind();
         auto const last = tip();
         uint32_t from = last + 1;
         for (auto const& [key, state] : targets) from = std::min(from, state.next_height());
         if (from > last) co_return error::success;
-        if (settings.scan == chain_scan::filters) {
-            auto const ec = co_await catch_up_with_filters(from, last);
-            if (ec) co_return ec;
-            for (auto& [key, state] : targets) state.set_synced(last);
-            co_return error::success;
-        }
+        bool moved = false;
         auto const ec = co_await each_block(from, last, false, [&](uint32_t height, block_ptr const& blk) {
+            auto const below = height > 0 ? applied.find(height - 1) : applied.end();
+            if (below != applied.end() && blk->header().previous_block_hash() != below->second) {
+                moved = true;
+                return true;
+            }
             for (auto& [key, state] : targets) {
                 if (state.next_height() <= height) (void)state.apply_block(height, blk->hash(), blk->transactions());
             }
+            remember(height, blk->hash());
             return false;
         });
         if (ec) co_return ec;
+        if (moved) {
+            // Read again, from the fork, on the next round.
+            followed = 0;
+            (void)wake.try_send(0);
+            co_return error::success;
+        }
         for (auto& [key, state] : targets) state.set_synced(last);
         co_return error::success;
-    }
-
-    // The other way: each block's script filter is built from the block and
-    // the outputs its undo record says it spends, as the node builds the
-    // filters it serves, and only the blocks a key matches are applied.
-    ::asio::awaitable<std::error_code> catch_up_with_filters(uint32_t from, uint32_t last) {
-        auto executor = co_await ::asio::this_coro::executor;
-        auto const width = std::max<size_t>(1, settings.parallel_reads);
-        for (uint64_t start = from; start <= last && ! stopping; start += width) {
-            auto const count = size_t(std::min<uint64_t>(width, uint64_t(last) - start + 1));
-            struct read {
-                block_ptr blk;
-                std::vector<size_t> matched;
-                std::error_code ec;
-            };
-            std::vector<hash_digest> keys;
-            for (auto const& [key, state] : targets) keys.push_back(key);
-            std::vector<read> reads(count);
-            {
-                kth::task_group tasks("wallet filter reads", executor);
-                for (size_t i = 0; i < count; ++i) {
-                    tasks.spawn("wallet filter read", [this, &reads, &keys, i, height = uint32_t(start + i)]() -> ::asio::awaitable<void> {
-                        auto& slot = reads[i];
-                        if (height == 0) {
-                            slot.blk = std::make_shared<domain::chain::block const>(detail::genesis_of(network));
-                            for (size_t k = 0; k < keys.size(); ++k) slot.matched.push_back(k);
-                            co_return;
-                        }
-                        auto fetched = co_await chain.fetch_block(size_t(height));
-                        if ( ! fetched) {
-                            slot.ec = fetched.error();
-                            co_return;
-                        }
-                        ++blocks_read;
-                        slot.blk = fetched->first;
-                        auto const spent = co_await chain.fetch_spent_outputs(fetched->first->hash(), fetched->first);
-                        if ( ! spent) {
-                            slot.ec = spent.error();
-                            co_return;
-                        }
-                        auto const filter = domain::chain::build_script_filter(*fetched->first, spent->outputs);
-                        if ( ! filter) {
-                            for (size_t k = 0; k < keys.size(); ++k) slot.matched.push_back(k);
-                            co_return;
-                        }
-                        slot.matched = match_script_filter(fetched->first->hash(), domain::chain::to_data(*filter), keys);
-                    });
-                }
-                co_await tasks.join();
-            }
-            for (size_t i = 0; i < count; ++i) {
-                auto const height = uint32_t(start + i);
-                if (reads[i].ec) co_return reads[i].ec;
-                for (auto const k : reads[i].matched) {
-                    auto const state = targets.find(keys[k]);
-                    if (state != targets.end() && state->second.next_height() <= height) {
-                        (void)state->second.apply_block(height, reads[i].blk->hash(), reads[i].blk->transactions());
-                    }
-                }
-            }
-        }
-        co_return stopping ? std::error_code(error::service_stopped) : std::error_code{};
     }
 
     std::optional<uint64_t> known_value(point const& outpoint) const {
@@ -274,19 +282,25 @@ struct chain_impl final : service::impl {
         return std::nullopt;
     }
 
-    // The mempool copy follows the node's own mempool.
+    // The mempool copy follows the node's own mempool: what left it leaves,
+    // what entered it is read. One refresh at a time.
     ::asio::awaitable<void> refresh_pool() {
+        if ( ! co_await detail::acquire(pool_lock)) co_return;
+        detail::lock_release release{pool_lock};
         auto const txids = chain.get_mempool_txids();
         std::set<hash_digest> now(txids.begin(), txids.end());
         if (now == pooled) co_return;
-        changes.bump();
-        pool.clear();
-        for (auto const& txid : txids) {
+        for (auto const& txid : pooled) {
+            if ( ! now.contains(txid)) (void)pool.erase(txid);
+        }
+        for (auto const& txid : now) {
+            if (pooled.contains(txid)) continue;
             auto const tx = co_await chain.fetch_unconfirmed_transaction(txid);
             if ( ! tx || ! *tx) continue;
             (void)pool.insert(domain::chain::transaction(**tx), [this](point const& outpoint) { return known_value(outpoint); });
         }
         pooled = std::move(now);
+        changes.bump();
     }
 
     target_state& watch_one(target const& watched, uint32_t birthday) {
@@ -300,7 +314,9 @@ struct chain_impl final : service::impl {
 
     ::asio::awaitable<std::error_code> watch(std::vector<target> watched, uint32_t birthday) override {
         for (auto const& one : watched) (void)watch_one(one, birthday);
-        co_return co_await catch_up();
+        auto const ec = co_await catch_up();
+        update_status();
+        co_return ec;
     }
 
     bool unwatch(target const& watched) override {
@@ -310,6 +326,7 @@ struct chain_impl final : service::impl {
     ::asio::awaitable<std::expected<target_state const*, std::error_code>> ready(target const& watched) {
         (void)watch_one(watched, settings.birthday);
         auto const ec = co_await catch_up();
+        update_status();
         if (ec) co_return std::unexpected(ec);
         co_await refresh_pool();
         auto const found = targets.find(watched.key());
@@ -335,22 +352,40 @@ struct chain_impl final : service::impl {
         co_return detail::unspent_of(**state, pool, tokens);
     }
 
-    struct located {
-        block_ptr blk;
-        uint32_t height;
-        uint32_t position;
-    };
+    // ------------------------------------------------------------------------
+    // Transactions by hash
 
-    // The block that holds `txid`: the height hint, a watched history, then
+    void keep_located(transaction_info const& info) {
+        auto const txid = info.tx.hash();
+        if (located.contains(txid)) return;
+        located.emplace(txid, info);
+        located_order.push_back(txid);
+        while (located_order.size() > located_limit) {
+            located.erase(located_order.front());
+            located_order.pop_front();
+        }
+    }
+
+    // The confirmed transaction with this hash: one found before (while its
+    // block is still the chain's), the height hint, a watched history, then
     // the stored blocks from the tip down. No index: the node reads its own
     // blocks, as a wallet reads its filters.
-    ::asio::awaitable<std::expected<located, std::error_code>> locate(hash_digest const& txid, std::optional<uint32_t> hint) {
+    ::asio::awaitable<std::expected<transaction_info, std::error_code>> locate(hash_digest const& txid, std::optional<uint32_t> hint) {
+        if (auto const known = located.find(txid); known != located.end()) {
+            auto const& at = *known->second.confirmed;
+            if (on_chain(at.height, at.block)) co_return known->second;
+        }
         auto const find_in = [&](block_ptr const& blk) -> std::optional<uint32_t> {
             auto const& txs = blk->transactions();
             for (size_t at = 0; at < txs.size(); ++at) {
                 if (txs[at].hash() == txid) return uint32_t(at);
             }
             return std::nullopt;
+        };
+        auto const found_at = [&](block_ptr const& blk, uint32_t height, uint32_t position) {
+            transaction_info info{blk->transactions()[position], confirmation{height, blk->hash(), position}};
+            keep_located(info);
+            return info;
         };
         std::vector<uint32_t> candidates;
         if (hint) candidates.push_back(*hint);
@@ -363,12 +398,12 @@ struct chain_impl final : service::impl {
             if (height > tip()) continue;
             auto const blk = co_await fetch_block(height);
             if ( ! blk) continue;
-            if (auto const at = find_in(*blk)) co_return located{*blk, height, *at};
+            if (auto const at = find_in(*blk)) co_return found_at(*blk, height, *at);
         }
-        std::optional<located> found;
+        std::optional<transaction_info> found;
         auto const ec = co_await each_block(0, tip(), true, [&](uint32_t height, block_ptr const& blk) {
             if (auto const at = find_in(blk)) {
-                found = located{blk, height, *at};
+                found = found_at(blk, height, *at);
                 return true;
             }
             return false;
@@ -381,17 +416,16 @@ struct chain_impl final : service::impl {
     ::asio::awaitable<std::expected<transaction_info, std::error_code>> transaction(hash_digest txid, std::optional<uint32_t> hint) override {
         co_await refresh_pool();
         if (auto const pending = pool.find(txid)) co_return transaction_info{pending->tx, std::nullopt};
-        auto const found = co_await locate(txid, hint);
-        if ( ! found) co_return std::unexpected(found.error());
-        co_return transaction_info{found->blk->transactions()[found->position],
-            confirmation{found->height, found->blk->hash(), found->position}};
+        co_return co_await locate(txid, hint);
     }
 
     ::asio::awaitable<std::expected<merkle_proof, std::error_code>> merkle(hash_digest txid, std::optional<uint32_t> hint) override {
         auto const found = co_await locate(txid, hint);
         if ( ! found) co_return std::unexpected(found.error());
-        co_return merkle_proof{txid, confirmation{found->height, found->blk->hash(), found->position},
-            found->blk->transaction_merkle_branch(found->position)};
+        auto const at = *found->confirmed;
+        auto const blk = co_await fetch_block(at.height);
+        if ( ! blk) co_return std::unexpected(blk.error());
+        co_return merkle_proof{txid, at, (*blk)->transaction_merkle_branch(at.position)};
     }
 
     ::asio::awaitable<std::expected<std::pair<domain::chain::transaction, merkle_proof>, std::error_code>>
@@ -464,16 +498,21 @@ struct chain_impl final : service::impl {
     header_branch(uint32_t height, uint32_t cp_height) override {
         if (height > cp_height || cp_height > tip()) co_return std::unexpected(error::operation_failed);
         auto const& index = chain.headers();
-        hash_list leaves;
-        leaves.reserve(size_t(cp_height) + 1);
-        for (uint32_t at = 0; at <= cp_height; ++at) leaves.push_back(index.get_hash(index.active_at(int32_t(at))));
-        co_return detail::merkle_branch_and_root(std::move(leaves), height);
+        co_return tree.branch(height, cp_height, [&index](uint32_t at) { return index.get_hash(index.active_at(int32_t(at))); });
     }
 
-    // The outputs that spend it are found by reading the blocks after it.
+    // An output a watched target owns is answered from its state; any other
+    // is found by reading its transaction's block and the blocks after it.
     ::asio::awaitable<std::expected<std::optional<utxo>, std::error_code>> output(point outpoint) override {
         co_await refresh_pool();
         if (pool.spender(outpoint)) co_return std::optional<utxo>{};
+        for (auto const& [key, state] : targets) {
+            auto const owned = state.coins().find(outpoint);
+            if (owned == state.coins().end()) continue;
+            if (state.is_spent(outpoint)) co_return std::optional<utxo>{};
+            auto const& coin = owned->second;
+            co_return std::optional<utxo>{utxo{outpoint, coin.value, coin.token, coin.script, coin.height}};
+        }
         auto const found = co_await transaction(outpoint.hash(), std::nullopt);
         if ( ! found) {
             if (found.error() == error::not_found) co_return std::optional<utxo>{};
@@ -505,27 +544,6 @@ struct chain_impl final : service::impl {
         co_return std::optional<utxo>{result};
     }
 
-    // The mempool transaction a proof is about, and its descendants.
-    void describe(dsproof_info& info) const {
-        info.descendants.clear();
-        auto const spender = pool.spender(info.outpoint);
-        info.txid = spender.value_or(null_hash);
-        if ( ! spender) return;
-        std::vector<hash_digest> pending{*spender};
-        std::set<hash_digest> seen;
-        while ( ! pending.empty()) {
-            auto const txid = pending.back();
-            pending.pop_back();
-            if ( ! seen.insert(txid).second) continue;
-            info.descendants.push_back(txid);
-            auto const* entry = pool.find(txid);
-            if (entry == nullptr) continue;
-            for (uint32_t vout = 0; vout < entry->tx.outputs().size(); ++vout) {
-                if (auto const child = pool.spender(point(txid, vout))) pending.push_back(*child);
-            }
-        }
-    }
-
     // The proofs the node holds that are about a transaction of its mempool.
     ::asio::awaitable<std::vector<dsproof_info>> own_dsproofs() {
         co_await refresh_pool();
@@ -539,7 +557,7 @@ struct chain_impl final : service::impl {
             if ( ! proof->to_data(writer, 0)) continue;
             dsproof_info info{proof->hash(), null_hash, std::move(raw),
                 point(proof->out_point().hash(), proof->out_point().index()), {}};
-            describe(info);
+            detail::describe(info, pool);
             if (info.txid != null_hash) out.push_back(std::move(info));
         }
         co_return out;
@@ -571,27 +589,62 @@ struct chain_impl final : service::impl {
         co_return domain::chain::header(*fetched->first);
     }
 
-    // Follows the connected tip: each new block is read for every target.
+    // ------------------------------------------------------------------------
+    // Following the node
+
+    // Rings the service for each event on a node channel, until it closes.
+    template <typename Channel>
+    ::asio::awaitable<void> relay(Channel channel) {
+        for (;;) {
+            auto const received = co_await channel->async_receive(::asio::as_tuple(::asio::use_awaitable));
+            if (std::get<0>(received)) co_return;
+            (void)wake.try_send(0);
+        }
+    }
+
+    // What the node changed since the last round: a new chain view (a block,
+    // a reorganization) is read for every target, and the mempool copy
+    // follows the node's mempool.
+    ::asio::awaitable<void> follow() {
+        auto const view = chain.chain_view();
+        auto const generation = view ? view->generation : 0;
+        if (generation != followed) {
+            followed = generation;
+            if ( ! targets.empty()) {
+                auto const ec = co_await catch_up();
+                if ( ! ec) {
+                    last_error.clear();
+                } else if (ec != error::service_stopped) {
+                    last_error = ec.message();
+                }
+            }
+            changes.bump();
+        }
+        co_await refresh_pool();
+        update_status();
+    }
+
+    // Woken by the node's own events, never by a timer: each chain view it
+    // publishes, each transaction its mempool accepts, each double-spend
+    // proof, and stop().
     ::asio::awaitable<std::error_code> run() override {
         auto executor = co_await ::asio::this_coro::executor;
-        while ( ! stopping) {
-            auto const now = tip();
-            if ( ! followed || *followed != now) {
-                if (followed) changes.bump();
-                if ( ! targets.empty()) {
-                    auto const ec = co_await catch_up();
-                    if (ec) last_error = ec.message();
-                }
-                followed = now;
+        auto views = chain.subscribe_chain_view();
+        auto transactions = chain.subscribe_transaction();
+        auto proofs = chain.subscribe_ds_proof();
+        {
+            kth::task_group relays("wallet chain events", executor);
+            if (views) relays.spawn("wallet chain views", relay(views));
+            if (transactions) relays.spawn("wallet mempool", relay(transactions));
+            if (proofs) relays.spawn("wallet double-spend proofs", relay(proofs));
+            while ( ! stopping) {
+                co_await follow();
+                if ( ! co_await detail::acquire(wake)) break;
             }
-            // The node's mempool moves without blocks: it is looked at each
-            // round, here inside the node, not asked of anyone.
-            co_await refresh_pool();
-            update_status();
-            auto completion = co_await ::asio::experimental::make_select(
-                    ::asio::experimental::receive(wake), ::asio::experimental::after(std::chrono::steady_clock::now() + follow_interval))
-                .async_wait(executor, {}, std::stop_token{}, ::asio::as_tuple(::asio::deferred));
-            (void)completion;
+            chain.unsubscribe_chain_view(views);
+            chain.unsubscribe_transaction(transactions);
+            chain.unsubscribe_ds_proof(proofs);
+            co_await relays.join();
         }
         update_status();
         co_return error::success;

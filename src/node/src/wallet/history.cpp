@@ -227,6 +227,12 @@ void mempool_copy::remove(hash_digest const& txid) {
     txs_.erase(found);
 }
 
+bool mempool_copy::erase(hash_digest const& txid) {
+    if ( ! txs_.contains(txid)) return false;
+    remove(txid);
+    return true;
+}
+
 std::vector<hash_digest> mempool_copy::remove_for_block(transaction::list const& txs) {
     std::vector<hash_digest> removed;
     std::vector<hash_digest> doomed;

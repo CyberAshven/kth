@@ -149,6 +149,9 @@ struct status {
     uint64_t blocks_downloaded = 0;
     uint64_t filter_bytes = 0;
     std::string error;
+    /// Peers found serving what does not fit the chain, each as
+    /// "<endpoint>: <why>"; none of them serves this service again.
+    std::vector<std::string> refused;
 };
 
 /// How a node without the full chain reaches its peers.
@@ -187,20 +190,9 @@ struct peer_settings {
     std::string user_agent;
 };
 
-/// How a full node finds the blocks that matter to a wallet.
-enum class chain_scan : uint8_t {
-    /// Each stored block is parsed and applied to every target: outputs to a
-    /// watched script or category, inputs that spend the target's outpoints.
-    direct,
-    /// Each block's script filter is built from the block and its undo record
-    /// (as the node serves it, nothing stored) and only the blocks it matches
-    /// are applied.
-    filters,
-};
-
-/// How a full node answers its wallet from its own chain.
+/// How a full node answers its wallet from its own chain. A target is read
+/// by parsing the stored blocks from its birthday on.
 struct chain_settings {
-    chain_scan scan = chain_scan::direct;
     /// The first height a target is read from when it is watched without one.
     uint32_t birthday = 0;
     /// Blocks read at once during a scan.

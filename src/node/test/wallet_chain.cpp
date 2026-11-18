@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <future>
 #include <memory>
@@ -16,9 +17,11 @@
 #include <vector>
 
 #include <asio/co_spawn.hpp>
+#include <asio/io_context.hpp>
 #include <asio/use_future.hpp>
 
 #include <kth/domain/chain/input_prefix_filter.hpp>
+#include <kth/node/sync/reorg.hpp>
 #include <kth/node/wallet/service.hpp>
 
 #include "sync_harness.hpp"
@@ -199,4 +202,152 @@ TEST_CASE("wallet double-spend proofs: the full node lists its own", "[wallet][w
     auto const pending_found = wait_for(*own, own->transaction(pending.hash(), std::nullopt));
     REQUIRE(pending_found);
     REQUIRE( ! pending_found->confirmed);
+}
+
+namespace {
+
+// Mines `count` blocks on `parent` from `first` on, each paying the miner.
+std::vector<chain::block> branch_of(hash_digest parent, uint32_t first, uint32_t count, uint32_t salt, uint32_t base_time) {
+    std::vector<chain::block> blocks;
+    for (uint32_t height = first; height < first + count; ++height) {
+        blocks.push_back(test::mine_block(parent, height, base_time + height * test::block_spacing, salt, {}, 0));
+        parent = blocks.back().hash();
+    }
+    return blocks;
+}
+
+std::vector<hash_digest> txids_of(wallet::target_history const& history) {
+    std::vector<hash_digest> out;
+    for (auto const& entry : history.confirmed) out.push_back(entry.txid);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("wallet from the node's own chain: a reorganization rolls the histories back and reads the new branch", "[wallet][wallet_chain]") {
+    test::chain_fixture fixture("wallet_chain_reorg");
+    REQUIRE(fixture.created());
+    REQUIRE(fixture.start());
+    auto& node_chain = fixture.chain();
+    constexpr uint32_t fork_height = 12;
+    auto const base_time = uint32_t(zulu_time()) - 60 * test::block_spacing;
+    auto const trunk = branch_of(chain::block::genesis_regtest().hash(), 1, fork_height, 0, base_time);
+    REQUIRE(fixture.organizer().add_headers(test::headers_of(trunk)).headers_added == trunk.size());
+    test::persist_headers(fixture, trunk, 1);
+    test::connect_bodies(fixture, trunk, 1);
+    auto const a = branch_of(trunk.back().hash(), fork_height + 1, 2, 1, base_time);
+    REQUIRE(fixture.organizer().add_headers(test::headers_of(a)).headers_added == a.size());
+    test::persist_headers(fixture, a, fork_height + 1);
+    test::connect_bodies(fixture, a, fork_height + 1);
+
+    auto own = wallet::service::from_chain(node_chain, domain::config::network::regtest);
+    auto running = ::asio::co_spawn(own->executor(), own->run(), ::asio::use_future);
+    auto const miner = wallet::target::of_script(test::miner_script().bytes());
+    auto const before = wait_for(*own, own->history(miner));
+    REQUIRE(before);
+    REQUIRE(before->confirmed.size() == 14u);
+    auto const orphaned = a.back().transactions().front().hash();
+    auto const listed_before = txids_of(*before);
+    REQUIRE(std::ranges::find(listed_before, orphaned) != listed_before.end());
+
+    // A heavier branch from the fork: the node switches to it.
+    auto const b = branch_of(trunk.back().hash(), fork_height + 1, 3, 2, base_time);
+    auto const added = fixture.organizer().add_headers(test::headers_of(b));
+    REQUIRE(added.reorg_candidate);
+    {
+        ::asio::io_context io;
+        auto switched = ::asio::co_spawn(io,
+            node::sync::execute_reorg(node_chain, fixture.organizer(), node_chain.headers().find(b.back().hash()),
+                fork_height, [] { return false; }, test::real_persister(node_chain)), ::asio::use_future);
+        io.run();
+        auto const outcome = switched.get();
+        REQUIRE_FALSE(outcome.fatal);
+        REQUIRE(outcome.result.ok);
+    }
+    test::connect_bodies(fixture, b, fork_height + 1);
+    REQUIRE(node_chain.chain_view()->tip_hash == b.back().hash());
+
+    // Woken by the node's chain views: the orphaned coinbases leave every
+    // answer and the new branch's arrive.
+    auto seen = wait_for(*own, own->changed(0, 0s));
+    auto const deadline = std::chrono::steady_clock::now() + 30s;
+    while (own->current().tip != fork_height + 3 && std::chrono::steady_clock::now() < deadline) {
+        seen = wait_for(*own, own->changed(seen, 5s));
+    }
+    auto const after = wait_for(*own, own->history(miner));
+    REQUIRE(after);
+    auto const listed = txids_of(*after);
+    REQUIRE(after->confirmed.size() == 15u);
+    for (auto const& blk : a) REQUIRE(std::ranges::find(listed, blk.transactions().front().hash()) == listed.end());
+    for (auto const& blk : b) REQUIRE(std::ranges::find(listed, blk.transactions().front().hash()) != listed.end());
+    REQUIRE(after->confirmed.back().height == fork_height + 3);
+    auto const coins = wait_for(*own, own->unspent(miner, wallet::token_filter::include));
+    REQUIRE(coins);
+    REQUIRE(coins->size() == 15u);
+    // The orphaned coinbase is no longer a confirmed transaction.
+    REQUIRE( ! wait_for(*own, own->transaction(orphaned, std::nullopt)));
+
+    own->stop();
+    REQUIRE(running.wait_for(30s) == std::future_status::ready);
+}
+
+TEST_CASE("wallet from the node's own chain: a birthday reads nothing below it", "[wallet][wallet_chain]") {
+    stored_chain stored("wallet_chain_birthday", 60, std::nullopt);
+    wallet::chain_settings settings;
+    settings.birthday = 40;
+    auto own = wallet::service::from_chain(stored.fixture.chain(), domain::config::network::regtest, settings);
+    auto const miner = wallet::target::of_script(test::miner_script().bytes());
+    auto const history = wait_for(*own, own->history(miner));
+    REQUIRE(history);
+    // The coinbases from the birthday on, and no block read below it.
+    REQUIRE(history->confirmed.size() == 21u);
+    REQUIRE(history->confirmed.front().height == 40u);
+    REQUIRE(own->current().blocks_downloaded == 21u);
+    // A later watch with its own, later birthday reads from there.
+    auto const other = wallet::target::of_script(data_chunk{0x51});
+    REQUIRE( ! wait_for(*own, own->watch({other}, 55)));
+    REQUIRE(own->current().blocks_downloaded == 21u + 6u);
+}
+
+TEST_CASE("wallet from the node's own chain: a birthday scan, timed", "[wallet][wallet_chain]") {
+    // 400 blocks; from 101 on, each spends the coinbase of the block 100 below.
+    constexpr uint32_t length = 400;
+    auto const flags = blockchain::settings(domain::config::network::regtest).enabled_flags();
+    auto const base_time = uint32_t(zulu_time()) - (length + 30) * test::block_spacing;
+    std::vector<chain::block> blocks;
+    auto previous = chain::block::genesis_regtest().hash();
+    for (uint32_t height = 1; height <= length; ++height) {
+        std::vector<chain::transaction> txs;
+        uint64_t fees = 0;
+        if (height > 100) {
+            auto const& coinbase = blocks[height - 101].transactions().front();
+            txs.push_back(test::spend_p2pkh(coinbase, 0, coinbase.outputs()[0].value() - 1000, flags));
+            fees = 1000;
+        }
+        blocks.push_back(test::mine_block(previous, height, base_time + height * test::block_spacing, 5, std::move(txs), fees));
+        previous = blocks.back().hash();
+    }
+    test::chain_fixture fixture("wallet_chain_timing");
+    REQUIRE(fixture.created());
+    REQUIRE(fixture.start());
+    REQUIRE(fixture.organizer().add_headers(test::headers_of(blocks)).headers_added == blocks.size());
+    test::persist_headers(fixture, blocks, 1);
+    test::connect_bodies(fixture, blocks, 1);
+    REQUIRE(fixture.chain().chain_view()->connected_tip_height == length);
+
+    auto const timed = [&](wallet::target const& target) {
+        auto own = wallet::service::from_chain(fixture.chain(), domain::config::network::regtest);
+        auto const started = std::chrono::steady_clock::now();
+        auto history = wait_for(*own, own->history(target));
+        auto const seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        REQUIRE(history);
+        return std::pair{std::move(*history), seconds};
+    };
+    auto const [dense, dense_seconds] = timed(wallet::target::of_script(test::miner_script().bytes()));
+    auto const [sparse, sparse_seconds] = timed(wallet::target::of_script(data_chunk{0x51}));
+    REQUIRE(dense.confirmed.size() == length + (length - 100));
+    REQUIRE(sparse.confirmed.empty());
+    std::printf("wallet birthday scan of %u blocks (direct parse): a script in every block %.3f s, "
+        "a script in none %.3f s\n", length, dense_seconds, sparse_seconds);
+    std::fflush(stdout);
 }
