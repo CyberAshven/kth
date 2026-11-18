@@ -199,6 +199,12 @@ uint64_t peer_impl::next_nonce() {
     if (handshake->peer_version) link->services = handshake->peer_version->services();
     tasks->spawn("wallet peer I/O", [session]() -> ::asio::awaitable<void> { (void)co_await session->run(); });
     tasks->spawn("wallet peer reader", pump(link));
+    // What a long-lived peer's mempool held before it was connected is
+    // announced on request (a `mempool` message names nothing), by a peer
+    // that serves it: one that offers bloom filters, as BCHN asks.
+    if ( ! isolated && (link->services & uint64_t(message::version::service::node_bloom)) != 0) {
+        (void)co_await send(*link, message::memory_pool{});
+    }
     co_return link;
 }
 
