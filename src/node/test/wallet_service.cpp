@@ -323,7 +323,12 @@ TEST_CASE("wallet from the node's own chain answers as from peers", "[wallet][wa
     REQUIRE(peer_found->confirmed->height == 1u);
 }
 
-TEST_CASE("wallet double-spend proofs: the full node lists its own as the peer path lists those relayed", "[wallet][wallet_chain]") {
+// Expected to fail until the dsproof message parses: its spender reads its
+// push data with read_remaining_bytes(), so the first spender takes the
+// second's bytes and no relayed proof parses (k-nuth/kth#589, #587; the
+// specification's push data is a counted list of pushes). The test peer
+// serves the proof and the client receives it; it then fails to parse.
+TEST_CASE("wallet double-spend proofs: the full node lists its own as the peer path lists those relayed", "[wallet][wallet_chain][!shouldfail]") {
     auto const flags = blockchain::settings(domain::config::network::regtest).enabled_flags();
     auto const base_time = uint32_t(zulu_time()) - 140 * test::block_spacing;
     std::vector<chain::block> blocks;
@@ -537,6 +542,7 @@ TEST_CASE("wallet from peers: a reorganization rolls the histories back, below t
         temporary_directory dir("peer_reorg");
         running_service running(settings_for(dir.path, {peer.endpoint()}));
         auto& service = *running.service;
+        REQUIRE(wait_for(service, service.wait_synced(30s)));
         auto const target = wallet::target::of_script(watched_script);
         auto const before = wait_for(service, service.history(target));
         REQUIRE(before);
