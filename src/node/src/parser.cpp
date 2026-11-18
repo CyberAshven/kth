@@ -315,6 +315,8 @@ void add_settings(CLI::App& app, configuration& cfg) {
         ->check(CLI::Validator([](std::string& value) -> std::string {
             return node::wallet::electrum_bind_refusal(value).value_or(std::string{});
         }, "LOOPBACK:PORT"));
+    app.add_option("--node.wallet_birthday",                cfg.node.wallet_birthday,
+        "The first height the node's own wallet support reads for a wallet that gives none (0: genesis).");
 #endif
     add_enum_option(app, "--node.display",
         cfg.node.display, parse_display_mode,

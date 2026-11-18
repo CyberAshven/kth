@@ -124,6 +124,13 @@ TEST_CASE("wallet listener of the node accepts loopback addresses only", "[walle
     REQUIRE(parse("[::1]:50001").first);
     REQUIRE( ! parse("0.0.0.0:50001").first);
     REQUIRE( ! parse("192.168.0.160:50001").first);
+
+    // The node's wallet reads from a birthday it is given.
+    node::parser parser(domain::config::network::regtest);
+    char const* argv[]{"kth", "--network", "regtest", "--node.wallet_birthday", "800000"};
+    std::ostringstream error;
+    REQUIRE(parser.parse(5, argv, error));
+    REQUIRE(parser.configured.node.wallet_birthday == 800000u);
 }
 
 TEST_CASE("wallet Electrum listener binds loopback addresses only", "[wallet][wallet_electrum]") {

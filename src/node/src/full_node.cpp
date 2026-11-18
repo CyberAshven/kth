@@ -370,7 +370,9 @@ void full_node::start_wallet() {
     auto const parsed = wallet::parse_electrum_bind(bind);
     if ( ! parsed) return;
     auto const& [address, port] = *parsed;
-    wallet_ = wallet::service::from_chain(chain_, network_type_);
+    wallet::chain_settings settings;
+    settings.birthday = node_settings_.wallet_birthday;
+    wallet_ = wallet::service::from_chain(chain_, network_type_, settings);
     wallet_electrum_ = std::make_unique<wallet::electrum_server>(*wallet_, network_type_);
     auto const bound = wallet_electrum_->listen(address, port);
     if ( ! bound) {

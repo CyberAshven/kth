@@ -58,6 +58,11 @@ struct KND_API settings {
     /// learn what other people's wallets watch.
     std::string wallet_electrum;
 
+    /// The first height the node's own wallet support reads for a wallet
+    /// that does not give one: no wallet it answers received anything
+    /// before it. 0 reads from genesis.
+    uint32_t wallet_birthday = 0;
+
     /// Display mode for console output (tui, log, daemon)
     display_mode display{display_mode::log};
 
