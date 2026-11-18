@@ -658,7 +658,8 @@ block_store::scan_undo_positions(undo_parent_lookup const& parent_of) {
     // A replay after a restart can append the same undo again, so a block may
     // own several records. Each is identified by its stored checksum: it is
     // seeded with the parent and covers the payload, so for one block equal
-    // content means an equal checksum.
+    // content means an equal checksum. In reference mode a replay can append a
+    // different record for the block instead; see where the two are compared.
     boost::unordered_flat_map<hash_digest, hash_digest> seen;
 
     auto fail = [&result](undo_scan_status status, int32_t file_num, uint32_t offset,
@@ -809,18 +810,32 @@ block_store::scan_undo_positions(undo_parent_lookup const& parent_of) {
 
             // Two records of one block with different checksums disagree about
             // its undo, whether or not the index still holds the block.
+            //
+            // Except in reference mode, where a replay does not repeat the bytes.
+            // There a spent output is stored as the position of the transaction
+            // that created it, and replaying a branch stores the branch's blocks
+            // again, at new positions. A block that spends from an earlier block
+            // of its own branch therefore writes a second record naming the new
+            // copy: the same outputs, different bytes, and so a different
+            // checksum. Refusing that stopped a node that had returned to a
+            // branch from starting again. Each record of a block the index holds
+            // was still checked against its checksum above.
             auto const [existing, inserted] = seen.emplace(block_hash, stored_checksum);
+#if ! defined(KTH_UTXOZ_REFERENCE_MODE)
             if ( ! inserted && existing->second != stored_checksum) {
                 std::fclose(file);
                 return fail(undo_scan_status::duplicate_record, file_num, offset, block_hash);
             }
+#endif
 
             if ( ! prev_hash) {
                 ++result.unattributed;
             } else if (inserted) {
-                // Keep the first occurrence; a replay wrote the same bytes. The
-                // position handed back is what read_undo expects: just past the
-                // header, since it seeks backwards from there.
+                // Keep the first occurrence: a replay wrote the same bytes, or,
+                // in reference mode, the same outputs at the positions of copies
+                // that stay in the blk files. The position handed back is what
+                // read_undo expects: just past the header, since it seeks
+                // backwards from there.
                 result.found.push_back({file_num,
                     offset + static_cast<uint32_t>(undo_header_size), block_hash});
             }

@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <optional>
 #include <vector>
@@ -314,6 +315,9 @@ TEST_CASE("a record for a block the index no longer holds is counted, not refuse
     CHECK(result.found.front().block_hash == kept);
 }
 
+// Full mode only: in reference mode a replay rewrites a record, so two that
+// differ are not a conflict there (see the reference-mode cases below).
+#if ! defined(KTH_UTXOZ_REFERENCE_MODE)
 TEST_CASE("conflicting records claiming the same block are refused", "[undo][scan]") {
     store_fixture fixture("duplicate");
 
@@ -328,6 +332,7 @@ TEST_CASE("conflicting records claiming the same block are refused", "[undo][sca
     CHECK(result.block_hash == block_a);
     CHECK(result.found.empty());
 }
+#endif
 
 TEST_CASE("a block with no undo record simply has none", "[undo][scan]") {
     // Side branches, blocks stored but never connected, and blocks below the
@@ -584,6 +589,7 @@ TEST_CASE("an implausible payload size is refused before anything is reserved",
     CHECK(result.error() == result_code::db_corrupt);
 }
 
+#if ! defined(KTH_UTXOZ_REFERENCE_MODE)
 TEST_CASE("conflicting records claiming one forgotten block are still refused", "[undo][scan]") {
     // Conflicting content must be refused even after the owner has disappeared
     // from the rebuilt header index.
@@ -600,6 +606,7 @@ TEST_CASE("conflicting records claiming one forgotten block are still refused", 
     CHECK(result.block_hash == forgotten);
     CHECK(result.found.empty());
 }
+#endif
 
 TEST_CASE("a path the platform can hold is a path the store can open", "[undo][scan]") {
     // std::fopen takes char const*, but a path is wchar_t on Windows. Narrowing
@@ -693,12 +700,14 @@ TEST_CASE("repeated records are compared by their checksums", "[undo][scan][repl
         auto const known = fixture.store.scan_undo_positions(parents_of({{block, parent}}));
         CHECK(known.status == block_store::undo_scan_status::invalid_checksum);
     }
+#if ! defined(KTH_UTXOZ_REFERENCE_MODE)
     SECTION("changed stored checksum with unchanged payload conflicts") {
         corrupt_byte(fixture.rev_path(0), repeated.pos + undo.serialized_size());
         auto const result = fixture.store.scan_undo_positions(parents_of({}));
         CHECK(result.status == block_store::undo_scan_status::duplicate_record);
         CHECK(result.found.empty());
     }
+#endif
     SECTION("known duplicate payload must validate its checksum") {
         corrupt_byte(fixture.rev_path(0), repeated.pos);
         auto const result = fixture.store.scan_undo_positions(parents_of({{block, parent}}));
@@ -712,3 +721,83 @@ TEST_CASE("repeated records are compared by their checksums", "[undo][scan][repl
         CHECK(result.found.empty());
     }
 }
+
+#if defined(KTH_UTXOZ_REFERENCE_MODE)
+// =============================================================================
+// Replays in reference mode
+// =============================================================================
+//
+// In reference mode a spent output is stored as the position of the transaction
+// that created it, {file_number, tx_offset}. Replaying a branch stores its
+// blocks again, so a block that spends from an earlier block of its own branch
+// writes a second record naming the new copy: the same outputs, different
+// bytes, and so a different checksum. The deep reorganization cycle in the node
+// suite runs that sequence end to end; these pin what the scan makes of the
+// two records.
+
+namespace {
+
+block_undo make_reference_undo(uint8_t seed, uint32_t height, uint32_t file_number,
+                               uint32_t tx_offset) {
+    std::vector<uint8_t> value(8);
+    std::memcpy(value.data(), &file_number, 4);
+    std::memcpy(value.data() + 4, &tx_offset, 4);
+    block_undo undo;
+    undo.spent.push_back({make_outpoint(seed, 0), std::move(value), height});
+    return undo;
+}
+
+} // namespace
+
+TEST_CASE("a replayed record that names a new copy is not a conflict in reference mode",
+          "[undo][scan][replayed_undo]") {
+    store_fixture fixture("replayed_reference");
+    auto const block = make_hash(1);
+    auto const parent = make_hash(0);
+    // One spent output, created at height 100: first referenced at offset 1000,
+    // then at 5000 once the replay had stored the block that created it again.
+    auto const first_undo = make_reference_undo(10, 100, 0, 1000);
+    auto const replayed_undo = make_reference_undo(10, 100, 0, 5000);
+    REQUIRE(first_undo.to_data() != replayed_undo.to_data());
+
+    auto const first = fixture.store.write_undo(first_undo, 0, block, parent);
+    REQUIRE_FALSE(first.is_null());
+    auto const replayed = fixture.store.write_undo(replayed_undo, 0, block, parent);
+    REQUIRE_FALSE(replayed.is_null());
+
+    SECTION("a block the index holds keeps its first record") {
+        auto const result = fixture.store.scan_undo_positions(parents_of({{block, parent}}));
+        REQUIRE(result.status == block_store::undo_scan_status::clean_eof);
+        REQUIRE(result.found.size() == 1);
+        CHECK(result.found.front().block_hash == block);
+        CHECK(result.found.front().position == first.pos);
+        auto const record = fixture.store.read_undo(first, block, parent);
+        REQUIRE(record.has_value());
+        REQUIRE(record->spent.size() == 1);
+        CHECK(record->spent.front().value == first_undo.spent.front().value);
+    }
+    SECTION("a forgotten block's records are both counted") {
+        auto const result = fixture.store.scan_undo_positions(parents_of({}));
+        CHECK(result.status == block_store::undo_scan_status::clean_eof);
+        CHECK(result.unattributed == 2);
+        CHECK(result.found.empty());
+    }
+    // Leniency about which bytes a replay writes, not about whether they are
+    // intact: each record of a block the index holds still has to match its
+    // own checksum.
+    SECTION("a replayed payload that was altered fails its checksum") {
+        corrupt_byte(fixture.rev_path(0), replayed.pos);
+        auto const result = fixture.store.scan_undo_positions(parents_of({{block, parent}}));
+        CHECK(result.status == block_store::undo_scan_status::invalid_checksum);
+        CHECK(result.block_hash == block);
+        CHECK(result.found.empty());
+    }
+    SECTION("a replayed record whose checksum was altered fails it") {
+        corrupt_byte(fixture.rev_path(0), replayed.pos + replayed_undo.serialized_size());
+        auto const result = fixture.store.scan_undo_positions(parents_of({{block, parent}}));
+        CHECK(result.status == block_store::undo_scan_status::invalid_checksum);
+        CHECK(result.block_hash == block);
+        CHECK(result.found.empty());
+    }
+}
+#endif
