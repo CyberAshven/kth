@@ -87,6 +87,21 @@ TEST_CASE("wallet Electrum listener answers in Fulcrum's shapes", "[wallet][wall
 // The node's own wallet listener
 // ----------------------------------------------------------------------------
 
+TEST_CASE("wallet Electrum listener shows the tip its answers reach, not the headers'", "[wallet][wallet_electrum]") {
+    // Headers from a peer that serves no filters: nothing below them can be
+    // answered yet, so the tip shown is genesis.
+    served_chain served;
+    for (uint32_t height = 1; height <= 10; ++height) served.mine({});
+    test_peer headers_only(served, false);
+    temporary_directory dir("electrum_tip");
+    running_service running(settings_for(dir.path, {headers_only.endpoint()}));
+    auto& service = *running.service;
+    REQUIRE(status_reaches(service, [](wallet::status const& now) { return now.header_height == 10u; }));
+    wallet::electrum_server electrum(service, domain::config::network::regtest);
+    auto const tip = wait_for(service, electrum.answer(R"({"jsonrpc":"2.0","id":1,"method":"blockchain.headers.get_tip","params":[]})"));
+    REQUIRE(tip.find(R"("height":0,)") != std::string::npos);
+}
+
 TEST_CASE("wallet listener of the node accepts loopback addresses only", "[wallet]") {
     for (auto const* accepted : {"127.0.0.1:50001", "127.5.6.7:0", "[::1]:50001"}) {
         CAPTURE(accepted);

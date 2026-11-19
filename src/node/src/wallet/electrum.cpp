@@ -465,8 +465,11 @@ struct electrum_server::impl : std::enable_shared_from_this<electrum_server::imp
     }
 
     ::asio::awaitable<std::optional<std::pair<uint32_t, chain::header>>> tip() {
+        // The tip the answers reach: the script filters' from peers, which
+        // stay behind the headers until they are synced (genesis before any),
+        // as Fulcrum shows only what it has indexed.
         auto const now = wallet.current();
-        auto const height = now.tip.value_or(now.header_height);
+        auto const height = now.tip.value_or(0);
         auto const header = co_await wallet.header(height);
         if ( ! header) co_return std::nullopt;
         co_return std::pair{height, *header};
