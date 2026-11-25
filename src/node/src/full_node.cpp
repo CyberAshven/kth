@@ -119,6 +119,11 @@ full_node::~full_node() {
         spdlog::error("[node] {}", jd_error);
         co_return error::operation_failed;
     }
+    if ( ! sv2::validate_jd_route(sv2_settings_, network_settings().proxy,
+            network_settings().i2psam, jd_error)) {
+        spdlog::error("[node] {}", jd_error);
+        co_return error::operation_failed;
+    }
 #endif
 
     // Start the blockchain (pass disk magic for block file storage)
@@ -231,7 +236,7 @@ full_node::~full_node() {
 #if defined(KTH_WITH_RPC) && ! defined(__EMSCRIPTEN__)
     if (rpc_settings_.enabled) {
         auto rpc_executor = network_.thread_pool().get_executor();
-        rpc_server_ = std::make_unique<rpc::server>(rpc_settings_, chain_, rpc_executor, &network_);
+        rpc_server_ = std::make_unique<rpc::server>(rpc_settings_, chain_, rpc_executor, &network_, started_);
     } else {
         spdlog::info("[node] JSON-RPC server disabled (rpc.enabled=false).");
     }
@@ -252,8 +257,12 @@ full_node::~full_node() {
 
 #if ! defined(__EMSCRIPTEN__)
     if (sv2_settings_.enabled) {
+        // The Job Declaration upstreams leave the node the way its peer
+        // connections do.
         template_provider_ = std::make_unique<sv2::template_provider>(
-            sv2_settings_, network_.thread_pool().get_executor(), chain_, network_type_);
+            sv2_settings_, network_.thread_pool().get_executor(), chain_, network_type_,
+            sv2::upstream_route{network_settings().proxy, network_settings().proxy_randomize,
+                network_settings().i2psam});
     } else {
         spdlog::info("[node] Stratum V2 Template Provider disabled (sv2.enabled=false).");
     }

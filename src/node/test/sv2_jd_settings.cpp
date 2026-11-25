@@ -4,10 +4,13 @@
 
 #include <test_helpers.hpp>
 
+#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include <kth/infrastructure/config/authority.hpp>
+#include <kth/infrastructure/message/network_address.hpp>
 #include <kth/node/sv2/jd_settings.hpp>
 #include <kth/node/sv2/noise.hpp>
 
@@ -397,4 +400,203 @@ TEST_CASE("sv2 JD sends worker names only to a marked upstream or one on this ma
     upstream.jds_address = "127.0.0.1:3334";
     upstream.own = false;
     CHECK_FALSE(jd_sends_worker_names(upstream));
+}
+
+TEST_CASE("sv2 JD an onion upstream needs the proxy and an I2P upstream needs the bridge", "[sv2 jd]") {
+    using infrastructure::config::authority;
+    using infrastructure::message::address_network;
+    using infrastructure::message::network_address;
+    hash_digest key{};
+    key.front() = 5;
+    auto const onion = authority(network_address(0, 0, address_network::torv3, key, 3336)).to_hostname();
+    auto const i2p = authority(network_address(0, 0, address_network::i2p, key, 0)).to_hostname();
+
+    auto settings = configured_jd();
+    std::string error;
+    // Ordinary addresses need neither, with or without them.
+    CHECK(validate_jd_route(settings, "", "", error));
+    CHECK(error.empty());
+    CHECK(validate_jd_route(settings, "127.0.0.1:9050", "127.0.0.1:7656", error));
+
+    settings.jd.mining_address = onion + ":3336";
+    CHECK(validate_jd_settings(settings, error));
+    CHECK_FALSE(validate_jd_route(settings, "", "127.0.0.1:7656", error));
+    CHECK(error.find("onion service and needs net.proxy") != std::string::npos);
+    CHECK(error.find(settings.jd.mining_address) != std::string::npos);
+    CHECK(validate_jd_route(settings, "127.0.0.1:9050", "", error));
+    CHECK(error.empty());
+
+    settings = configured_jd();
+    settings.jd.jds_address = i2p + ":0";
+    CHECK(validate_jd_settings(settings, error));
+    CHECK_FALSE(validate_jd_route(settings, "127.0.0.1:9050", "", error));
+    CHECK(error.find("I2P address and needs net.i2psam") != std::string::npos);
+    CHECK(validate_jd_route(settings, "", "127.0.0.1:7656", error));
+
+    // A node that declares no jobs has no upstream to route.
+    settings.jd.enabled = false;
+    CHECK(validate_jd_route(settings, "", "", error));
+
+    CHECK(jd_onion_host("a.onion"));
+    CHECK(jd_onion_host("A.ONION."));
+    CHECK_FALSE(jd_onion_host("onion"));
+    CHECK_FALSE(jd_onion_host("a.onion.example"));
+    CHECK(jd_i2p_host("a.b32.i2p"));
+    CHECK_FALSE(jd_i2p_host("i2p"));
+    CHECK_FALSE(jd_i2p_host("a.i2p.example"));
+}
+
+TEST_CASE("sv2 JD overlay upstreams follow the peer address rules", "[sv2 jd]") {
+    using infrastructure::config::authority;
+    using infrastructure::message::address_network;
+    using infrastructure::message::network_address;
+    hash_digest key{};
+    key.front() = 5;
+    auto const onion = authority(network_address(0, 0, address_network::torv3, key, 3336)).to_hostname();
+    auto const i2p = authority(network_address(0, 0, address_network::i2p, key, 0)).to_hostname();
+
+    // SAM 3.1 has no ports: an I2P upstream is written with port 0.
+    auto const stream = parse_jd_endpoint(i2p + ":0");
+    REQUIRE(stream);
+    CHECK(stream->host == i2p);
+    CHECK(stream->port == 0);
+    CHECK_FALSE(parse_jd_endpoint(i2p + ":3336"));
+    // Only a .b32.i2p address names a destination without an address book.
+    CHECK_FALSE(parse_jd_endpoint("pool.i2p:0"));
+    CHECK_FALSE(parse_jd_endpoint(i2p.substr(1) + ":0"));
+    auto shouted = i2p;
+    for (auto& c : shouted) {
+        if (c >= 'a' && c <= 'z') c = char(c - ('a' - 'A'));
+    }
+    CHECK_FALSE(parse_jd_endpoint(shouted + ":0"));
+
+    auto const service = parse_jd_endpoint(onion + ":3336");
+    REQUIRE(service);
+    CHECK(service->host == onion);
+    CHECK(service->port == 3336);
+    CHECK_FALSE(parse_jd_endpoint(onion + ":0"));
+    // A Tor v3 address carries a checksum; a changed character fails it.
+    auto altered = onion;
+    altered[0] = altered[0] == 'a' ? 'b' : 'a';
+    CHECK_FALSE(parse_jd_endpoint(altered + ":3336"));
+    CHECK_FALSE(parse_jd_endpoint("expyuzz4wqqyqhjn.onion:3336"));
+
+    // Port 0 stays refused for every other upstream.
+    CHECK_FALSE(parse_jd_endpoint("pool.example:0"));
+    CHECK_FALSE(parse_jd_endpoint("127.0.0.1:0"));
+
+    auto settings = configured_jd();
+    settings.jd.mining_address = i2p + ":3336";
+    std::string error;
+    CHECK_FALSE(validate_jd_settings(settings, error));
+    CHECK(error.find("or an I2P address with port 0") != std::string::npos);
+}
+
+TEST_CASE("sv2 JD every entry of an upstream list needs the route its address names", "[sv2 jd]") {
+    using infrastructure::config::authority;
+    using infrastructure::message::address_network;
+    using infrastructure::message::network_address;
+    hash_digest key{};
+    key.front() = 5;
+    auto const onion = authority(network_address(0, 0, address_network::torv3, key, 3336)).to_hostname();
+    auto const i2p = authority(network_address(0, 0, address_network::i2p, key, 0)).to_hostname();
+
+    // The second entry is dialed only when the first fails: it is checked at
+    // startup all the same.
+    auto backup = configured_jd();
+    backup.jd.jds_address = onion + ":3336";
+    auto settings = configured_list();
+    settings.jd.upstreams.push_back(upstream_text(backup.jd));
+    std::string error;
+    REQUIRE(validate_jd_settings(settings, error));
+    CHECK_FALSE(validate_jd_route(settings, "", "127.0.0.1:7656", error));
+    CHECK(error.find("onion service and needs net.proxy") != std::string::npos);
+    CHECK(error.find(backup.jd.jds_address) != std::string::npos);
+    CHECK(validate_jd_route(settings, "127.0.0.1:9050", "", error));
+    CHECK(error.empty());
+
+    backup = configured_jd();
+    backup.jd.mining_address = i2p + ":0";
+    settings = configured_list();
+    settings.jd.upstreams.push_back(upstream_text(backup.jd));
+    REQUIRE(validate_jd_settings(settings, error));
+    CHECK_FALSE(validate_jd_route(settings, "127.0.0.1:9050", "", error));
+    CHECK(error.find("I2P address and needs net.i2psam") != std::string::npos);
+    CHECK(validate_jd_route(settings, "", "127.0.0.1:7656", error));
+
+    // An I2P address with a port is refused in a list entry as it is for the
+    // single pool, with the same explanation.
+    backup.jd.mining_address = i2p + ":3336";
+    settings = configured_list();
+    settings.jd.upstreams.push_back(upstream_text(backup.jd));
+    CHECK_FALSE(validate_jd_settings(settings, error));
+    CHECK(error.find("sv2.jd.upstream[1].mining_address") != std::string::npos);
+    CHECK(error.find("or an I2P address with port 0") != std::string::npos);
+
+    // A list with an entry that does not parse is validate_jd_settings' to
+    // report; the route check reads the entries that do.
+    settings = configured_list();
+    settings.jd.upstreams.push_back("not an entry");
+    CHECK(validate_jd_route(settings, "", "", error));
+}
+
+TEST_CASE("sv2 JD an upstream is held to a latency limit that fits its route", "[sv2 jd]") {
+    using namespace std::chrono_literals;
+    using infrastructure::config::authority;
+    using infrastructure::message::address_network;
+    using infrastructure::message::network_address;
+    hash_digest key{};
+    key.front() = 5;
+    auto const onion = authority(network_address(0, 0, address_network::torv3, key, 3336)).to_hostname();
+    auto const i2p = authority(network_address(0, 0, address_network::i2p, key, 0)).to_hostname();
+
+    auto settings = configured_jd();
+    REQUIRE(settings.jd.max_latency_milliseconds == 5000);
+    // Dialed directly: the setting, whatever it is.
+    CHECK(jd_latency_limit(settings.jd, "pool.example", false) == 5000ms);
+    // Through the proxy, an onion service or any other host: at least 15 s.
+    CHECK(jd_latency_limit(settings.jd, "pool.example", true) == 15000ms);
+    CHECK(jd_latency_limit(settings.jd, onion, true) == 15000ms);
+    // Over I2P, whether or not there is a proxy as well: at least 45 s.
+    CHECK(jd_latency_limit(settings.jd, i2p, false) == 45000ms);
+    CHECK(jd_latency_limit(settings.jd, i2p, true) == 45000ms);
+
+    // The floors only raise: a setting above them stands, one below a direct
+    // connection's stays as set.
+    settings.jd.max_latency_milliseconds = 60000;
+    CHECK(jd_latency_limit(settings.jd, "pool.example", false) == 60000ms);
+    CHECK(jd_latency_limit(settings.jd, "pool.example", true) == 60000ms);
+    CHECK(jd_latency_limit(settings.jd, i2p, false) == 60000ms);
+    settings.jd.max_latency_milliseconds = 20000;
+    CHECK(jd_latency_limit(settings.jd, "pool.example", true) == 20000ms);
+    CHECK(jd_latency_limit(settings.jd, i2p, false) == 45000ms);
+    settings.jd.max_latency_milliseconds = 250;
+    CHECK(jd_latency_limit(settings.jd, "pool.example", false) == 250ms);
+    CHECK(jd_latency_limit(settings.jd, "pool.example", true) == 15000ms);
+}
+
+TEST_CASE("sv2 JD a Reconnect does not move an I2P upstream to an address dialed directly", "[sv2 jd]") {
+    using infrastructure::config::authority;
+    using infrastructure::message::address_network;
+    using infrastructure::message::network_address;
+    hash_digest key{};
+    key.front() = 5;
+    auto const onion = authority(network_address(0, 0, address_network::torv3, key, 3336)).to_hostname();
+    auto const i2p = authority(network_address(0, 0, address_network::i2p, key, 0)).to_hostname();
+    key.front() = 6;
+    auto const other_i2p = authority(network_address(0, 0, address_network::i2p, key, 0)).to_hostname();
+
+    // With no proxy, an address outside I2P is dialed directly.
+    CHECK_FALSE(jd_reconnect_keeps_route(i2p, "pool.example", false));
+    CHECK_FALSE(jd_reconnect_keeps_route(i2p, "203.0.113.7", false));
+    CHECK_FALSE(jd_reconnect_keeps_route(i2p, onion, false));
+    CHECK(jd_reconnect_keeps_route(i2p, other_i2p, false));
+    // With a proxy it leaves through the proxy, as every address outside I2P does.
+    CHECK(jd_reconnect_keeps_route(i2p, "pool.example", true));
+    CHECK(jd_reconnect_keeps_route(i2p, onion, true));
+    // An upstream that was dialed directly, or through the proxy, moves as before.
+    CHECK(jd_reconnect_keeps_route("pool.example", "other.example", false));
+    CHECK(jd_reconnect_keeps_route("pool.example", "other.example", true));
+    CHECK(jd_reconnect_keeps_route("pool.example", i2p, false));
+    CHECK(jd_reconnect_keeps_route(onion, "pool.example", true));
 }

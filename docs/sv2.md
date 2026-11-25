@@ -46,6 +46,12 @@ a little behind still accepts it, and lasts `sv2.certificate_validity_seconds`
 after it (default 2592000, or 30 days). The authority key stays the same across
 restarts.
 
+When Knuth is the client and checks a server's certificate, its own clock may
+be up to 10 seconds outside the certificate's validity times. A certificate
+carries whole seconds, and a server that signs from its current second would
+otherwise be refused by a client whose clock is a moment behind it. Knuth's own
+certificate is served only inside its validity period.
+
 Startup prints `Noise authority public key: <key>`. Give that public key to the
 Job Declarator or pool over a trusted channel and configure it as the client's
 authority public key. It is the SV2 section 4.7 encoding: Base58Check of
@@ -314,6 +320,37 @@ Each upstream always uses Noise, including when the local listener explicitly
 uses plaintext. A different signing authority, a certificate outside its
 validity window or an unauthenticated frame ends that attempt.
 
+Both upstream connections of every entry leave the node the way its peer
+connections do. With
+[`net.proxy`](outbound-tor.md) set, each is opened through that SOCKS5 proxy:
+the hostname goes to the proxy unresolved, `net.proxy_randomize` gives each
+connection its own credentials, and a proxy failure fails the attempt, with no
+direct connection in its place. An upstream can then be a Tor v3 onion address:
+
+```ini
+net.proxy             = 127.0.0.1:9050
+sv2.jd.mining_address = <56 base32 characters>.onion:3333
+```
+
+With [`net.i2psam`](i2p.md) set, an upstream can be an I2P address. It is
+written with port 0, as an I2P peer is, because SAM 3.1 has no ports:
+
+```ini
+net.i2psam            = 127.0.0.1:7656
+sv2.jd.mining_address = <52 base32 characters>.b32.i2p:0
+```
+
+I2P upstreams are opened through a SAM session of their own. Its destination is
+made for that session, kept nowhere, and accepts nothing, so it is not the
+address the node's I2P peers see. I2P addresses go to the bridge and never to
+the proxy. An onion address without `net.proxy`, an I2P address without
+`net.i2psam`, an I2P address with a nonzero port, an address that is not a
+valid Tor v3 or `.b32.i2p` address, and any other address with port 0 stop
+startup. Every entry of an `sv2.jd.upstream` list is checked this way, whether
+or not it is ever dialed. Opening the stream may take up to 20 seconds through
+the proxy and 90 seconds through I2P, on top of
+`sv2.handshake_timeout_seconds`.
+
 Both upstream `SetupConnection` messages identify the node (specification
 section 3.6.1): `vendor` is `Knuth` followed by the node's version, for example
 `Knuth 1.5.2`, and `hardware_version` is `Knuth Bitcoin Cash full node`.
@@ -561,7 +598,9 @@ hold, so a server that redirects every new connection cannot keep Knuth
 reconnecting without a pause. The new addresses last until that entry fails;
 its retry then uses the configured addresses. A malformed `Reconnect`, or one
 naming an address the configuration would refuse, demotes the entry for its
-retry delay.
+retry delay. So does one that names an address outside I2P for an upstream
+reached over I2P when `net.proxy` is not set: that address would be dialed
+directly, and an I2P upstream never learns the node's address.
 
 `ChannelEndpointChanged` (section 3.6.4) is how a proxy in front of the pool
 says it moved the extended channel to another endpoint. The channel and its
@@ -573,7 +612,10 @@ then either. One naming another channel, or arriving before the channel is
 open, ends the attempt like any other misaddressed message.
 
 Response latency above `sv2.jd.max_latency_milliseconds` also demotes an
-entry. Share health uses a rolling window of `sv2.jd.health_window` results;
+entry. An answer through Tor or over I2P crosses several relays each way, so
+an entry reached through `net.proxy` is held to that setting or to 15 seconds,
+whichever is longer, and an I2P entry to that setting or to 45 seconds. An
+entry dialed directly is held to the setting alone. Share health uses a rolling window of `sv2.jd.health_window` results;
 once that window is full, a stale or reject percentage strictly above its
 threshold demotes the entry. A refusal of a valid current-tip share is flagged
 immediately, without waiting for a full window.

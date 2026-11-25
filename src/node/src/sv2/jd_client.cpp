@@ -140,15 +140,18 @@ struct jd_client::attempt {
     // authority keys always come from the configuration.
     attempt(size_t index, jd_endpoint mining_endpoint, jd_endpoint declaration_endpoint,
         sv2_settings::jd_upstream const& upstream, sv2_settings const& settings,
-        ::asio::any_io_executor executor)
+        jd_route const& route, ::asio::any_io_executor executor)
         : index(index)
         , mining_at(std::move(mining_endpoint))
         , declaration_at(std::move(declaration_endpoint))
+        , max_latency(std::max(
+            jd_latency_limit(settings.jd, mining_at.host, ! route.proxy.empty()),
+            jd_latency_limit(settings.jd, declaration_at.host, ! route.proxy.empty())))
         , mining(executor, mining_at.host, mining_at.port, authority(upstream.mining_authority_public_key),
-            std::chrono::seconds(settings.handshake_timeout_seconds))
+            std::chrono::seconds(settings.handshake_timeout_seconds), route)
         , declaration(executor, declaration_at.host, declaration_at.port,
             authority(upstream.jds_authority_public_key),
-            std::chrono::seconds(settings.handshake_timeout_seconds))
+            std::chrono::seconds(settings.handshake_timeout_seconds), route)
         // Worker names follow the configured entry, not a Reconnect address:
         // the new server proves the same authority.
         , mining_session(jd_peer::mining, mining_at.host, mining_at.port,
@@ -157,7 +160,7 @@ struct jd_client::attempt {
             upstream.user_identity, upstream.mode == "full-template")
         , jobs(upstream.user_identity, upstream.mode == "full-template",
             data_chunk(settings.coinbase_tag.begin(), settings.coinbase_tag.end()))
-        , health(settings.jd)
+        , health(settings.jd, max_latency)
         , declaration_wake(executor)
         , hash_rate_wake(executor)
     {}
@@ -202,6 +205,9 @@ struct jd_client::attempt {
     size_t const index;
     jd_endpoint const mining_at;
     jd_endpoint const declaration_at;
+    // What both upstreams are held to: sv2.jd.max_latency_milliseconds, or
+    // more where the route to either one needs it.
+    std::chrono::milliseconds const max_latency;
     jd_connection mining;
     jd_connection declaration;
     // Empty until negotiation silence. Not a second run of declaration: run()
@@ -266,9 +272,10 @@ struct jd_client::attempt {
 };
 
 jd_client::jd_client(sv2_settings const& settings, ::asio::any_io_executor executor,
-    blockchain::block_chain* chain)
+    blockchain::block_chain* chain, jd_route route)
     : owner_(::asio::make_strand(executor))
     , settings_(settings)
+    , route_(std::move(route))
     , upstreams_(jd_upstreams(settings.jd))
     , policy_(upstreams_.size(), settings.jd)
     , redirects_(upstreams_.size())
@@ -393,8 +400,7 @@ void jd_client::mark_ready(attempt& value) {
         bool const setup_reply = header->extension() == 0
             || header->extension() == extensions_negotiation_type;
         if ( ! was_ready && setup_reply
-            && std::chrono::steady_clock::now() - sent
-                > std::chrono::milliseconds(settings_.jd.max_latency_milliseconds)) {
+            && std::chrono::steady_clock::now() - sent > value.max_latency) {
             fail(value, jd_failure::transient, "upstream setup latency exceeded threshold");
             return false;
         }
@@ -465,13 +471,13 @@ void jd_client::mark_ready(attempt& value) {
     // serve() sets negotiation_timeout only after awaiting_extensions() was
     // true, then returns without another session message. The restart holds.
     KTH_CONTRACT(value.declaration_session.restart_without_extensions());
-    // Same endpoint and authority as the connection that just closed. Nothing
-    // runs between the check above and this assignment, so a later stop()
-    // closes the new socket too.
+    // Same endpoint, authority and route as the connection that just closed.
+    // Nothing runs between the check above and this assignment, so a later
+    // stop() closes the new socket too.
     value.declaration_replacement = std::make_unique<jd_connection>(owner_,
         value.declaration_at.host, value.declaration_at.port,
         authority(upstreams_[value.index].jds_authority_public_key),
-        std::chrono::seconds(settings_.handshake_timeout_seconds));
+        std::chrono::seconds(settings_.handshake_timeout_seconds), route_);
     spdlog::info("[sv2 jd] Entry {} JDS: no RequestExtensions answer within "
         "sv2.jd.response_timeout_seconds; replacing the JDS connection", value.index + 1);
     co_await serve(value, *value.declaration_replacement, value.declaration_session,
@@ -517,7 +523,7 @@ void jd_client::start_attempt(size_t index, bool probe) {
     auto const& moved = redirects_[index];
     auto value = std::make_shared<attempt>(index,
         moved.mining.value_or(endpoint(upstream.mining_address)),
-        moved.declaration.value_or(endpoint(upstream.jds_address)), upstream, settings_, owner_);
+        moved.declaration.value_or(endpoint(upstream.jds_address)), upstream, settings_, route_, owner_);
     value->redirected = moved.mining || moved.declaration;
     // Before its channel request is built. Only the active pair's pool is sent
     // shares, so a probe opens with zero and an active pair with the sum.
@@ -720,8 +726,7 @@ bool jd_client::dispatch(attempt& value, jd_declaration::result result) {
         return true;
     }
     if (result.progress) {
-        if (value.job_sent && now - *value.job_sent
-            > std::chrono::milliseconds(settings_.jd.max_latency_milliseconds)) {
+        if (value.job_sent && now - *value.job_sent > value.max_latency) {
             fail(value, jd_failure::transient, "upstream declaration latency exceeded threshold");
             return false;
         }
@@ -1017,6 +1022,13 @@ bool jd_client::follow_reconnect(attempt& value, jd_peer peer, byte_span payload
         + ":" + std::to_string(port));
     if ( ! target) {
         fail(value, jd_failure::transient, "upstream Reconnect named an invalid address");
+        return false;
+    }
+    // An upstream reached over I2P never learns the node's address. With no
+    // proxy, an address outside I2P would be dialed directly, so the pool
+    // cannot move the node there.
+    if ( ! jd_reconnect_keeps_route(present.host, target->host, ! route_.proxy.empty())) {
+        fail(value, jd_failure::transient, "upstream Reconnect named an address outside I2P");
         return false;
     }
     // A server that answered every new connection with Reconnect would
