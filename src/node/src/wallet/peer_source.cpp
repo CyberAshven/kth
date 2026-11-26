@@ -75,7 +75,9 @@ peer_impl::peer_impl(peer_settings given, size_t capacity, data_chunk seed)
     , consensus(validation_settings(settings.network))
     , organizer(index, consensus, settings.network)
     , pool(settings.mempool_bytes)
+#if ! defined(KTH_BROWSER_NODE)
     , io(std::make_unique<::asio::io_context>(1))
+#endif
 {
     // It keeps headers and filters: it serves no blocks. It asks peers to
     // announce transactions, for the mempool copy. It says what the node
@@ -92,13 +94,20 @@ peer_impl::peer_impl(peer_settings given, size_t capacity, data_chunk seed)
     organizer.sync_tip();
     organizer.start();
     (void)history_lock.try_send(0);
+#if ! defined(KTH_BROWSER_NODE)
     work.emplace(io->get_executor());
     scan_pool = std::make_unique<::asio::thread_pool>(1);
+#endif
     tasks = std::make_unique<kth::task_group>("wallet peers", executor());
 }
 
 peer_impl::~peer_impl() {
     stopping = true;
+#if defined(KTH_BROWSER_NODE)
+    // The Worker owns the thread: run() has returned before this (see
+    // service.hpp), so nothing waits on what is destroyed here.
+    shutdown();
+#else
     // What still runs on the service ends once it is shut down; whatever a
     // caller still holds after ten seconds is cut off.
     ::asio::post(*io, [this] { shutdown(); });
@@ -106,21 +115,31 @@ peer_impl::~peer_impl() {
     if (thread.joinable() && done.wait_for(std::chrono::seconds(10)) != std::future_status::ready) io->stop();
     if (thread.joinable()) thread.join();
     scan_pool->join();
+#endif
     links.clear();
+#if ! defined(KTH_BROWSER_NODE)
     io.reset();
+#endif
     organizer.stop();
     persist();
 }
 
 void peer_impl::start_thread() {
+#if ! defined(KTH_BROWSER_NODE)
     thread = std::thread([this] {
         io->run();
         finished.set_value();
     });
+#endif
 }
 
 ::asio::any_io_executor peer_impl::executor() const {
+#if defined(KTH_BROWSER_NODE)
+    runtime->wake();
+    return runtime->context().get_executor();
+#else
     return io->get_executor();
+#endif
 }
 
 void peer_impl::shutdown() {
@@ -177,12 +196,17 @@ status peer_impl::current() const {
     if ( ! regular || items.empty() || from > to) co_return scan_hits{};
     auto locations = regular->locations(from, to + 1);
     auto path = regular->data_path();
+#if defined(KTH_BROWSER_NODE)
+    // Inline: the Worker has one thread.
+    co_return scan_regular_filters(path, locations, items, 1);
+#else
     auto const workers = threads;
     co_return co_await ::asio::co_spawn(scan_pool->get_executor(),
         [path, locations = std::move(locations), items = std::move(items), workers]()
             -> ::asio::awaitable<std::expected<scan_hits, std::error_code>> {
             co_return scan_regular_filters(path, locations, items, workers);
         }, ::asio::use_awaitable);
+#endif
 }
 
 ::asio::awaitable<std::expected<scan_hits, std::error_code>> peer_impl::scan_prefixes(scan_prefix wanted,
@@ -190,6 +214,10 @@ status peer_impl::current() const {
     if ( ! prefixes || from > to) co_return scan_hits{};
     auto locations = prefixes->locations(from, to + 1);
     auto path = prefixes->data_path();
+#if defined(KTH_BROWSER_NODE)
+    std::vector<scan_prefix> const asked{wanted};
+    co_return scan_input_prefix_filters(path, locations, asked, 1);
+#else
     auto const workers = threads;
     co_return co_await ::asio::co_spawn(scan_pool->get_executor(),
         [path, locations = std::move(locations), wanted, workers]()
@@ -197,6 +225,7 @@ status peer_impl::current() const {
             std::vector<scan_prefix> const asked{wanted};
             co_return scan_input_prefix_filters(path, locations, asked, workers);
         }, ::asio::use_awaitable);
+#endif
 }
 
 // Every target with blocks left to read, together. The regular filters are

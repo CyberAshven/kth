@@ -166,7 +166,8 @@ struct peer_settings {
     domain::config::network network = domain::config::network::mainnet;
     /// A folder per network is made in it for the headers and filters.
     std::filesystem::path directory;
-    /// host:port; a missing port takes the network's default.
+    /// host:port; a missing port takes the network's default. In a browser
+    /// node, ws:// or wss:// URLs of bridges.
     std::vector<std::string> peers;
     /// Long-lived connections for headers, filters and relay.
     size_t service_peers = 2;
@@ -213,17 +214,21 @@ struct chain_settings {
 };
 
 struct KND_API service {
+#if ! defined(KTH_BROWSER_NODE)
     /// Answers from the node's own chain: its stored blocks, its chain state
     /// and its mempool. Nothing is sent to any peer and nothing is stored.
     [[nodiscard]]
     static std::unique_ptr<service> from_chain(blockchain::block_chain& chain, domain::config::network network,
         chain_settings settings = {});
+#endif
 
     /// Answers from peers that serve the regular filter. Only scripts are
     /// watched: the regular filter holds output scripts as they are, so a
     /// script known by its hash alone or a token category is not_implemented.
     /// operation_failed without peers; file_system when the folder or a store
-    /// cannot be opened.
+    /// cannot be opened. In a browser node (KTH_BROWSER_NODE) the peers are
+    /// ws:// or wss:// bridges, everything runs on the Worker's runtime, and
+    /// the service is destroyed only after run() has returned.
     [[nodiscard]]
     static std::expected<std::unique_ptr<service>, std::error_code> from_peers(peer_settings settings);
 

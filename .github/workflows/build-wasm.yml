@@ -269,7 +269,7 @@ jobs:
           conan install . --version="${{ needs.setup.outputs.build-version }}" \
             --output-folder=build/browser-deps --lockfile=conan-wasm.lock --lockfile-partial \
             -pr:h ci_utils/conan/profiles/ems6 --build=missing \
-            -o browser_node=True -o tests=False -o rpc=none -o consensus=False \
+            -o browser_node=True -o tests=False -o rpc=none -o consensus=False -o neutrino=True -o wallet=True \
             2>&1 | tee build/browser-results/dependencies.log
           source build/browser-deps/build/Release/generators/conanbuild.sh
           cmake -S . -B build/browser -G Ninja \
@@ -280,6 +280,7 @@ jobs:
           cmake --build build/browser --parallel 4 --target \
             browser_stream_control browser_cap_control browser_eof_control \
             browser_select_control browser_terminal_control browser_headers_control browser_persist_control browser_peers_control browser_content_control \
+            browser_wallet_control \
             2>&1 | tee build/browser-results/build.log
       - name: 🌐 Run real WASM in Chromium Workers
         run: |

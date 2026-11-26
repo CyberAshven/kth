@@ -37,9 +37,11 @@
 #include <asio/post.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
+#if ! defined(KTH_BROWSER_NODE)
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
 #include <asio/thread_pool.hpp>
+#endif
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -51,6 +53,9 @@
 #include <kth/infrastructure/utility/async_channel.hpp>
 #include <kth/infrastructure/utility/task_group.hpp>
 #include <kth/network/peer_session.hpp>
+#if defined(KTH_BROWSER_NODE)
+#include <kth/node/detail/worker_runtime.hpp>
+#endif
 #include <kth/node/wallet/detail/service_impl.hpp>
 #include <kth/node/wallet/filter_files.hpp>
 #include <kth/node/wallet/scan.hpp>
@@ -220,15 +225,23 @@ struct peer_impl final : service::impl {
     std::atomic<bool> stopping{false};
 
     // Last: destroyed first, so no operation outlives what it uses.
+#if defined(KTH_BROWSER_NODE)
+    // The Worker's runtime: everything runs on the Worker's one thread, and
+    // the scans inline.
+    std::shared_ptr<browser::runtime> runtime = node::detail::worker_runtime();
+#else
     std::unique_ptr<::asio::io_context> io;
     std::optional<::asio::executor_work_guard<::asio::io_context::executor_type>> work;
+#endif
     kth::select_channel<int> wake{1};
     kth::select_channel<int> history_lock{1};
     std::unique_ptr<kth::task_group> tasks;
+#if ! defined(KTH_BROWSER_NODE)
     std::unique_ptr<::asio::thread_pool> scan_pool;
     std::promise<void> finished;
     std::future<void> done = finished.get_future();
     std::thread thread;
+#endif
 
     peer_impl(peer_settings given, size_t capacity, data_chunk seed);
     ~peer_impl() override;

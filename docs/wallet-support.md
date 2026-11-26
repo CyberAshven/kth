@@ -65,3 +65,7 @@ The regular filter holds output scripts as they are and no transaction
 hashes, so from peers a script known only by its hash, a token category, and
 a transaction known by its hash alone are answered `not_implemented`. Those
 wait for a filter that holds script keys, category keys and transaction keys.
+
+A browser node (the option `browser_node`) built with `neutrino` and `wallet`
+answers from peers the same way: its peers are ws:// or wss:// bridges, it runs
+on the Worker's runtime, which header clients share, and scans inline.

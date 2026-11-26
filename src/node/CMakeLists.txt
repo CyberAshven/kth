@@ -177,7 +177,8 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
 endif()
 
 # A browser node compiles what an ordinary WebAssembly node does, plus the
-# headers-only client and the network layer it runs on.
+# headers-only client and the network layer it runs on, and with the option
+# wallet, wallet support answered from peers (it stores no blocks).
 if(KTH_BROWSER_NODE)
   list(APPEND kth_sources_just_legacy src/header_sync.cpp)
 endif()
@@ -336,7 +337,9 @@ set(kth_headers
 )
 
 if(KTH_BROWSER_NODE)
-  list(APPEND kth_headers include/kth/node/header_sync.hpp)
+  list(APPEND kth_headers
+    include/kth/node/header_sync.hpp
+    include/kth/node/detail/worker_runtime.hpp)
 endif()
 
 add_library(${PROJECT_NAME} ${MODE} ${kth_sources} ${kth_headers})
@@ -420,6 +423,27 @@ if(KTH_WITH_WALLET AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
   target_sources(${PROJECT_NAME} PRIVATE
     src/wallet/blocks.cpp
     src/wallet/chain_source.cpp
+    src/wallet/filter_files.cpp
+    src/wallet/history.cpp
+    src/wallet/peer_blocks.cpp
+    src/wallet/peer_filters.cpp
+    src/wallet/peer_links.cpp
+    src/wallet/peer_mempool.cpp
+    src/wallet/peer_source.cpp
+    src/wallet/peer_source.hpp
+    src/wallet/scan.cpp
+    src/wallet/service.cpp
+    include/kth/node/wallet/blocks.hpp
+    include/kth/node/wallet/detail/service_impl.hpp
+    include/kth/node/wallet/filter_files.hpp
+    include/kth/node/wallet/history.hpp
+    include/kth/node/wallet/scan.hpp
+    include/kth/node/wallet/service.hpp)
+endif()
+if(KTH_WITH_WALLET AND KTH_BROWSER_NODE)
+  target_compile_definitions(${PROJECT_NAME} PUBLIC KTH_WITH_WALLET)
+  target_sources(${PROJECT_NAME} PRIVATE
+    src/wallet/blocks.cpp
     src/wallet/filter_files.cpp
     src/wallet/history.cpp
     src/wallet/peer_blocks.cpp
