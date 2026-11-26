@@ -13,7 +13,6 @@
 #include <type_traits>
 #include <utility>
 
-#include <boost/range/adaptor/reversed.hpp>
 
 #include <kth/database/define.hpp>
 #include <kth/database/settings.hpp>
@@ -30,7 +29,6 @@ namespace kth::database {
 using namespace kth::domain::chain;
 using namespace kth::config;
 using namespace kth::domain::wallet;
-using namespace boost::adaptors;
 using namespace std::filesystem;
 
 #define NAME "data_base"
@@ -73,7 +71,8 @@ bool data_base::create(block const& genesis) {
         return false;
     }
 
-    // Store the genesis header only (blocks are now stored in flat files).
+    // Store the genesis header only. Blocks are stored in flat files, which the
+    // chain opens at start: block_chain::start writes the genesis block there.
     auto res = internal_db_->push_header(genesis.header(), 0);
     if ( ! succeed(res)) {
         return false;

@@ -18,7 +18,6 @@
 #include <print>
 #include <thread>
 
-#include <boost/core/null_deleter.hpp>
 
 #include <kth/blockchain/utxo_builder.hpp>
 #include <kth/domain/multi_crypto_support.hpp>
@@ -53,7 +52,6 @@ using namespace kth::network;
 #endif
 
 using namespace std::placeholders;
-using boost::null_deleter;
 using std::error_code;
 using kth::database::data_base;
 using std::placeholders::_1;
@@ -98,7 +96,7 @@ void executor::start_io_thread() {
 
     // Start io_context in background thread
     io_thread_ = std::thread([this]() {
-        spdlog::info("[executor:io_thread] io_context_.run() starting (thread_id={})",
+        spdlog::debug("[executor:io_thread] io_context_.run() starting (thread_id={})",
             std::hash<std::thread::id>{}(std::this_thread::get_id()));
         try {
             io_context_.run();

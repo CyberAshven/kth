@@ -79,7 +79,6 @@
 #include <kth/infrastructure/utility/collection.hpp>
 #include <kth/infrastructure/utility/color.hpp>
 #include <kth/infrastructure/utility/conditional_lock.hpp>
-#include <kth/infrastructure/utility/container_sink.hpp>
 #include <kth/infrastructure/utility/data.hpp>
 #include <kth/infrastructure/utility/deadline.hpp>
 #include <kth/infrastructure/utility/decorator.hpp>
@@ -92,7 +91,6 @@
 #include <kth/infrastructure/utility/monitor.hpp>
 #include <kth/infrastructure/utility/noncopyable.hpp>
 #include <kth/infrastructure/utility/operators.hpp>
-#include <kth/infrastructure/utility/ostream_writer.hpp>
 
 #ifdef KTH_WITH_PNG
 #include <kth/infrastructure/utility/png.hpp>
@@ -118,6 +116,8 @@
 #include <kth/infrastructure/utility/threadpool.hpp>
 #include <kth/infrastructure/utility/timer.hpp>
 #include <kth/infrastructure/utility/track.hpp>
+#include <kth/infrastructure/utility/bit_reader.hpp>
+#include <kth/infrastructure/utility/bit_writer.hpp>
 #include <kth/infrastructure/utility/byte_reader.hpp>
 #include <kth/infrastructure/utility/byte_writer.hpp>
 #include <kth/infrastructure/utility/writer.hpp>
@@ -127,10 +127,6 @@
 
 #ifdef KTH_WITH_QRENCODE
 #include <kth/infrastructure/wallet/qrcode.hpp>
-#endif
-
-#if ! defined(__EMSCRIPTEN__)
-#include <kth/infrastructure/utility/pending.hpp>
 #endif
 
 // =============================================================================

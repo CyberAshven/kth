@@ -18,6 +18,7 @@
 // call has already been written and executed, whereas these fail while the
 // wrong call is being written.
 
+#include <algorithm>
 #include <filesystem>
 #include <string>
 
@@ -436,12 +437,57 @@ TEST_CASE("utxoz contract: sync is a separate act from close", "[utxoz][contract
     // wrappers that call sync() first would become redundant — and, more to the
     // point, code that forgot to would start working by accident, which is the
     // kind of thing that should be noticed deliberately.
-    static_assert(std::is_same_v<decltype(std::declval<utxoz_db&>().sync()), utxoz::result<>>,
-        "sync() must report what it achieved; a void sync promises what it cannot");
+    // The barrier comes in two halves, and each reports what it achieved: a
+    // void half would promise what it cannot. The second exists only on what
+    // the first returns, so the two cannot be taken out of order.
+    static_assert(std::is_same_v<decltype(std::declval<utxoz_db&>().begin_sync()),
+                                 utxoz::result<utxoz::pending_sync>>,
+        "begin_sync() must report what it achieved and hand back the pending barrier");
+    static_assert(std::is_same_v<decltype(std::declval<utxoz::pending_sync>().finish()),
+                                 utxoz::result<>>,
+        "finish() must report what it achieved; a void barrier promises what it cannot");
     static_assert(std::is_same_v<decltype(std::declval<utxoz_database&>().sync()),
                                  kth::database::barrier_outcome>,
         "the wrapper must keep 'this platform has none' apart from 'one failed': a bool "
         "answers both with false, and only one of the two may be carried on past (#600)");
+}
+
+TEST_CASE("utxoz behaviour: the barrier in two halves is the barrier, and each half answers for itself",
+          "[utxoz][contract]") {
+    // A closed store has no first half to give, and says `failed` as sync()
+    // does: a caller asking for a guarantee did not get one.
+    {
+        utxoz_database closed;
+        auto const refused = closed.begin_sync();
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error() == kth::database::barrier_outcome::failed);
+    }
+
+    scoped_temp_dir const dir{"kth_utxoz_halves_" + std::to_string(current_process_id())};
+    utxoz_database db;
+    REQUIRE(db.open(dir.path, true));
+
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
+    // Both halves, in order: the same answer the single call gives.
+    {
+        auto pending = db.begin_sync();
+        REQUIRE(pending.has_value());
+        CHECK(std::move(*pending).finish() == kth::database::barrier_outcome::crossed);
+        CHECK(db.sync() == kth::database::barrier_outcome::crossed);
+    }
+
+    // The second half does not keep the store open, and does not pretend: a
+    // store closed between the halves made no barrier, and the half that finds
+    // out is the one that says so.
+    {
+        auto pending = db.begin_sync();
+        REQUIRE(pending.has_value());
+        db.close();
+        CHECK(std::move(*pending).finish() == kth::database::barrier_outcome::failed);
+    }
+#else
+    db.close();
+#endif
 }
 
 TEST_CASE("utxoz contract: platform durability is askable, not assumed", "[utxoz][contract]") {
@@ -528,7 +574,7 @@ TEST_CASE("utxoz behaviour: a negative file number fails in reference mode only"
     REQUIRE(negative->inserts.size() == 1);
     auto const& stored = negative->inserts.begin()->second;
     CHECK(stored.height == 500u);
-    CHECK(stored.data == std::vector<uint8_t>{0xf4, 0x01, 0, 0, 10, 0, 0, 0, 0});
+    CHECK(std::ranges::equal(stored.data, std::vector<uint8_t>{0xf4, 0x01, 0, 0, 10, 0, 0, 0, 0}));
 #endif
 
     // The control that keeps the above from passing by always failing: a valid

@@ -24,19 +24,25 @@ endif()
 
 message(STATUS "Knuth: Cryptocurrency: ${CURRENCY}")
 
-# Mempool backing map: cfm (boost::concurrent_flat_map) | parlay (ParlayHash).
-# Set at the root so the define (and, for parlay, the vendored include) reach
-# every module that includes block_chain.hpp — not only blockchain.
-set(KTH_MEMPOOL_BACKEND "cfm" CACHE STRING "Mempool backing map (cfm|parlay).")
-if (${KTH_MEMPOOL_BACKEND} STREQUAL "cfm")
-    add_definitions(-DKTH_MEMPOOL_BACKEND_CFM)
-elseif (${KTH_MEMPOOL_BACKEND} STREQUAL "parlay")
-    add_definitions(-DKTH_MEMPOOL_BACKEND_PARLAY)
-    include_directories(SYSTEM ${CMAKE_CURRENT_SOURCE_DIR}/third_party/parlayhash/include)
-else()
-    message(FATAL_ERROR "Invalid mempool backend: ${KTH_MEMPOOL_BACKEND} (expected cfm|parlay)")
+include(cmake/KthParlayHash.cmake)
+
+# Signature verification: secp256k1 (libsecp256k1, one signature at a time,
+# inline in the script interpreter) | secp256k1_turbo (the interpreters defer
+# the checks whose failure is final and the block validator verifies them in
+# lane-parallel batches with src/secp256k1-turbo). Set at the root so the
+# define reaches every module that compiles the interpreters.
+set(KTH_SIGNATURE_VERIFICATION "secp256k1" CACHE STRING "Signature verification: secp256k1 | secp256k1_turbo")
+if (KTH_SIGNATURE_VERIFICATION STREQUAL "secp256k1_turbo")
+    add_definitions(-DKTH_SIGVERIFY_TURBO_BATCH)
+elseif (NOT KTH_SIGNATURE_VERIFICATION STREQUAL "secp256k1")
+    message(FATAL_ERROR "Invalid signature verification: ${KTH_SIGNATURE_VERIFICATION} (expected secp256k1|secp256k1_turbo)")
 endif()
-message(STATUS "Knuth: Mempool backend: ${KTH_MEMPOOL_BACKEND}")
+message(STATUS "Knuth: Signature verification: ${KTH_SIGNATURE_VERIFICATION}")
+# GPU backends of src/secp256k1-turbo: none | auto | cuda | metal. Off by
+# default in the node build; src/secp256k1-turbo/CMakeLists.txt documents the
+# toolchains each one needs.
+set(KTH_SECP256K1_TURBO_GPU "none" CACHE STRING "secp256k1-turbo GPU backends: none | auto | cuda | metal")
+message(STATUS "Knuth: secp256k1-turbo GPU backends: ${KTH_SECP256K1_TURBO_GPU}")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -75,6 +81,15 @@ if(KTH_BROWSER_NODE)
         ASIO_CHANNEL_SELECT_TIMER_TYPE=::kth::browser::timer)
 endif()
 option(KTH_WITH_WEBSOCKET "Build native P2P WebSocket server transport" OFF)
+option(KTH_WITH_NEUTRINO "Build the compact block filters for light wallets (Neutrino, BIP157/158)" OFF)
+option(KTH_WITH_SOCKS5 "Build outbound connections through a SOCKS5 proxy" OFF)
+option(KTH_WITH_BLOOM_FILTERS "Build serving wallets that load a bloom filter (BIP37)" OFF)
+option(KTH_WITH_SV2 "Build Stratum V2 for pools and miners" OFF)
+# The regular filter built is the one of Bitcoin Cash, which is not the basic
+# filter of BIP158: another currency would serve filters its wallets cannot use.
+if (KTH_WITH_NEUTRINO AND NOT CURRENCY STREQUAL "BCH")
+    message(FATAL_ERROR "KTH_WITH_NEUTRINO requires CURRENCY=BCH")
+endif()
 
 # set(ENABLE_POSITION_INDEPENDENT_CODE ON)
 # set(WITH_CONSOLE OFF)

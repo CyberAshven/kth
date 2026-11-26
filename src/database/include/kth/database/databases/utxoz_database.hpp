@@ -123,6 +123,40 @@ concept utxo_delete_range = std::ranges::range<T> && requires(std::ranges::range
 // Converts between Knuth types and UTXO-Z types.
 // =============================================================================
 
+/// The second half of the UTXO store's durability barrier, owed since
+/// utxoz_database::begin_sync().
+///
+/// The barrier comes in two halves because they need different things. The
+/// first flushes what deletions wrote through the store's file cache and has to
+/// be excluded like a mutation, lookups included. The second is the rest of it,
+/// and most of it: the active containers, the files and the directory. It
+/// shares nothing with a lookup, so it may run while lookups do; nothing that
+/// mutates the store may run until it has returned.
+///
+/// Move-only, and finish() consumes it. Dropping one without finishing makes
+/// nothing durable: the barrier was simply not made. The destructor does not
+/// finish it, because it could not report that it had failed.
+struct KD_API [[nodiscard]] pending_barrier {
+    pending_barrier(pending_barrier&&) noexcept = default;
+    pending_barrier& operator=(pending_barrier&&) noexcept = default;
+    pending_barrier(pending_barrier const&) = delete;
+    pending_barrier& operator=(pending_barrier const&) = delete;
+
+    /// Makes the rest of the barrier. `crossed` means everything written before
+    /// begin_sync() was called is on stable storage. Never `unsupported`: a
+    /// platform with no barrier says so from begin_sync() and hands back
+    /// nothing to finish.
+    [[nodiscard]]
+    barrier_outcome finish() &&;
+
+private:
+    friend struct utxoz_database;
+    explicit pending_barrier(utxoz::pending_sync&& pending) noexcept
+        : pending_(std::move(pending)) {}
+
+    utxoz::pending_sync pending_;
+};
+
 struct KD_API utxoz_database {
     utxoz_database() = default;
     ~utxoz_database();
@@ -200,8 +234,8 @@ struct KD_API utxoz_database {
     // =============================================================================
 
     /// A UTXO exactly as stored, without resolving it into a utxo_entry.
-    /// `value` is the storage-native payload — in reference mode the 8-byte
-    /// {file_number, tx_offset} reference, in full mode the serialized entry —
+    /// `value` is the storage-native payload — in reference mode the bytes of
+    /// a utxoz::reference_location, in full mode the serialized entry —
     /// which is the same shape apply_delta_raw inserts. It is NOT the same type:
     /// that range holds utxo_raw_value, whose payload member is `data`, so a
     /// range of these does not compile there and the caller rebuilds the pair
@@ -314,20 +348,19 @@ struct KD_API utxoz_database {
 
         for (auto const& [key, raw] : inserts) {
 #ifdef KTH_UTXOZ_REFERENCE_MODE
-            // Reference mode: deserialize the 8-byte reference into typed fields.
-            // Checked first: these are two reads off a caller-supplied buffer,
-            // and a short payload would read past its end. A payload that is not
-            // exactly eight bytes is not a reference at all, whatever it is.
-            if (raw.data.size() != 8) {
+            // Reference mode: the payload is a utxoz::reference_location, as
+            // its bytes. Checked first: this is a read off a caller-supplied
+            // buffer, and a short payload would read past its end. A payload of
+            // any other size is not a reference at all, whatever it is.
+            if (raw.data.size() != utxoz::reference_value_size) {
                 spdlog::error("[utxoz_database] reference payload for {} is {} byte(s), "
-                    "not 8; refusing to read it as a reference",
-                    utxoz::outpoint_to_string(key), raw.data.size());
+                    "not {}; refusing to read it as a reference",
+                    utxoz::outpoint_to_string(key), raw.data.size(), utxoz::reference_value_size);
                 return result_code::other;
             }
-            uint32_t file_number, tx_offset;
-            std::memcpy(&file_number, raw.data.data(), 4);
-            std::memcpy(&tx_offset, raw.data.data() + 4, 4);
-            auto ins = db_->insert(key, file_number, tx_offset, raw.height);
+            utxoz::reference_location location;
+            std::memcpy(&location, raw.data.data(), utxoz::reference_value_size);
+            auto ins = db_->insert(key, location.file_number, location.offset, raw.height);
 #else
             auto ins = db_->insert(key, raw.data, raw.height);
 #endif
@@ -468,6 +501,15 @@ struct KD_API utxoz_database {
     /// platform that has none.
     [[nodiscard]]
     barrier_outcome sync();
+
+    /// The first half of the same barrier, for a caller that wants its lookups
+    /// back before the second. Needs the exclusion a mutation needs.
+    ///
+    /// The error is the outcome sync() would have reported: `unsupported` where
+    /// the platform has no barrier, `failed` otherwise. See pending_barrier for
+    /// what running the second half requires.
+    [[nodiscard]]
+    std::expected<pending_barrier, barrier_outcome> begin_sync();
 
     /// Print statistics to log.
     ///

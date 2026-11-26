@@ -14,6 +14,7 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <boost/unordered/concurrent_flat_map.hpp>
@@ -30,6 +31,7 @@
 #include <kth/network/protocols_coro.hpp>
 #include <kth/network/settings.hpp>
 
+#include <kth/node/detail/outbound_retry.hpp>
 #include <kth/node/detail/tx_announcements.hpp>
 
 #include <asio/awaitable.hpp>
@@ -43,6 +45,10 @@
 
 namespace kth::node::detail { struct p2p_node_test_seam; }
 namespace kth::node::detail { struct ws_discovery_inbox; }
+
+namespace kth::node::sync {
+struct compact_block_receiver;
+} // namespace kth::node::sync
 
 namespace kth::node {
 using namespace kth::network;
@@ -114,19 +120,19 @@ public:
     ::asio::awaitable<bool> dispatch(peer_session& peer, raw_message const& msg);
 
     /// Register a raw handler for a specific command
-    void register_handler(std::string const& command, message_handler_fn handler);
+    void register_handler(std::string_view command, message_handler_fn handler);
 
     /// Register a typed handler for a specific message type
     /// The message type must have a static 'command' string member
     template <typename Message>
     void register_handler(typed_message_handler_fn<Message> handler) {
-        handlers_[Message::command] = make_handler<Message>(std::move(handler));
+        handlers_.insert_or_assign(std::string{Message::command}, make_handler<Message>(std::move(handler)));
     }
 
     /// Register a typed handler from a function pointer
     template <typename Message>
     void register_handler(::asio::awaitable<message_result>(*handler)(peer_session&, Message const&)) {
-        handlers_[Message::command] = make_handler<Message>(handler);
+        handlers_.insert_or_assign(std::string{Message::command}, make_handler<Message>(handler));
     }
 
     /// Register a default handler for unhandled messages
@@ -138,7 +144,7 @@ public:
     /// For requests whose answer waits on the peer's data queue.
     template <typename Message>
     void register_served_handler(typed_message_handler_fn<Message> handler) {
-        served_handlers_[Message::command] = make_handler<Message>(std::move(handler));
+        served_handlers_.insert_or_assign(std::string{Message::command}, make_handler<Message>(std::move(handler)));
     }
 
     /// Announces a tip to one peer. `last_announced` is what this peer's
@@ -216,12 +222,22 @@ struct handshake_response {
 /// Channel type for handshake response (one-shot)
 using handshake_response_channel = concurrent_channel<handshake_response>;
 
+struct peer_lifecycle_end {
+    bool admitted = false;
+    std::chrono::steady_clock::duration connected_for{};
+};
+
+using peer_lifecycle_channel = select_channel<peer_lifecycle_end>;
+
 struct peer_event {
     peer_session::ptr peer;
     peer_direction direction;
     // Optional response channel for connect() to wait on handshake result
     // If nullptr, no response is expected (e.g., for seeding connections)
     std::shared_ptr<handshake_response_channel> response_channel;
+    // Closed only after the supervisor has joined the full session lifecycle.
+    // A configured endpoint's owner waits here before attempting a replacement.
+    std::shared_ptr<peer_lifecycle_channel> lifecycle_ended = nullptr;
 };
 
 /// Type of peer lifecycle event for sync layer notification
@@ -237,6 +253,9 @@ namespace detail {
 struct header_ingest_channels;
 struct tx_relay_channels;
 class tx_relay_backlog;
+#if defined(KTH_WITH_NEUTRINO)
+struct compact_filter_channels;
+#endif
 } // namespace detail
 
 /// Woken when at least one block has been announced. Carries nothing: the
@@ -354,6 +373,21 @@ public:
         dispatcher_.set_tx_announcement_handler(std::move(sources));
     }
 
+    /// The node's compact block receiver (BIP152), set before run() and
+    /// outliving it. The read loop offers it each cmpctblock and blocktxn,
+    /// without waiting. Without one a cmpctblock contributes its header
+    /// alone, and a blocktxn is not taken.
+    void set_compact_block_receiver(sync::compact_block_receiver* receiver);
+
+    /// Peers asked at once to send new blocks as a cmpctblock before they
+    /// announce them (BIP152 high bandwidth, sendcmpct(1, 1)), as BIP152
+    /// recommends and BCHN does. The others are asked for low bandwidth.
+    static constexpr size_t max_high_bandwidth_compact_peers = 3;
+
+    /// node.compact_blocks_high_bandwidth. Off, every peer is asked for low
+    /// bandwidth (sendcmpct(0, 1)). Set before run().
+    void set_compact_high_bandwidth(bool enabled);
+
     // Manual connections
     // -------------------------------------------------------------------------
 
@@ -405,11 +439,14 @@ public:
     // treated as an answer. An `inv` carries no header, only hashes, and those
     // are registered as announcements instead, under a mutex, because they
     // arrive on several peer strands at once. Its channel is only a doorbell.
+    // The exception is a `cmpctblock` the node takes to rebuild its block
+    // (set_compact_block_receiver): its header comes in with the block.
 
-    /// What the read loop does with `headers`, `cmpctblock` and `inv` before
-    /// anything else sees them. Answers whether the message was consumed: only
-    /// `headers` is; the other two carry on to the dispatcher. Any other
-    /// command is left alone.
+    /// What the read loop does with `headers`, `cmpctblock`, `blocktxn` and
+    /// `inv` before anything else sees them. Answers whether the message was
+    /// consumed: `headers` is, and a `blocktxn` the reconstruction waiting for
+    /// it took; the others carry on to the dispatcher. Any other command is
+    /// left alone.
     [[nodiscard]]
     bool observe_block_message(peer_session::ptr const& peer, raw_message const& raw);
 
@@ -447,6 +484,14 @@ public:
     /// Closed by stop().
     [[nodiscard]]
     detail::tx_relay_channels& tx_relay();
+
+#if defined(KTH_WITH_NEUTRINO)
+    /// What the peers' services ask of the compact filter index, and the ring
+    /// of each connected tip (detail/compact_filters.hpp). Owned and drained by
+    /// the index when the node serves compact filters. Closed by stop().
+    [[nodiscard]]
+    detail::compact_filter_channels& compact_filters();
+#endif
 
     /// What was announced since the last take. `overflowed` says the registry
     /// refused hashes for want of room, so the list is not the whole story and
@@ -549,6 +594,11 @@ private:
     ::asio::awaitable<void> run_peer_protocols(peer_session::ptr peer, bool discovery);
     ::asio::awaitable<void> read_peer_messages(peer_session::ptr peer, bool discovery);
     ::asio::awaitable<void> maintain_outbound_connections();
+    ::asio::awaitable<void> maintain_configured_peer(std::string host, uint16_t port);
+    ::asio::awaitable<bool> wait_configured_retry(std::chrono::seconds delay);
+    awaitable_expected<peer_session::ptr> connect(
+        std::string const& host, uint16_t port,
+        std::shared_ptr<peer_lifecycle_channel> lifecycle_ended);
 
     // Peer supervisor - manages all peer lifecycles (structured concurrency)
     ::asio::awaitable<void> peer_supervisor();
@@ -557,7 +607,8 @@ private:
     ::asio::awaitable<void> connect_to_seed(
         std::string seed_host,
         uint16_t seed_port,
-        std::shared_ptr<std::atomic<size_t>> seeds_completed);
+        std::shared_ptr<std::atomic<size_t>> seeds_completed,
+        std::stop_token enough);
 
     uint64_t generate_nonce();
 
@@ -575,13 +626,9 @@ private:
     // Prevents multiple simultaneous connection attempts to the same IP
     boost::concurrent_flat_set<::asio::ip::address, salted_ip_hasher> pending_connections_;
 
-    // Track recently failed connection IPs with cooldown timestamp
-    // Prevents rapid reconnection to failing peers
-    boost::concurrent_flat_map<
-        ::asio::ip::address,
-        std::chrono::steady_clock::time_point,
-        salted_ip_hasher
-    > failed_connections_;
+    // Addresses left alone for a while: the ones that could not be reached,
+    // and the ones whose sessions keep ending at once.
+    detail::outbound_retry outbound_retry_;
 
     // Acceptor for inbound connections
     std::unique_ptr<::asio::ip::tcp::acceptor> acceptor_;
@@ -740,6 +787,9 @@ private:
 
     std::unique_ptr<detail::header_ingest_channels> header_ingest_;
     std::unique_ptr<detail::tx_relay_channels> tx_relay_;
+#if defined(KTH_WITH_NEUTRINO)
+    std::unique_ptr<detail::compact_filter_channels> compact_filters_;
+#endif
 
     /// Each form a header or an announcement arrives in. Every one of them
     /// states what it does with the message; none accepts a message and
@@ -749,6 +799,16 @@ private:
     void announce_from_inventory(peer_session::ptr const& peer, raw_message const& raw,
                                  detail::tx_relay_backlog& backlog);
 
+
+    /// A cmpctblock or a blocktxn, parsed whole, to the node's compact block
+    /// handlers. False when it does not parse, has bytes past its end, or is
+    /// not taken.
+    bool offer_compact_block(peer_session::ptr const& peer, raw_message const& raw);
+    bool deliver_block_transactions(peer_session::ptr const& peer, raw_message const& raw);
+
+    sync::compact_block_receiver* compact_blocks_{nullptr};
+
+    bool compact_high_bandwidth_{true};
 
     // Peers choose what goes in here, so it is bounded and its membership test
     // is constant time. Beyond the bound new hashes are refused and the refusal

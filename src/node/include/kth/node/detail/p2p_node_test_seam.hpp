@@ -11,7 +11,13 @@
 #ifndef KTH_NODE_DETAIL_P2P_NODE_TEST_SEAM_HPP_
 #define KTH_NODE_DETAIL_P2P_NODE_TEST_SEAM_HPP_
 
+#include <cstddef>
+#include <future>
+#include <system_error>
 #include <utility>
+
+#include <asio/co_spawn.hpp>
+#include <asio/use_future.hpp>
 
 #include <kth/node/p2p_node.hpp>
 
@@ -27,6 +33,13 @@ namespace kth::node::detail {
 struct p2p_node_test_seam {
     using probe_point = p2p_node::status_probe_point;
 
+    // A day-long retry makes cancellation observable without a tight timing
+    // assertion. This calls the same wait the configured endpoint owner uses.
+    static ::asio::awaitable<bool> wait_configured_retry(
+            p2p_node& target, std::chrono::seconds delay) {
+        co_return co_await target.wait_configured_retry(delay);
+    }
+
     static ::asio::awaitable<void> admit_peer(p2p_node& target,
         network::peer_session::ptr peer, peer_direction direction) {
         co_await target.new_peer_channel_->async_send(std::error_code{},
@@ -37,6 +50,21 @@ struct p2p_node_test_seam {
     template <typename Probe>
     static void set_status_probe(p2p_node& target, Probe probe) {
         target.status_probe_ = std::move(probe);
+    }
+
+    /// Hand a session to the peer supervisor as an inbound connection, as the
+    /// acceptor does, so a test can hold the other end of the handshake.
+    /// Inbound, so any number of test peers on the loopback address are
+    /// admitted: an outbound session needs an address no other session holds.
+    static bool queue_peer(p2p_node& target, network::peer_session::ptr peer) {
+        return target.new_peer_channel_->try_send(std::error_code{},
+            peer_event{std::move(peer), peer_direction::inbound, nullptr});
+    }
+
+    /// Peers holding one of the high-bandwidth compact block slots.
+    static size_t high_bandwidth_compact_peers(p2p_node& target) {
+        return ::asio::co_spawn(target.pool_.get_executor(), target.manager_.compact_slots(),
+            ::asio::use_future).get();
     }
 };
 

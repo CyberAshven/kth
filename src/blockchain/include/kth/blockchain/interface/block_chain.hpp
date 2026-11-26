@@ -57,6 +57,7 @@
 #include <asio/any_io_executor.hpp>
 #include <asio/awaitable.hpp>
 #include <stop_token>
+#include <asio/experimental/channel_select.hpp>
 #include <asio/experimental/concurrent_channel.hpp>
 
 
@@ -317,6 +318,17 @@ struct KB_API block_chain {
     [[nodiscard]]
     std::expected<uint32_t, database::result_code> get_utxo_built_height() const;
 
+    /// Remove the block files a pruning node no longer keeps, given the height
+    /// the UTXO set was just built to. Does nothing on a node that keeps every
+    /// block (`db.prune_keep_blocks` zero), and looks again only after the
+    /// built height has moved on a little, so calling it per batch is cheap.
+    ///
+    /// For the task that applies blocks to the UTXO set, after it has made
+    /// `built_height` durable: see `prune_block_files` in prune.hpp.
+    /// @return How many block files were removed.
+    [[nodiscard]]
+    std::expected<size_t, database::result_code> prune_block_files(uint32_t built_height);
+
     [[nodiscard]]
     database::result_code set_utxo_built_height(uint32_t height);
 
@@ -344,7 +356,9 @@ struct KB_API block_chain {
     //   6  drain the deferred deletions           a failure is fatal, not logged
     //   7  flush_undo(every rev file touched)     not just the last
     //   8  the undo directory                     inside flush_undo
-    //   9  utxo_sync()
+    //   9  utxo_sync()                            or its two halves: the first
+    //                                             under the window, the second
+    //                                             after it, beside readers
     //  10  publish_transition(...)                ONE transaction: heights AND clear
     //  11  env_sync()
     //  12  mempool, publish_chain_view(), end_transition()
@@ -395,6 +409,33 @@ struct KB_API block_chain {
     /// recursive.
     [[nodiscard]]
     database::barrier_outcome utxo_sync(utxo_write_window const& window);
+
+    /// Step 9 in two halves, for an operation that wants lookups admitted
+    /// before the barrier is whole.
+    ///
+    /// The first half runs under the operation's window, like every mutation.
+    /// It flushes what the deletions wrote through the store's file cache and
+    /// returns what is still owed. The error is the outcome utxo_sync() would
+    /// have reported, `unsupported` included.
+    [[nodiscard]]
+    std::expected<database::pending_barrier, database::barrier_outcome>
+    utxo_begin_sync(utxo_write_window const& window);
+
+    /// The second half, taken AFTER the window has ended: the active
+    /// containers, the files and the directory. Lookups may run while it does.
+    ///
+    /// It holds a read lease for as long as it runs. That is what keeps every
+    /// mutation out: a window waits for the leases to drain, so no writer can
+    /// reach the store between the two halves' end. A lease is the right
+    /// capability and not a weaker one borrowed for convenience — the store's
+    /// own rule for this half is exactly a reader's: any number of lookups
+    /// beside it, nothing that mutates.
+    ///
+    /// Anything but `crossed` latches the gate. The window that applied the
+    /// mutations has already ended, so it can no longer do that itself, and
+    /// what it applied is not known to be on disk.
+    [[nodiscard]]
+    database::barrier_outcome utxo_finish_sync(database::pending_barrier&& pending);
 
     /// What this node may claim about a published transition: the weakest of
     /// the four barriers above, not any one store's answer.
@@ -693,6 +734,13 @@ struct KB_API block_chain {
     [[nodiscard]]
     code commit_validated_transaction(mempool_entry entry, chain_view_ptr const& expected);
 
+    /// What commit_validated_transaction(entry, ...) would refuse `entry` for,
+    /// or success, without recording it: its pooled parents, the pool's
+    /// minimum fee, and the eviction of a pool at its limit. On the chain's
+    /// executor, as mempool_minimum_fee().
+    [[nodiscard]]
+    ::asio::awaitable<code> test_commit_validated_transaction(mempool_entry entry);
+
     // Metadata relative to a single connected publication. The overload taking
     // a view lets multi-part API responses retain the same reference chain.
     // An unavailable reference leaves both depths at -1; own branch metadata
@@ -741,6 +789,16 @@ struct KB_API block_chain {
 
     [[nodiscard]]
     bool transition_in_progress() const;
+
+    /// Rung each time a transition ends, once capture has reopened: the
+    /// connected tip may have moved, and work can be built on it again. For
+    /// one consumer that waits for the tip to change instead of asking again;
+    /// it reads chain_view() for where the tip is. It holds one ring, and a
+    /// transition that finds it full adds nothing: the ring already waiting
+    /// asks for the same read. Whoever receives it takes it, so a second
+    /// consumer would be woken for some transitions only.
+    using doorbell = ::asio::experimental::select_channel<std::monostate>;
+    doorbell& tip_changes() { return tip_changes_; }
 
     /// Whether this node should be serving mining work: it has connected
     /// everything it has headers for, and that tip is recent.
@@ -907,6 +965,12 @@ struct KB_API block_chain {
     [[nodiscard]]
     ::asio::awaitable<code> transaction_validate(transaction_const_ptr tx) const;
 
+    /// Whether submit_transaction(tx) would admit `tx` to the mempool as the
+    /// pool is now, without admitting or announcing it: the pool can change
+    /// before a later submission. Yields the transaction's sigchecks when it would.
+    [[nodiscard]]
+    awaitable_expected<size_t> test_accept(transaction_const_ptr tx);
+
     // =========================================================================
     // PROPERTIES
     // =========================================================================
@@ -1004,6 +1068,17 @@ struct KB_API block_chain {
     [[nodiscard]] std::expected<std::vector<data_chunk>, database::result_code>
     fetch_blocks_raw(uint32_t from, uint32_t to) const;
 
+    // fetch_blocks_raw for as many of the blocks from `from` as fit in
+    // `max_bytes`, never past `to` and never fewer than one: the caller reads
+    // how many came back. Lets a batch be sized by what it holds rather than
+    // by a count of blocks, which says little when a block is anything from
+    // two hundred bytes to tens of megabytes. Every height of the range has
+    // to be stored, whether or not it ends up read: the range is the caller's
+    // statement of what is there. key_not_found when one is not, and when
+    // `from` is above `to`.
+    [[nodiscard]] std::expected<std::vector<data_chunk>, database::result_code>
+    fetch_blocks_raw_within(uint32_t from, uint32_t to, uint64_t max_bytes) const;
+
     [[nodiscard]] awaitable_expected<std::pair<header_ptr, size_t>>
     fetch_block_header(size_t height) const;
 
@@ -1076,8 +1151,25 @@ struct KB_API block_chain {
     fetch_mining_template(uint64_t coinbase_reserve_size) const;
 
     // Optional request clock for deterministic callers; nullopt samples wall time.
+    //
+    // `after_generation` is for a caller that already holds the template
+    // selected from the mempool of that generation and asks for a later one,
+    // as a long poll does once its wait is over. A cached template that is not
+    // later is then served only when the mempool has not changed since it was
+    // selected, since no later one exists.
     awaitable_expected<blockchain::mining_template>
-    fetch_mining_template(uint64_t coinbase_reserve_size, std::optional<uint32_t> request_time) const;
+    fetch_mining_template(uint64_t coinbase_reserve_size, std::optional<uint32_t> request_time,
+        std::optional<uint64_t> after_generation = std::nullopt) const;
+
+    // Both reserves, space and SigChecks, for a caller whose coinbase needs
+    // SigChecks room too, such as an SV2 client's CoinbaseOutputConstraints.
+    // Both are part of the template cache key. The reserve is its own type so
+    // that a SigChecks count cannot be passed where the overload above takes
+    // the request clock. `after_generation` is as in the overload above.
+    [[nodiscard]] awaitable_expected<blockchain::mining_template>
+    fetch_mining_template(blockchain::coinbase_reserve reserve,
+        std::optional<uint32_t> request_time = std::nullopt,
+        std::optional<uint64_t> after_generation = std::nullopt) const;
 
     // Mining-relevant chain snapshot (height, difficulty, mempool size, network)
     // for getmininginfo. C-API counterpart: kth_chain_async_fetch_mining_info.
@@ -1092,7 +1184,21 @@ struct KB_API block_chain {
     std::vector<domain::chain::transaction> get_mempool_transactions_from_wallets(std::vector<domain::wallet::payment_address> const& payment_addresses, bool use_testnet_rules) const;
 
     mempool_mini_hash_map get_mempool_mini_hash_map(domain::message::compact_block const& block) const;
-    void fill_tx_list_from_mempool(domain::message::compact_block const& block, size_t& mempool_count, std::vector<domain::chain::transaction>& txn_available, std::unordered_map<uint64_t, uint16_t> const& shorttxids) const;
+    /// What the mempool gave a compact block's slots.
+    struct mempool_fill {
+        /// The slots handed in, with each one the mempool holds exactly one
+        /// transaction for filled. An ambiguous slot is left null.
+        domain::chain::transaction::list transactions;
+        /// How many of them the mempool filled.
+        size_t matched = 0;
+        /// Whether two of the mempool's transactions claimed one slot.
+        bool collided = false;
+    };
+
+    /// Fill `slots`, positions in the block, from the mempool: `positions`
+    /// gives the slot of each short ID.
+    [[nodiscard]]
+    mempool_fill fill_tx_list_from_mempool(domain::message::compact_block const& block, domain::chain::transaction::list slots, short_id_slots const& positions) const;
 
     // Mempool query readers, backing the typical BCH JSON-RPC mempool calls.
     hash_list get_mempool_txids() const;                                                             // getrawmempool
@@ -1238,12 +1344,18 @@ private:
     database::data_base database_;
     // db.nocow: the UTXO-Z directory is created NOCOW on btrfs.
     bool const in_place_nocow_;
+    // db.prune_keep_blocks: zero on a node that keeps every block.
+    uint32_t const prune_keep_blocks_;
+    // The built height of the last pruning pass. Touched only by the task that
+    // calls prune_block_files.
+    uint32_t pruned_at_height_{0};
 
     /// The published state on its own. Private: a caller that wants the state
     /// wants the tip and the generation that go with it, and reading them apart
     /// is what produced the combinations #605 was about. The one legitimate use
     /// is seeding a branch's state below.
     mutable capture_gate capture_gate_;
+    doorbell tip_changes_{1};
 
     // One swap publishes the whole triple; see published_chain_view.
     mutable boost::atomic_shared_ptr<published_chain_view const> chain_view_;
@@ -1268,6 +1380,11 @@ private:
     // and a trim, each ringing mempool_fee_events_ when the minimum moved.
     void note_mempool_block_connected();
     size_t trim_mempool(uint64_t limit);
+
+    // What keeps a validated transaction out of the pool before it is added:
+    // a pooled parent that left, or a fee under the pool's minimum. The caller
+    // holds the validation mutex.
+    code admission_refusal(mempool_entry const& entry, uint64_t limit);
     ::asio::experimental::select_channel<std::monostate> mempool_fee_events_{1};
 
     // Under validation_mutex_: the order of admission, and its doorbell.
@@ -1287,6 +1404,7 @@ private:
         uint64_t generation;
         uint32_t time;
         uint64_t coinbase_reserve_size;
+        uint64_t coinbase_reserve_sigchecks;
     };
     mutable boost::atomic_shared_ptr<template_snapshot> template_cache_;
     /// Ends the hydration phase. Called once, by the start path, after the header
