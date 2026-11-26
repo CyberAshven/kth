@@ -621,6 +621,7 @@ if (ENABLE_TEST AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
   if(KTH_WITH_WALLET AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     add_executable(kth_node_wallet_test
       test/wallet.cpp
+      test/wallet_block_checks.cpp
       test/wallet_chain.cpp)
     target_include_directories(kth_node_wallet_test PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test>)
     target_link_libraries(kth_node_wallet_test PUBLIC ${PROJECT_NAME})
