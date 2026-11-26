@@ -2712,15 +2712,37 @@ static
                         settle_connected();
                     }
 
-                    // Buffer the chunk result (chunks may arrive out of order)
-                    pending_chunks[result->start_height] = *result;
+                    // Buffer the chunk result (chunks may arrive out of order).
+                    // Two results can start at one height, the longer kept:
+                    // a compact block stores the block after the connected tip
+                    // alone, while a body range that also asked for it
+                    // completes with that block and the ones after it.
+                    auto const [slot, fresh_slot] = pending_chunks.try_emplace(result->start_height, *result);
+                    if ( ! fresh_slot && result->block_count > slot->second.block_count) {
+                        slot->second = *result;
+                    }
 
-                    // Advance blocks_synced_to through consecutive completed chunks
-                    while (true) {
-                        auto it = pending_chunks.find(blocks_synced_to + 1);
-                        if (it == pending_chunks.end()) break;
-                        blocks_synced_to = it->second.start_height + it->second.block_count - 1;
-                        pending_chunks.erase(it);
+                    // Advance blocks_synced_to through the completed chunks that
+                    // reach it. One may start at or below it, for the same
+                    // reason: its first block came in as a compact block, and
+                    // its end is still the next body. Left buffered, it held
+                    // the cursor below the range end, the range read as in
+                    // flight, and no further range was opened.
+                    for (bool moved = true; moved;) {
+                        moved = false;
+                        for (auto it = pending_chunks.begin(); it != pending_chunks.end();) {
+                            auto const start = it->second.start_height;
+                            if (start > blocks_synced_to + 1) {
+                                ++it;
+                                continue;
+                            }
+                            auto const end = start + it->second.block_count - 1;
+                            if (it->second.block_count != 0 && end > blocks_synced_to) {
+                                blocks_synced_to = end;
+                                moved = true;
+                            }
+                            it = pending_chunks.erase(it);
+                        }
                     }
 
                     // Log progress periodically (every 1000 blocks)
