@@ -421,11 +421,13 @@ if(KTH_WITH_WALLET AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     src/wallet/chain_source.cpp
     src/wallet/filter_files.cpp
     src/wallet/history.cpp
+    src/wallet/scan.cpp
     src/wallet/service.cpp
     include/kth/node/wallet/blocks.hpp
     include/kth/node/wallet/detail/service_impl.hpp
     include/kth/node/wallet/filter_files.hpp
     include/kth/node/wallet/history.hpp
+    include/kth/node/wallet/scan.hpp
     include/kth/node/wallet/service.hpp)
 endif()
 
@@ -624,7 +626,8 @@ if (ENABLE_TEST AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     add_executable(kth_node_wallet_test
       test/wallet.cpp
       test/wallet_chain.cpp
-      test/wallet_filter_files.cpp)
+      test/wallet_filter_files.cpp
+      test/wallet_scan.cpp)
     target_include_directories(kth_node_wallet_test PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test>)
     target_link_libraries(kth_node_wallet_test PUBLIC ${PROJECT_NAME})
     target_link_libraries(kth_node_wallet_test PRIVATE Catch2::Catch2WithMain)
