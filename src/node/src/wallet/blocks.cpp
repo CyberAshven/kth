@@ -6,9 +6,31 @@
 
 #include <algorithm>
 
+#include <kth/domain/chain/compact_filter.hpp>
 #include <kth/domain/chain/input_prefix_filter.hpp>
+#include <kth/infrastructure/error.hpp>
 
 namespace kth::node::wallet {
+
+std::error_code check_block(domain::chain::block const& blk, hash_digest const& expected) {
+    if (blk.transactions().empty()) return error::empty_block;
+    if (blk.hash() != expected) return error::bad_stream;
+    if (blk.generate_merkle_root() != blk.header().merkle()) return error::merkle_mismatch;
+    if ( ! blk.is_distinct_transaction_set()) return error::bad_stream;
+    return {};
+}
+
+std::error_code check_regular_filter(domain::chain::block const& blk, byte_span filter) {
+    auto const rebuilt = domain::chain::build_regular_filter(blk);
+    if ( ! rebuilt || ! std::ranges::equal(rebuilt->to_data(), filter)) return error::bad_stream;
+    return {};
+}
+
+std::error_code check_input_prefix_filter(domain::chain::block const& blk, byte_span filter) {
+    auto const rebuilt = domain::chain::to_data(domain::chain::build_input_prefix_filter(blk));
+    if ( ! std::ranges::equal(rebuilt, filter)) return error::bad_stream;
+    return {};
+}
 
 std::vector<uint32_t> prefix_inputs(domain::chain::transaction const& tx, uint16_t prefix, uint8_t bits) {
     std::vector<uint32_t> out;
