@@ -412,8 +412,9 @@ if(KTH_WITH_NEUTRINO AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     include/kth/node/detail/compact_filters.hpp)
 endif()
 
-# Wallet support in the node, answered from the node's own chain. An optional
-# feature: built only when asked for (docs/optional-features.md).
+# Wallet support in the node, answered from the node's own chain or from
+# peers. An optional feature: built only when asked for
+# (docs/optional-features.md).
 if(KTH_WITH_WALLET AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
   target_compile_definitions(${PROJECT_NAME} PUBLIC KTH_WITH_WALLET)
   target_sources(${PROJECT_NAME} PRIVATE
@@ -421,6 +422,12 @@ if(KTH_WITH_WALLET AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     src/wallet/chain_source.cpp
     src/wallet/filter_files.cpp
     src/wallet/history.cpp
+    src/wallet/peer_blocks.cpp
+    src/wallet/peer_filters.cpp
+    src/wallet/peer_links.cpp
+    src/wallet/peer_mempool.cpp
+    src/wallet/peer_source.cpp
+    src/wallet/peer_source.hpp
     src/wallet/scan.cpp
     src/wallet/service.cpp
     include/kth/node/wallet/blocks.hpp
@@ -630,6 +637,7 @@ if (ENABLE_TEST AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
       test/wallet_block_checks.cpp
       test/wallet_chain.cpp
       test/wallet_filter_files.cpp
+      test/wallet_peers.cpp
       test/wallet_scan.cpp)
     target_include_directories(kth_node_wallet_test PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test>)
     target_link_libraries(kth_node_wallet_test PUBLIC ${PROJECT_NAME})

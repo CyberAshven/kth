@@ -39,11 +39,15 @@ struct block_chain;
 namespace kth::node::wallet {
 
 // Wallet support in the node: one set of calls for the wallet of the node's
-// own user, answered from the node's own chain (its stored blocks, its chain
-// state and its mempool). Nothing is asked of any peer, no index is built,
-// and nothing kept grows with the chain: the only memory is what the watched
-// targets own and a bounded cache of blocks. Other nodes' wallets are never
-// answered.
+// own user. On a full node it is answered from the node's own chain (its
+// stored blocks, its chain state and its mempool): nothing is asked of any
+// peer, no index is built, and nothing kept grows with the chain, the only
+// memory being what the watched targets own and a bounded cache of blocks.
+// A node that holds only headers answers it from peers: the regular filters
+// (type 0) and, when asked for, the input prefix filters (type 2) are synced
+// over P2P, whole blocks are downloaded where they match, and unconfirmed
+// transactions come from ordinary relay. Nothing sent to a peer names what
+// the wallet watches. Other nodes' wallets are never answered.
 
 /// A transaction of a target's history in the mempool.
 struct unconfirmed_tx {
@@ -157,6 +161,47 @@ struct status {
     std::vector<std::string> refused;
 };
 
+/// How a node without the full chain reaches its peers.
+struct peer_settings {
+    domain::config::network network = domain::config::network::mainnet;
+    /// A folder per network is made in it for the headers and filters.
+    std::filesystem::path directory;
+    /// host:port; a missing port takes the network's default.
+    std::vector<std::string> peers;
+    /// Long-lived connections for headers, filters and relay.
+    size_t service_peers = 2;
+    /// Blocks downloaded at once.
+    size_t parallel_downloads = 4;
+    /// Each block over a connection of its own (on by default: the peers
+    /// that serve headers and filters do not see which blocks follow them).
+    bool isolate_downloads = true;
+    /// Other blocks downloaded with each block a wallet needs: the same ones
+    /// for that block every time, after a restart too (derived from a seed
+    /// kept in the store), so sessions cannot be intersected.
+    size_t decoy_blocks = 3;
+    /// Every block of a scanned range, so which are fetched says nothing.
+    bool download_all_blocks = false;
+    /// Threads that match filters; 0 for one per core.
+    size_t scan_threads = 0;
+    /// Also sync input prefix filters (filter type 2) and check blocks
+    /// against them: an RPA lookup then downloads the blocks they match, each
+    /// with its decoys, where without them it downloads every block of its
+    /// range.
+    bool input_prefix_filters = false;
+    /// The first height whose filters are synced: no wallet watched here
+    /// received anything before it.
+    uint32_t birthday = 0;
+    /// Headers the index holds; 0 for the network's default.
+    size_t header_capacity = 0;
+    std::chrono::seconds request_timeout{60};
+    size_t block_cache_bytes = size_t(64) << 20;
+    size_t mempool_bytes = size_t(256) << 20;
+    /// Every message sent to a peer, appended as "<command> <payload hex>"
+    /// lines, for audits. Empty: none.
+    std::filesystem::path sent_log;
+    std::string user_agent;
+};
+
 /// How a full node answers its wallet from its own chain. A target is read
 /// by parsing the stored blocks from its birthday on.
 struct chain_settings {
@@ -173,6 +218,14 @@ struct KND_API service {
     [[nodiscard]]
     static std::unique_ptr<service> from_chain(blockchain::block_chain& chain, domain::config::network network,
         chain_settings settings = {});
+
+    /// Answers from peers that serve the regular filter. Only scripts are
+    /// watched: the regular filter holds output scripts as they are, so a
+    /// script known by its hash alone or a token category is not_implemented.
+    /// operation_failed without peers; file_system when the folder or a store
+    /// cannot be opened.
+    [[nodiscard]]
+    static std::expected<std::unique_ptr<service>, std::error_code> from_peers(peer_settings settings);
 
     ~service();
     service(service const&) = delete;
@@ -207,7 +260,9 @@ struct KND_API service {
 
     /// A transaction by hash: from the mempool, a watched history, the block
     /// at `height_hint`, or the stored blocks read from the tip down (a fully
-    /// spent transaction included). No index.
+    /// spent transaction included). No index. From peers, the regular filters
+    /// hold no transaction hashes: one in no watched history and with no
+    /// `height_hint` is not_implemented.
     ::asio::awaitable<std::expected<transaction_info, std::error_code>> transaction(hash_digest txid, std::optional<uint32_t> height_hint);
     ::asio::awaitable<std::expected<merkle_proof, std::error_code>> merkle(hash_digest txid, std::optional<uint32_t> height_hint);
     ::asio::awaitable<std::expected<std::pair<domain::chain::transaction, merkle_proof>, std::error_code>> transaction_at(uint32_t height, uint32_t position);
