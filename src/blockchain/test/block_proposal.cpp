@@ -200,10 +200,11 @@ TEST_CASE("a block proposal the node holds is answered from the header index", "
     REQUIRE(fixture.start());
     auto& chain = fixture.chain();
 
-    // The connected tip.
+    // The connected tip. TEST ONLY backport: this base predates k-nuth/kth#1011,
+    // so the genesis block has no body in the block files and no verdict.
     auto const genesis = judge(chain, block::genesis_regtest());
     CHECK(genesis.result == outcome::duplicate);
-    CHECK(genesis.validity == block_validity::valid);
+    CHECK(genesis.validity == block_validity::unknown);
 
     // A header the node holds without its body has no verdict.
     auto const mined = mine_block(genesis_hash(), 1, now() - 60, 0, {}, 0);
