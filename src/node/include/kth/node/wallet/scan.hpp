@@ -18,7 +18,9 @@
 #include <utility>
 #include <vector>
 
+#include <kth/domain/chain/point.hpp>
 #include <kth/infrastructure/math/hash.hpp>
+#include <kth/infrastructure/utility/data.hpp>
 #include <kth/node/define.hpp>
 #include <kth/node/wallet/filter_files.hpp>
 
@@ -28,9 +30,11 @@ namespace kth::node::wallet {
 // pass over each filter, the heights split over threads. Nothing leaves the
 // process: the matches only say which whole blocks to download.
 
-/// A script filter key (script, category or transaction) watched from a height on.
-struct scan_key {
-    hash_digest key;
+/// An item of the regular filter (filter type 0) watched from a height on:
+/// an output script as the output holds it, or an outpoint as the input that
+/// spends it holds it (outpoint_item).
+struct scan_item {
+    data_chunk item;
     uint32_t from;
 };
 
@@ -43,17 +47,23 @@ struct scan_prefix {
 };
 
 /// The heights that match, in increasing order, each with the positions of
-/// the keys or prefixes it matches, in increasing order.
+/// the items or prefixes it matches, in increasing order.
 using scan_hits = std::vector<std::pair<uint32_t, std::vector<size_t>>>;
 
-/// Tests `keys` against the script filters (filter type 1: the entry tree's
-/// root, then the Golomb set) at `locations` of `data`. A filter that does not
-/// parse matches every key, so it can never hide a payment. file_system when
-/// the file cannot be read.
+/// The item of an outpoint in the regular filter: the transaction hash, then
+/// the index in little-endian.
 [[nodiscard]]
 KND_API
-std::expected<scan_hits, std::error_code> scan_script_filters(std::filesystem::path const& data,
-    std::span<filter_location const> locations, std::span<scan_key const> keys, size_t threads);
+data_chunk outpoint_item(domain::chain::point const& outpoint);
+
+/// Tests `items` against the regular filters (filter type 0) at `locations`
+/// of `data`, each with the key of its block. A filter that does not parse
+/// matches every item, so it can never hide a payment or a spend.
+/// file_system when the file cannot be read.
+[[nodiscard]]
+KND_API
+std::expected<scan_hits, std::error_code> scan_regular_filters(std::filesystem::path const& data,
+    std::span<filter_location const> locations, std::span<scan_item const> items, size_t threads);
 
 /// Tests `prefixes` against the input prefix filters (filter type 2) at
 /// `locations` of `data`. A filter that does not parse matches every prefix.
@@ -62,12 +72,12 @@ KND_API
 std::expected<scan_hits, std::error_code> scan_input_prefix_filters(std::filesystem::path const& data,
     std::span<filter_location const> locations, std::span<scan_prefix const> prefixes, size_t threads);
 
-/// The keys of `keys` a script filter holds, by position; all of them when
-/// the filter does not parse.
+/// The items of `items` the regular filter of `block` holds, by position;
+/// all of them when the filter does not parse.
 [[nodiscard]]
 KND_API
-std::vector<size_t> match_script_filter(hash_digest const& block, byte_span filter,
-    std::span<hash_digest const> keys);
+std::vector<size_t> match_regular_filter(hash_digest const& block, byte_span filter,
+    std::span<byte_span const> items);
 
 } // namespace kth::node::wallet
 

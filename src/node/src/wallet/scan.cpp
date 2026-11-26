@@ -15,6 +15,7 @@
 #include <kth/domain/chain/golomb_match.hpp>
 #include <kth/domain/chain/input_prefix_filter.hpp>
 #include <kth/infrastructure/error.hpp>
+#include <kth/infrastructure/utility/byte_writer.hpp>
 
 namespace kth::node::wallet {
 
@@ -102,29 +103,32 @@ std::expected<scan_hits, std::error_code> scan(std::filesystem::path const& data
 
 } // namespace
 
-std::vector<size_t> match_script_filter(hash_digest const& block, byte_span filter,
-        std::span<hash_digest const> keys) {
-    std::vector<size_t> all(keys.size());
-    std::iota(all.begin(), all.end(), size_t{0});
-    // The served bytes are the entry tree's root, then the set.
-    if (filter.size() <= hash_size) return all;
-    std::vector<byte_span> items(keys.begin(), keys.end());
-    auto const found = domain::chain::golomb_match_each(domain::chain::compact_filter_key(block),
-        filter.subspan(hash_size), items);
-    if ( ! found) return all;
-    return *found;
+data_chunk outpoint_item(domain::chain::point const& outpoint) {
+    data_chunk item(outpoint.serialized_size(true));
+    byte_writer writer(item);
+    (void)outpoint.to_data(writer, true);
+    return item;
 }
 
-std::expected<scan_hits, std::error_code> scan_script_filters(std::filesystem::path const& data,
-        std::span<filter_location const> locations, std::span<scan_key const> keys, size_t threads) {
+std::vector<size_t> match_regular_filter(hash_digest const& block, byte_span filter,
+        std::span<byte_span const> items) {
+    auto const found = domain::chain::golomb_match_each(domain::chain::compact_filter_key(block), filter, items);
+    if (found) return *found;
+    std::vector<size_t> all(items.size());
+    std::iota(all.begin(), all.end(), size_t{0});
+    return all;
+}
+
+std::expected<scan_hits, std::error_code> scan_regular_filters(std::filesystem::path const& data,
+        std::span<filter_location const> locations, std::span<scan_item const> items, size_t threads) {
     std::vector<uint32_t> from;
-    for (auto const& key : keys) from.push_back(key.from);
-    auto const test = [keys](filter_location const& at, byte_span filter, std::span<size_t const> active) {
-        std::vector<hash_digest> asked;
+    for (auto const& item : items) from.push_back(item.from);
+    auto const test = [items](filter_location const& at, byte_span filter, std::span<size_t const> active) {
+        std::vector<byte_span> asked;
         asked.reserve(active.size());
-        for (auto const k : active) asked.push_back(keys[k].key);
+        for (auto const k : active) asked.emplace_back(items[k].item);
         std::vector<size_t> matched;
-        for (auto const position : match_script_filter(at.block, filter, asked)) {
+        for (auto const position : match_regular_filter(at.block, filter, asked)) {
             matched.push_back(active[position]);
         }
         return matched;
