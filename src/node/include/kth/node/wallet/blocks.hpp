@@ -32,21 +32,13 @@ namespace kth::node::wallet {
 KND_API
 std::error_code check_block(domain::chain::block const& blk, hash_digest const& expected);
 
-/// What checking a block against its script filter found.
-struct script_filter_check {
-    /// The filter holds the transaction key of every transaction: peers'
-    /// filters carry kind 4 leaves, so a transaction is found by txid alone.
-    bool transaction_keys;
-};
-
-/// The key of every output the block creates (its script, its token
-/// category) must be in its script filter: a filter that leaves one out was
-/// not built from this block. Spent outputs' scripts sit in older blocks and
-/// are not checked here. bad_stream when the filter does not fit the block.
+/// The regular filter (filter type 0) rebuilt from the block must equal the
+/// one served: it holds the output scripts and the outpoints the block spends,
+/// all read from the block alone, so any difference proves the serving peer
+/// sent a filter that was not built from this block. bad_stream otherwise.
 [[nodiscard]]
 KND_API
-std::expected<script_filter_check, std::error_code>
-check_script_filter(domain::chain::block const& blk, byte_span filter);
+std::error_code check_regular_filter(domain::chain::block const& blk, byte_span filter);
 
 /// The input prefix filter rebuilt from the block must equal the one served:
 /// it is built from the block alone, so any difference proves the serving

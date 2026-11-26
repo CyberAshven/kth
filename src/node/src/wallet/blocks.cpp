@@ -7,22 +7,10 @@
 #include <algorithm>
 
 #include <kth/domain/chain/compact_filter.hpp>
-#include <kth/domain/chain/golomb_match.hpp>
 #include <kth/domain/chain/input_prefix_filter.hpp>
-#include <kth/domain/chain/script_filter_builder.hpp>
-#include <kth/domain/machine/opcode.hpp>
 #include <kth/infrastructure/error.hpp>
 
 namespace kth::node::wallet {
-
-namespace {
-
-// Empty scripts and those that start with OP_RETURN have no key.
-bool keyed_script(data_chunk const& script) {
-    return ! script.empty() && script.front() != static_cast<uint8_t>(domain::machine::opcode::return_);
-}
-
-} // namespace
 
 std::error_code check_block(domain::chain::block const& blk, hash_digest const& expected) {
     if (blk.transactions().empty()) return error::empty_block;
@@ -32,30 +20,10 @@ std::error_code check_block(domain::chain::block const& blk, hash_digest const& 
     return {};
 }
 
-std::expected<script_filter_check, std::error_code>
-check_script_filter(domain::chain::block const& blk, byte_span filter) {
-    if (filter.size() <= hash_size) return std::unexpected(error::bad_stream);
-    std::vector<hash_digest> created;
-    for (auto const& tx : blk.transactions()) {
-        for (auto const& out : tx.outputs()) {
-            if (keyed_script(out.script().bytes())) created.push_back(domain::chain::script_key(out.script().bytes()));
-            if (out.token_data()) created.push_back(domain::chain::category_key(out.token_data()->id));
-        }
-    }
-    std::ranges::sort(created);
-    created.erase(std::unique(created.begin(), created.end()), created.end());
-    auto const created_count = created.size();
-    for (auto const& tx : blk.transactions()) {
-        created.push_back(domain::chain::transaction_key(tx.hash()));
-    }
-    std::vector<byte_span> items(created.begin(), created.end());
-    auto const found = domain::chain::golomb_match_each(domain::chain::compact_filter_key(blk.hash()),
-        filter.subspan(hash_size), items);
-    if ( ! found) return std::unexpected(error::bad_stream);
-    auto const outputs = size_t(std::ranges::count_if(*found, [&](size_t at) { return at < created_count; }));
-    if (outputs != created_count) return std::unexpected(error::bad_stream);
-    auto const transactions = found->size() - outputs;
-    return script_filter_check{transactions == blk.transactions().size()};
+std::error_code check_regular_filter(domain::chain::block const& blk, byte_span filter) {
+    auto const rebuilt = domain::chain::build_regular_filter(blk);
+    if ( ! rebuilt || ! std::ranges::equal(rebuilt->to_data(), filter)) return error::bad_stream;
+    return {};
 }
 
 std::error_code check_input_prefix_filter(domain::chain::block const& blk, byte_span filter) {

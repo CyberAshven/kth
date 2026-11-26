@@ -15,7 +15,7 @@
 #include <kth/domain/chain/compact_filter.hpp>
 #include <kth/domain/chain/golomb_set.hpp>
 #include <kth/domain/chain/input_prefix_filter.hpp>
-#include <kth/domain/chain/script_filter_builder.hpp>
+#include <kth/infrastructure/utility/byte_writer.hpp>
 #include <kth/node/wallet/blocks.hpp>
 
 using namespace kth;
@@ -80,18 +80,6 @@ chain::block block_with(hash_digest const& previous, chain::transaction::list tx
     return chain::block(chain::header{0x20000000, previous, root, 1700000000, 0x207fffff, 0}, std::move(txs));
 }
 
-// A served script filter (root, then the set) holding `keys`, for `block`.
-data_chunk script_filter_of(hash_digest const& block, std::vector<hash_digest> const& keys) {
-    std::vector<data_chunk> items;
-    for (auto const& key : keys) items.push_back(to_chunk(key));
-    auto const set = chain::golomb_set::build(chain::compact_filter_key(block), items);
-    REQUIRE(set);
-    data_chunk served(hash_size, 0x42);
-    auto const bytes = set->to_data();
-    served.insert(served.end(), bytes.begin(), bytes.end());
-    return served;
-}
-
 // Static data: decoded without assertions, which belong to test cases.
 data_chunk decoded(std::string_view hex) {
     auto bytes = decode_base16(hex);
@@ -128,27 +116,59 @@ TEST_CASE("wallet block check needs the requested hash, the Merkle root and dist
     REQUIRE(wallet::check_block(empty, empty.hash()) == error::empty_block);
 }
 
-TEST_CASE("wallet block check against its script filter, with and without transaction keys", "[wallet]") {
-    // bchd simnet block 127 (txid-vectors.md), its filter with transaction
-    // keys, its filter from before them, and the filter of another block.
+TEST_CASE("wallet block check against its regular filter, rebuilt from the block", "[wallet]") {
+    // bchd simnet block 127 and the regular filter bchd serves for it (the
+    // vectors of test/chain/compact_filter.cpp of the domain).
     auto const block = block_of_hex("01000030faec54d16b2a5bdbc3371f5e1593a8166e95a55d0df4f8ee33b6d8281bee6d79816c95ada87beb3bac7be56331697aa815d04915e94c1d6570812f083e9669f791b0f66affff7f20000000000301000000010000000000000000000000000000000000000000000000000000000000000000ffffffff12017f086f88e3cf77f9ac8d062f626368642fffffffff01c621062a010000001976a914b2275cc60091cdde77bddb8c132f60494cb2ea6b88ac00000000010000000178618fd7cc15e6088f2b77cc5ac25dd92ad86619bbe91d693427a9cd965e8708000000006441dfea2c0f1c08e147bdf45182ca31e99745704f5caa7f348d3b9e55ff01a594141bf235e38ad141d4389033312c576917f0652c754bb452127a069a3dfab511d9412102be31cab636041636a1846f4358a241f608ca9d9f29177585280590f9d97e033fffffffff0300a3e1110000000017a91469d7ef8f42a25e8791bb37d5fb48456f102a3cb9870000000000000000176a157363726970742066696c74657220766563746f72734a462418010000001976a91438b726cdbeb1d7f311544519c3412a4ad67c26fb88ac0000000002000000013a90cdbcad008793ceca6cc7d7dd73c22e1d85dd0858760234cae2c1c79fdf2100000000020152ffffffff02f07be111000000001976a914040404040404040404040404040404040404040488ac0000000000000000176a157363726970742066696c74657220766563746f727300000000");
     REQUIRE(encode_hash(block.hash()) == "0f5f466912edf56885b527866f8a3f12d8d620edef5ff3ebdf43ec00ab556868");
     REQUIRE( ! wallet::check_block(block, block.hash()));
+    auto const served = chunk_of("07415a006e6bee1f3520c934743abce01b7f8480");
+    REQUIRE( ! wallet::check_regular_filter(block, served));
 
-    auto const with_keys = wallet::check_script_filter(block, chunk_of("0203471b91863237e77edce7baf8aece3399215b146501a2d5da70a0cc33819107e621fae1832906b2f0e54a00d93660c5896e"));
-    REQUIRE(with_keys);
-    REQUIRE(with_keys->transaction_keys);
-
-    auto const without = wallet::check_script_filter(block, chunk_of("96abbd5fe8f576296a2f50b3ebe8f03d61e2dba7968309a18d6ceab2be7861db04bbbb62037514a1956b1740"));
+    // A filter that leaves out one item of the block, keeps the same count
+    // with other bytes, holds one item more, or is another block's: each is
+    // refused.
+    std::vector<data_chunk> items;
+    auto const& txs = block.transactions();
+    auto const add_scripts = [&items](chain::transaction const& tx) {
+        for (auto const& out : tx.outputs()) {
+            if ( ! out.script().bytes().empty()) items.push_back(out.script().bytes());
+        }
+    };
+    add_scripts(txs[0]);
+    for (size_t at = 1; at < txs.size(); ++at) {
+        for (auto const& in : txs[at].inputs()) {
+            data_chunk item(in.previous_output().serialized_size(true));
+            byte_writer writer(item);
+            REQUIRE(in.previous_output().to_data(writer, true));
+            items.push_back(std::move(item));
+        }
+        add_scripts(txs[at]);
+    }
+    auto const key = chain::compact_filter_key(block.hash());
+    auto const rebuilt = chain::golomb_set::build(key, items);
+    REQUIRE(rebuilt);
+    REQUIRE(rebuilt->to_data() == served);
+    auto missing = items;
+    missing.erase(missing.begin() + 1);
+    auto const without = chain::golomb_set::build(key, missing);
     REQUIRE(without);
-    REQUIRE( ! without->transaction_keys);
-
-    // A filter that leaves out the block's outputs, and one too short to hold a set.
-    auto const foreign = wallet::check_script_filter(block, script_filter_of(block.hash(), {digest_of(1)}));
-    REQUIRE( ! foreign);
-    REQUIRE(foreign.error() == error::bad_stream);
-    REQUIRE(wallet::check_script_filter(block, data_chunk(32, 0)).error() == error::bad_stream);
-    REQUIRE(wallet::check_script_filter(block, chunk_of("0203471b91863237e77edce7baf8aece3399215b146501a2d5da70a0cc33819107")).error() == error::bad_stream);
+    REQUIRE(wallet::check_regular_filter(block, without->to_data()) == error::bad_stream);
+    auto extra = items;
+    extra.push_back(to_chunk(digest_of(1)));
+    auto const with = chain::golomb_set::build(key, extra);
+    REQUIRE(with);
+    REQUIRE(wallet::check_regular_filter(block, with->to_data()) == error::bad_stream);
+    auto flipped = served;
+    flipped.back() ^= 0x01;
+    REQUIRE(wallet::check_regular_filter(block, flipped) == error::bad_stream);
+    auto const foreign = chain::golomb_set::build(chain::compact_filter_key(digest_of(2)), items);
+    REQUIRE(foreign);
+    REQUIRE(wallet::check_regular_filter(block, foreign->to_data()) == error::bad_stream);
+    REQUIRE(wallet::check_regular_filter(block, data_chunk{}) == error::bad_stream);
+    auto longer = served;
+    longer.push_back(0x00);
+    REQUIRE(wallet::check_regular_filter(block, longer) == error::bad_stream);
 }
 
 TEST_CASE("wallet block check against its input prefix filter, and the inputs of a prefix", "[wallet]") {
