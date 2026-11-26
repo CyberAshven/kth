@@ -13,6 +13,12 @@
 #include <string_view>
 #include <vector>
 
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <kth/node/detail/compact_filter_store.hpp>
 #include <kth/node/wallet/filter_files.hpp>
 
@@ -22,10 +28,20 @@ namespace wallet = kth::node::wallet;
 
 namespace {
 
+int process_id() {
+#if defined(_WIN32)
+    return ::_getpid();
+#else
+    return ::getpid();
+#endif
+}
+
+// A folder of its own for each test and process.
 struct temporary_directory {
     std::filesystem::path path;
     explicit temporary_directory(std::string_view tag)
-        : path(std::filesystem::temp_directory_path() / (std::string("kth_wallet_files_") + std::string(tag))) {
+        : path(std::filesystem::temp_directory_path()
+            / (std::string("kth_wallet_files_") + std::string(tag) + "_" + std::to_string(process_id()))) {
         std::error_code ignored;
         std::filesystem::remove_all(path, ignored);
         std::filesystem::create_directories(path);
@@ -76,7 +92,7 @@ TEST_CASE("wallet filter files appends, reopens, and keeps only the header chain
         return std::nullopt;
     };
     {
-        auto store = wallet::filter_files::open(dir.path, 1, lookup);
+        auto store = wallet::filter_files::open(dir.path, 0, lookup);
         REQUIRE(store);
         REQUIRE(store->empty());
         REQUIRE( ! store->tip());
@@ -97,7 +113,7 @@ TEST_CASE("wallet filter files appends, reopens, and keeps only the header chain
         REQUIRE(where[1].length == 42u);
     }
     {
-        auto const store = wallet::filter_files::open(dir.path, 1, lookup);
+        auto const store = wallet::filter_files::open(dir.path, 0, lookup);
         REQUIRE(store);
         REQUIRE(store->tip() == 4u);
         REQUIRE(*store->read(0) == filters[0]);
@@ -109,7 +125,7 @@ TEST_CASE("wallet filter files appends, reopens, and keeps only the header chain
         if (height < changed.size()) return changed[height];
         return std::nullopt;
     };
-    auto store = wallet::filter_files::open(dir.path, 1, other);
+    auto store = wallet::filter_files::open(dir.path, 0, other);
     REQUIRE(store);
     REQUIRE(store->tip() == 2u);
     REQUIRE(*store->read(2) == filters[2]);
@@ -136,7 +152,7 @@ TEST_CASE("wallet filter files drops a torn write and refuses a damaged filter",
     };
     std::filesystem::path data;
     {
-        auto store = wallet::filter_files::open(dir.path, 1, lookup);
+        auto store = wallet::filter_files::open(dir.path, 0, lookup);
         REQUIRE(store);
         REQUIRE( ! store->append(entries));
         data = store->data_path();
@@ -144,7 +160,7 @@ TEST_CASE("wallet filter files drops a torn write and refuses a damaged filter",
     // The last filter loses its last byte, as a write cut short would leave it.
     std::filesystem::resize_file(data, std::filesystem::file_size(data) - 1);
     {
-        auto const store = wallet::filter_files::open(dir.path, 1, lookup);
+        auto const store = wallet::filter_files::open(dir.path, 0, lookup);
         REQUIRE(store);
         REQUIRE(store->tip() == 18u);
     }
@@ -155,7 +171,7 @@ TEST_CASE("wallet filter files drops a torn write and refuses a damaged filter",
         file.seekp(5);
         file.put(char(0x7f));
     }
-    auto store = wallet::filter_files::open(dir.path, 1, lookup);
+    auto store = wallet::filter_files::open(dir.path, 0, lookup);
     REQUIRE(store);
     REQUIRE(store->tip() == 18u);
     REQUIRE(store->read(0).error() == error::bad_stream);
@@ -167,7 +183,7 @@ TEST_CASE("wallet filter files drops a torn write and refuses a damaged filter",
         file.seekp(30 * 10 + 3);
         file.put(char(0x7f));
     }
-    auto const cut = wallet::filter_files::open(dir.path, 1, lookup);
+    auto const cut = wallet::filter_files::open(dir.path, 0, lookup);
     REQUIRE(cut);
     REQUIRE(cut->tip() == 9u);
 }
@@ -214,24 +230,28 @@ TEST_CASE("wallet filter files refuses a folder it cannot create", "[wallet]") {
     temporary_directory dir("store_refused");
     auto const blocker = dir.path / "file";
     std::ofstream(blocker) << "not a folder";
-    auto const store = wallet::filter_files::open(blocker / "inside", 1,
+    auto const store = wallet::filter_files::open(blocker / "inside", 0,
         [](uint32_t) -> std::optional<hash_digest> { return std::nullopt; });
     REQUIRE( ! store);
     REQUIRE(store.error() == error::file_system);
 }
 
 TEST_CASE("wallet filter header chains a filter hash to the previous header", "[wallet]") {
-    // Block 127 of the bchd simnet vectors (txid-vectors.md): its served
-    // filter and the header it chains to.
-    auto const served = chunk_of("0203471b91863237e77edce7baf8aece3399215b146501a2d5da70a0cc33819107e621fae1832906b2f0e54a00d93660c5896e");
-    auto const parent = chunk_of("3362679fcffacc8c327f41e9e79b3818bcca4f2359438ca3270350ea39b64ad1");
-    hash_digest previous{};
-    std::copy(parent.begin(), parent.end(), previous.begin());
-    REQUIRE(encode_base16(wallet::next_filter_header(served, previous)) ==
-        "e5058dd1d7d008d1391eec4ec1abc95748c837760f02c0157b4b6357d925839b");
-    REQUIRE(wallet::next_filter_header_from_hash(bitcoin_hash(served), previous) ==
-        wallet::next_filter_header(served, previous));
-    // The node's own index chains its filter headers the same way.
-    REQUIRE(node::detail::chain_filter_header(bitcoin_hash(served), previous) ==
-        wallet::next_filter_header(served, previous));
+    // Blocks 127 and 128 of the bchd simnet vectors of the regular filter
+    // (test/chain/compact_filter.cpp of the domain): their served filters,
+    // and the filter hash and filter header of block 127 over the all-zero
+    // header before the first block.
+    auto const served = chunk_of("07415a006e6bee1f3520c934743abce01b7f8480");
+    REQUIRE(encode_base16(bitcoin_hash(served)) ==
+        "37b0cc8ff7d3e4792b667fa3a2317ee2de7e5d38091a2bcf67d4774b6450899f");
+    auto const first = wallet::next_filter_header(served, null_hash);
+    REQUIRE(encode_base16(first) == "325016e7cd3cdc4564feff6f4d36ed13d65b5e4167c40491b47acc4904c7da12");
+    REQUIRE(wallet::next_filter_header_from_hash(bitcoin_hash(served), null_hash) == first);
+    // The next filter chained to it: the node's own index chains its filter
+    // headers the same way.
+    auto const next = chunk_of("0552f855452bf8cf29860982f7f200");
+    auto const second = wallet::next_filter_header(next, first);
+    REQUIRE(second != wallet::next_filter_header(next, null_hash));
+    REQUIRE(wallet::next_filter_header_from_hash(bitcoin_hash(next), first) == second);
+    REQUIRE(node::detail::chain_filter_header(bitcoin_hash(next), first) == second);
 }
