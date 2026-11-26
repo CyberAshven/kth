@@ -468,6 +468,7 @@ if (KTH_WITH_NEUTRINO)
         src/chain/compact_filter.cpp
         src/chain/golomb_set.cpp
         include/kth/domain/chain/compact_filter.hpp
+        include/kth/domain/chain/golomb_match.hpp
         include/kth/domain/chain/golomb_set.hpp
         src/chain/script_filter.cpp
         src/chain/script_filter_builder.cpp
