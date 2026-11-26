@@ -469,6 +469,7 @@ if (KTH_WITH_NEUTRINO)
         src/chain/golomb_set.cpp
         src/chain/input_prefix_filter.cpp
         include/kth/domain/chain/compact_filter.hpp
+        include/kth/domain/chain/golomb_match.hpp
         include/kth/domain/chain/golomb_set.hpp
         include/kth/domain/chain/input_prefix_filter.hpp
         src/chain/script_filter.cpp

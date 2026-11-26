@@ -23,6 +23,7 @@ on:
       - src/domain/CMakeLists.txt
       - src/domain/include/kth/domain/chain/compact_filter.hpp
       - src/domain/include/kth/domain/chain/golomb_set.hpp
+      - src/domain/include/kth/domain/chain/golomb_match.hpp
       - src/domain/src/chain/compact_filter.cpp
       - src/domain/src/chain/golomb_set.cpp
       - src/domain/test/chain/compact_filter.cpp
