@@ -5,6 +5,7 @@
 #include <kth/blockchain/validate/batch_validate.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <limits>
@@ -23,7 +24,6 @@
 #include <kth/blockchain/validate/validate_input.hpp>
 #include <kth/domain/constants.hpp>
 #include <kth/domain/chain/faster_blocks.hpp>
-#include <kth/domain/chain/merkle.hpp>
 #include <kth/infrastructure/utility/assert.hpp>
 
 #if defined(KTH_SIGVERIFY_TURBO_BATCH)
@@ -164,6 +164,36 @@ code validate_block_batch(
 }
 
 namespace {
+
+// TEST ONLY backport: this base has no kth/domain/chain/merkle.hpp. The root of
+// `hashes` and whether two equal hashes were paired as siblings at any level,
+// the last hash of an odd level paired with itself not counting.
+hash_digest merkle_root(hash_list hashes, bool& mutated) {
+    mutated = false;
+    if (hashes.empty()) {
+        return null_hash;
+    }
+    while (hashes.size() > 1) {
+        for (size_t i = 0; i + 1 < hashes.size(); i += 2) {
+            if (hashes[i] == hashes[i + 1]) {
+                mutated = true;
+            }
+        }
+        if (hashes.size() % 2 != 0) {
+            hashes.push_back(hashes.back());
+        }
+        hash_list next;
+        next.reserve(hashes.size() / 2);
+        for (size_t i = 0; i < hashes.size(); i += 2) {
+            std::array<uint8_t, 2 * hash_size> pair;
+            std::copy(hashes[i].begin(), hashes[i].end(), pair.begin());
+            std::copy(hashes[i + 1].begin(), hashes[i + 1].end(), pair.begin() + hash_size);
+            next.push_back(bitcoin_hash(pair));
+        }
+        hashes = std::move(next);
+    }
+    return hashes.front();
+}
 
 // validate_block_batch, on the branch `branch` names when it is given: the
 // index entry that stands in for the last block's own, for a block the index
