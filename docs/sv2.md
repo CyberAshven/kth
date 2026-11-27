@@ -2,12 +2,22 @@
 
 Knuth can serve block templates to Stratum V2 clients (a Job Declarator or a
 pool) over the Template Distribution Protocol. It can also serve solo miners
-over the Mining Protocol on the same listener. Both are part of node core and
-do not need a build with JSON-RPC.
+over the Mining Protocol on the same listener. Neither needs a build with
+JSON-RPC.
+
+Stratum V2 is an [optional feature](optional-features.md): it needs a build
+with the Conan option `sv2`, off by default.
+
+```
+conan install . -o sv2=True ...
+```
+
+A build without it refuses to start with `sv2.enabled = true`.
 
 ## Running
 
-It is off by default. Enable it in the config file:
+In a build with the option it is still off by default. Enable it in the config
+file:
 
 ```ini
 sv2.enabled = true

@@ -167,30 +167,13 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     src/sync/orchestrator.cpp
     src/sync/reorg.cpp
     src/sync/tip_announcement.cpp
+    src/sync/compact_blocks.cpp
 
     # Mining helpers shared by the JSON-RPC server and other template consumers.
     src/mining/job_store.cpp
     src/mining/block_submit.cpp
     src/mining/work.cpp
-
-    # Stratum V2 Template Distribution and Mining Protocol server.
-    src/sv2/framing.cpp
-    src/sv2/primitives.cpp
-    src/sv2/messages.cpp
-    src/sv2/connection.cpp
-    src/sv2/extensions.cpp
-    src/sv2/noise.cpp
-    src/sv2/noise_credentials.cpp
-    src/sv2/template_provider.cpp
-    src/sv2/mining_messages.cpp
-    src/sv2/mining_session.cpp
-    src/sv2/jd_settings.cpp
-    src/sv2/jd_failover.cpp
-    src/sv2/jd_connection.cpp
-    src/sv2/jd_session.cpp
-    src/sv2/jd_messages.cpp
-    src/sv2/jd_declaration.cpp
-    src/sv2/jd_client.cpp
+    src/mining/work_changes.cpp
   )
 endif()
 
@@ -323,25 +306,7 @@ set(kth_headers
   include/kth/node/mining/job_store.hpp
   include/kth/node/mining/block_submit.hpp
   include/kth/node/mining/work.hpp
-
-  # Stratum V2 template provider.
-  include/kth/node/sv2/framing.hpp
-  include/kth/node/sv2/primitives.hpp
-  include/kth/node/sv2/messages.hpp
-  include/kth/node/sv2/connection.hpp
-  include/kth/node/sv2/extensions.hpp
-  include/kth/node/sv2/noise.hpp
-  include/kth/node/sv2/noise_credentials.hpp
-  include/kth/node/sv2/template_provider.hpp
-  include/kth/node/sv2/mining_messages.hpp
-  include/kth/node/sv2/mining_session.hpp
-  include/kth/node/sv2/jd_settings.hpp
-  include/kth/node/sv2/jd_failover.hpp
-  include/kth/node/sv2/jd_connection.hpp
-  include/kth/node/sv2/jd_session.hpp
-  include/kth/node/sv2/jd_messages.hpp
-  include/kth/node/sv2/jd_declaration.hpp
-  include/kth/node/sv2/jd_client.hpp
+  include/kth/node/mining/work_changes.hpp
 
   # Optional JSON-RPC server (compiled only when KTH_WITH_RPC is set).
   include/kth/node/rpc/error.hpp
@@ -369,6 +334,7 @@ set(kth_headers
   include/kth/node/sync/block_tasks.hpp
   include/kth/node/sync/orchestrator.hpp
   include/kth/node/sync/tip_announcement.hpp
+  include/kth/node/sync/compact_blocks.hpp
 )
 
 if(KTH_BROWSER_NODE)
@@ -409,6 +375,75 @@ endif()
 
 if (MINGW)
   target_link_libraries(${PROJECT_NAME} PUBLIC ws2_32 wsock32)
+endif()
+
+# Serving wallets that load a bloom filter (BIP37). An optional feature: built
+# only when asked for (docs/optional-features.md).
+if(KTH_WITH_BLOOM_FILTERS AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+  target_compile_definitions(${PROJECT_NAME} PUBLIC KTH_WITH_BLOOM_FILTERS)
+  target_sources(${PROJECT_NAME} PRIVATE
+    src/detail/bloom_filters.cpp
+    include/kth/node/detail/bloom_filters.hpp)
+endif()
+
+# Stratum V2 for pools and miners. An optional feature: built only when asked
+# for (docs/optional-features.md).
+if(KTH_WITH_SV2 AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+  # TEST ONLY (test/kth-chipnet-backend): the Mining Protocol server and the
+  # Job Declaration client of this build open their upstreams through net.proxy
+  # and I2P, so Stratum V2 here needs the socks5 and i2p options too.
+  if(NOT KTH_WITH_SOCKS5 OR NOT KTH_WITH_I2P)
+    message(FATAL_ERROR "This build's Stratum V2 needs the Conan options socks5=True and i2p=True as well as sv2=True.")
+  endif()
+  target_compile_definitions(${PROJECT_NAME} PUBLIC KTH_WITH_SV2)
+  target_sources(${PROJECT_NAME} PRIVATE
+    # Stratum V2 Template Distribution and Mining Protocol server, and the
+    # Job Declaration client.
+    src/sv2/framing.cpp
+    src/sv2/primitives.cpp
+    src/sv2/messages.cpp
+    src/sv2/connection.cpp
+    src/sv2/extensions.cpp
+    src/sv2/noise.cpp
+    src/sv2/noise_credentials.cpp
+    src/sv2/template_provider.cpp
+    src/sv2/mining_messages.cpp
+    src/sv2/mining_session.cpp
+    src/sv2/jd_settings.cpp
+    src/sv2/jd_failover.cpp
+    src/sv2/jd_connection.cpp
+    src/sv2/jd_session.cpp
+    src/sv2/jd_messages.cpp
+    src/sv2/jd_declaration.cpp
+    src/sv2/jd_client.cpp
+    include/kth/node/sv2/feature.hpp
+    include/kth/node/sv2/framing.hpp
+    include/kth/node/sv2/primitives.hpp
+    include/kth/node/sv2/messages.hpp
+    include/kth/node/sv2/connection.hpp
+    include/kth/node/sv2/extensions.hpp
+    include/kth/node/sv2/noise.hpp
+    include/kth/node/sv2/noise_credentials.hpp
+    include/kth/node/sv2/template_provider.hpp
+    include/kth/node/sv2/mining_messages.hpp
+    include/kth/node/sv2/mining_session.hpp
+    include/kth/node/sv2/jd_settings.hpp
+    include/kth/node/sv2/jd_failover.hpp
+    include/kth/node/sv2/jd_connection.hpp
+    include/kth/node/sv2/jd_session.hpp
+    include/kth/node/sv2/jd_messages.hpp
+    include/kth/node/sv2/jd_declaration.hpp
+    include/kth/node/sv2/jd_client.hpp)
+endif()
+
+# Serving compact block filters to light wallets (Neutrino, BIP157/158). An
+# optional feature: built only when asked for (docs/optional-features.md).
+if(KTH_WITH_NEUTRINO AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+  target_sources(${PROJECT_NAME} PRIVATE
+    src/detail/compact_filter_store.cpp
+    src/detail/compact_filters.cpp
+    include/kth/node/detail/compact_filter_store.hpp
+    include/kth/node/detail/compact_filters.hpp)
 endif()
 
 # JSON-RPC server: link the llhttp HTTP parser and enable the feature macro.
@@ -475,6 +510,7 @@ if (ENABLE_TEST AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
           test/body_range_reopen.cpp
           test/body_range_genesis_checkpoint.cpp
           test/connected_tip_remainder.cpp
+          test/utxo_build_remainder.cpp
           test/resume_stored_bodies.cpp
           test/resume_stored_bodies_decision.cpp
           test/directory_probe.cpp
@@ -484,6 +520,7 @@ if (ENABLE_TEST AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
           test/bip30_integration.cpp
           test/header_durability.cpp
           test/utxo_batch_atomicity.cpp
+          test/utxo_build_wake.cpp
           test/validated_finality.cpp
           test/fatal_outside_window.cpp
           test/slow_sync_ordering.cpp
@@ -491,6 +528,7 @@ if (ENABLE_TEST AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
           test/block_reads.cpp
           test/chain_data.cpp
           test/tip_announcement.cpp
+          test/compact_blocks.cpp
           test/reorg_deferred_sweep.cpp
           test/reorg_stale_chunk_drop.cpp
           test/reorg_storage_wakeup.cpp
@@ -516,31 +554,13 @@ if (ENABLE_TEST AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
           test/node.cpp
           test/configured_peers.cpp
           test/p2p_node.cpp
-          test/i2p.cpp
           test/p2p_connection_close.cpp
+          test/outbound_retry.cpp
           test/p2p_status_timer.cpp
           test/sync_decisions.cpp
           test/mining_job_store.cpp
           test/mining_block_submit.cpp
-          test/sv2_framing.cpp
-          test/sv2_primitives.cpp
-          test/sv2_messages.cpp
-          test/sv2_connection.cpp
-          test/sv2_extensions.cpp
-          test/sv2_noise.cpp
-          test/sv2_noise_credentials.cpp
-          test/sv2_template_provider.cpp
-          test/sv2_mining.cpp
-          test/sv2_mining_session.cpp
-          test/sv2_mining_work.cpp
-          test/sv2_jd_settings.cpp
-          test/sv2_jd_failover.cpp
-          test/sv2_jd_connection.cpp
-          test/sv2_jd_session.cpp
-          test/sv2_jd_messages.cpp
-          test/sv2_jd_work.cpp
-          test/sv2_jd_declaration.cpp
-          test/sv2_jd_client.cpp
+          test/mining_work_changes.cpp
           test/settings.cpp)
 
   # JSON-RPC unit tests build only when the server is compiled in.
@@ -607,8 +627,85 @@ if (ENABLE_TEST AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
 
   _group_sources(kth_node_test "${CMAKE_CURRENT_LIST_DIR}/test")
 
+  # The tests of an optional feature are an executable of their own, so that
+  # its workflow builds and runs them and nothing else.
+  if(KTH_WITH_NEUTRINO AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    add_executable(kth_node_neutrino_test
+      test/compact_filter_store.cpp
+      test/compact_filters.cpp)
+    target_include_directories(kth_node_neutrino_test PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test>)
+    target_link_libraries(kth_node_neutrino_test PUBLIC ${PROJECT_NAME})
+    target_link_libraries(kth_node_neutrino_test PRIVATE Catch2::Catch2WithMain)
+  endif()
+  if(KTH_WITH_SOCKS5 AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    add_executable(kth_node_socks5_test
+      test/socks5.cpp)
+    target_include_directories(kth_node_socks5_test PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test>)
+    target_link_libraries(kth_node_socks5_test PUBLIC ${PROJECT_NAME})
+    target_link_libraries(kth_node_socks5_test PRIVATE Catch2::Catch2WithMain)
+  endif()
+  if(KTH_WITH_I2P AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    add_executable(kth_node_i2p_test
+      test/i2p.cpp)
+    target_include_directories(kth_node_i2p_test PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test>)
+    target_link_libraries(kth_node_i2p_test PUBLIC ${PROJECT_NAME})
+    target_link_libraries(kth_node_i2p_test PRIVATE Catch2::Catch2WithMain)
+    # Some cases run as subprocesses of this executable (child_process_harness.hpp).
+    target_compile_definitions(kth_node_i2p_test PRIVATE
+      KTH_NODE_TEST_BINARY="$<TARGET_FILE:kth_node_i2p_test>")
+  endif()
+  if(KTH_WITH_BLOOM_FILTERS AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    add_executable(kth_node_bloom_filters_test
+      test/bloom_filters.cpp)
+    target_include_directories(kth_node_bloom_filters_test PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test>)
+    target_link_libraries(kth_node_bloom_filters_test PUBLIC ${PROJECT_NAME})
+    target_link_libraries(kth_node_bloom_filters_test PRIVATE Catch2::Catch2WithMain)
+  endif()
+
+  if(KTH_WITH_SV2 AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    add_executable(kth_node_sv2_test
+      test/sv2_framing.cpp
+      test/sv2_primitives.cpp
+      test/sv2_messages.cpp
+      test/sv2_configuration.cpp
+      test/sv2_connection.cpp
+      test/sv2_extensions.cpp
+      test/sv2_noise.cpp
+      test/sv2_noise_credentials.cpp
+      test/sv2_template_provider.cpp
+      test/sv2_mining.cpp
+      test/sv2_mining_session.cpp
+      test/sv2_mining_work.cpp
+      test/sv2_jd_settings.cpp
+      test/sv2_jd_failover.cpp
+      test/sv2_jd_connection.cpp
+      test/sv2_jd_session.cpp
+      test/sv2_jd_messages.cpp
+      test/sv2_jd_work.cpp
+      test/sv2_jd_declaration.cpp
+      test/sv2_jd_client.cpp)
+    target_include_directories(kth_node_sv2_test PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test>)
+    target_link_libraries(kth_node_sv2_test PUBLIC ${PROJECT_NAME})
+    target_link_libraries(kth_node_sv2_test PRIVATE Catch2::Catch2WithMain)
+  endif()
+
   include(CTest)
   kth_register_tests(kth_node_test TIMEOUT 600)
+  if(TARGET kth_node_sv2_test)
+    kth_register_tests(kth_node_sv2_test TIMEOUT 600)
+  endif()
+  if(TARGET kth_node_bloom_filters_test)
+    kth_register_tests(kth_node_bloom_filters_test TIMEOUT 600)
+  endif()
+  if(TARGET kth_node_neutrino_test)
+    kth_register_tests(kth_node_neutrino_test TIMEOUT 600)
+  endif()
+  if(TARGET kth_node_socks5_test)
+    kth_register_tests(kth_node_socks5_test TIMEOUT 600)
+  endif()
+  if(TARGET kth_node_i2p_test)
+    kth_register_tests(kth_node_i2p_test TIMEOUT 600)
+  endif()
 
   # README C++ snippet checks disabled: v1.0 switched the public API
   # to coroutines (start/run/stop/join), so the legacy start_chain /
