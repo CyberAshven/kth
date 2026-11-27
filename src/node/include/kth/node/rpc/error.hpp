@@ -25,8 +25,6 @@ enum class error_code : int {
     parse_error      = -32700,
     // Application-level (Bitcoin RPC_MISC_ERROR family).
     misc_error       = -1,
-    // A parameter of the wrong JSON type (RPC_TYPE_ERROR).
-    type_error = -3,
     invalid_parameter = -8,
     deserialization_error = -22,
     verify_error = -25,
